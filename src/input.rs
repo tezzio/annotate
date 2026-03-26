@@ -4,11 +4,8 @@ use sdl2::mouse::MouseButton;
 
 use crate::{
     canvas::Canvas,
-    tools::{
-        Tool, PALETTE,
-        draw_line, draw_rect_outline, draw_ellipse_outline,
-        draw_arrow, draw_highlight, draw_erase, draw_circle_fill,
-    },
+    scene::{DrawObject, PenStroke, ShapeObj, EraseObj, HighlightStroke},
+    tools::{Tool, PALETTE},
     ui::{ToolbarLayout, TOOLBAR_HEIGHT, MENU_HEIGHT},
     AppState,
 };
@@ -27,7 +24,7 @@ pub fn process_event(
         Event::Quit { .. } => return false,
 
         Event::KeyDown { keycode: Some(k), keymod, .. } => {
-            if !handle_keydown(*k, *keymod, state, canvas) {
+            if !handle_keydown(*k, *keymod, state) {
                 return false;
             }
         }
@@ -51,7 +48,7 @@ pub fn process_event(
 
         // ── Mouse button up ───────────────────────────────────────────────────
         Event::MouseButtonUp { mouse_btn: MouseButton::Left, x, y, .. } => {
-            handle_release(*x, *y, state, canvas);
+            handle_release(*x, *y, state);
         }
 
         // ── Touch / stylus (single-touch) ─────────────────────────────────────
@@ -65,7 +62,7 @@ pub fn process_event(
         }
         Event::FingerUp { x, y, .. } => {
             let (mx, my) = finger_to_px(*x, *y, canvas);
-            handle_release(mx, my, state, canvas);
+            handle_release(mx, my, state);
         }
 
         Event::Window { win_event: WindowEvent::Resized(w, h), .. }
@@ -87,7 +84,7 @@ fn finger_to_px(x: f32, y: f32, canvas: &Canvas) -> (i32, i32) {
 
 // ── Shared press / move / release handlers ────────────────────────────────────
 
-fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &mut Canvas, layout: &ToolbarLayout) {
+fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, layout: &ToolbarLayout) {
     if state.show_device_picker {
         if let Some(picker) = &mut state.device_picker {
             if let Some(idx) = picker.click_hit(mx, my, canvas.width as i32, canvas.height as i32) {
@@ -108,57 +105,111 @@ fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &mut Canvas, lay
         return;
     }
     if state.draw_locked_until.map_or(false, |t| std::time::Instant::now() < t) { return; }
-    push_undo(state, canvas);
     state.mouse_down = true;
     state.drag_start = (mx, my);
     state.drag_cur   = (mx, my);
     match state.active_tool {
-        Tool::Pen       => { draw_circle_fill(canvas, mx, my, state.brush_size as i32 / 2, state.color.0, state.color.1, state.color.2, 255); }
-        Tool::Eraser    => { draw_erase(canvas, mx, my, state.brush_size as i32); }
-        Tool::Highlight => { draw_highlight(canvas, mx, my, state.brush_size as i32 * 2, state.color.0, state.color.1, state.color.2); }
+        Tool::Select => {
+            let hit = state.scene.hit_test(mx, my);
+            state.scene.selected = hit;
+            if hit.is_some() {
+                // Snapshot before potential move so it can be undone
+                state.scene.push_undo();
+                state.pending_select_undo = true;
+            }
+        }
         Tool::Text => {
-            commit_text(state, canvas);
+            commit_text(state);
             state.text_pos = (mx, my);
             state.text_buffer.clear();
             state.text_input_active = true;
             sdl2::hint::set("SDL_IME_SHOW_UI", "1");
         }
-        _ => { state.preview_base = Some(canvas.snapshot()); }
+        Tool::Pen => {
+            state.scene.push_undo();
+            state.scene.add(DrawObject::Pen(PenStroke {
+                points: vec![(mx, my)],
+                color:  state.color,
+                size:   state.brush_size,
+            }));
+        }
+        Tool::Eraser => {
+            state.scene.push_undo();
+            state.scene.add(DrawObject::Erase(EraseObj {
+                points: vec![(mx, my)],
+                size:   state.brush_size,
+            }));
+        }
+        Tool::Highlight => {
+            state.scene.push_undo();
+            state.scene.add(DrawObject::Highlight(HighlightStroke {
+                points: vec![(mx, my)],
+                color:  state.color,
+                size:   state.brush_size,
+            }));
+        }
+        // Shape tools: push undo here; object committed on release
+        _ => {
+            state.scene.push_undo();
+        }
     }
 }
 
-fn handle_move(mx: i32, my: i32, state: &mut AppState, canvas: &mut Canvas) {
+fn handle_move(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas) {
     if !state.mouse_down || state.show_device_picker { return; }
     if my < MENU_HEIGHT || my >= canvas.height as i32 - TOOLBAR_HEIGHT { return; }
     let prev = state.drag_cur;
     state.drag_cur = (mx, my);
+    let (dx, dy) = (mx - prev.0, my - prev.1);
     match state.active_tool {
-        Tool::Pen => { draw_line(canvas, prev.0, prev.1, mx, my, state.color.0, state.color.1, state.color.2, 255, state.brush_size as i32); }
-        Tool::Eraser    => { draw_erase(canvas, mx, my, state.brush_size as i32); }
-        Tool::Highlight => { draw_highlight(canvas, mx, my, state.brush_size as i32 * 2, state.color.0, state.color.1, state.color.2); }
-        _ => { rebuild_preview(state, canvas, mx, my); }
+        Tool::Select => {
+            if let Some(idx) = state.scene.selected {
+                if let Some(obj) = state.scene.objects.get_mut(idx) {
+                    obj.translate(dx, dy);
+                }
+            }
+        }
+        Tool::Pen => {
+            if let Some(DrawObject::Pen(s)) = state.scene.objects.last_mut() {
+                s.points.push((mx, my));
+            }
+        }
+        Tool::Eraser => {
+            if let Some(DrawObject::Erase(e)) = state.scene.objects.last_mut() {
+                e.points.push((mx, my));
+            }
+        }
+        Tool::Highlight => {
+            if let Some(DrawObject::Highlight(h)) = state.scene.objects.last_mut() {
+                h.points.push((mx, my));
+            }
+        }
+        // shape tools: preview is drawn by main.rs via preview_object()
+        _ => {}
     }
 }
 
-fn handle_release(x1: i32, y1: i32, state: &mut AppState, canvas: &mut Canvas) {
+fn handle_release(x1: i32, y1: i32, state: &mut AppState) {
     if !state.mouse_down { return; }
     state.mouse_down = false;
     let (x0, y0) = state.drag_start;
-    if state.active_tool != Tool::Pen
-        && state.active_tool != Tool::Eraser
-        && state.active_tool != Tool::Highlight
-        && state.active_tool != Tool::Text
-    {
-        if let Some(base) = state.preview_base.take() { canvas.restore(base); }
-        let (r, g, b) = state.color;
-        let t = state.brush_size as i32;
-        match state.active_tool {
-            Tool::Line   => draw_line(canvas, x0, y0, x1, y1, r, g, b, 255, t),
-            Tool::Rect   => draw_rect_outline(canvas, x0, y0, x1, y1, r, g, b, 255, t),
-            Tool::Circle => draw_ellipse_outline(canvas, x0, y0, x1, y1, r, g, b, 255, t),
-            Tool::Arrow  => draw_arrow(canvas, x0, y0, x1, y1, r, g, b, 255, t),
-            _ => {}
+    let s = ShapeObj { x0, y0, x1, y1, color: state.color, size: state.brush_size };
+    match state.active_tool {
+        Tool::Line   => { state.scene.add(DrawObject::Line(s)); }
+        Tool::Rect   => { state.scene.add(DrawObject::Rect(s)); }
+        Tool::Circle => { state.scene.add(DrawObject::Circle(s)); }
+        Tool::Arrow  => { state.scene.add(DrawObject::Arrow(s)); }
+        // Pen/Eraser/Highlight: already appended point-by-point
+        Tool::Select => {
+            if state.pending_select_undo {
+                state.pending_select_undo = false;
+                // If the object didn't actually move, discard the undo snapshot
+                if state.drag_start == state.drag_cur {
+                    state.scene.undo_stack.pop_back();
+                }
+            }
         }
+        _ => {}
     }
 }
 
@@ -168,7 +219,6 @@ fn handle_keydown(
     k: Keycode,
     mods: Mod,
     state: &mut AppState,
-    canvas: &mut Canvas,
 ) -> bool {
     let ctrl  = mods.contains(Mod::LCTRLMOD)  || mods.contains(Mod::RCTRLMOD);
     let shift = mods.contains(Mod::LSHIFTMOD) || mods.contains(Mod::RSHIFTMOD);
@@ -177,7 +227,7 @@ fn handle_keydown(
     if state.text_input_active && state.active_tool == Tool::Text {
         match k {
             Keycode::Return | Keycode::KpEnter => {
-                commit_text(state, canvas);
+                commit_text(state);
             }
             Keycode::Escape => {
                 state.text_buffer.clear();
@@ -215,14 +265,15 @@ fn handle_keydown(
         Keycode::Escape => return false,
 
         // ── Tool selection ────────────────────────────────────────────────────
-        Keycode::P => { commit_text(state, canvas); switch_tool(state, Tool::Pen);       }
-        Keycode::L => { commit_text(state, canvas); switch_tool(state, Tool::Line);      }
-        Keycode::R => { commit_text(state, canvas); switch_tool(state, Tool::Rect);      }
-        Keycode::C => { commit_text(state, canvas); switch_tool(state, Tool::Circle);    }
-        Keycode::A => { commit_text(state, canvas); switch_tool(state, Tool::Arrow);     }
-        Keycode::T => { commit_text(state, canvas); switch_tool(state, Tool::Text);      }
-        Keycode::E => { commit_text(state, canvas); switch_tool(state, Tool::Eraser);    }
-        Keycode::H => { commit_text(state, canvas); switch_tool(state, Tool::Highlight); }
+        Keycode::P => { commit_text(state); switch_tool(state, Tool::Pen);       }
+        Keycode::L => { commit_text(state); switch_tool(state, Tool::Line);      }
+        Keycode::R => { commit_text(state); switch_tool(state, Tool::Rect);      }
+        Keycode::C => { commit_text(state); switch_tool(state, Tool::Circle);    }
+        Keycode::A => { commit_text(state); switch_tool(state, Tool::Arrow);     }
+        Keycode::T => { commit_text(state); switch_tool(state, Tool::Text);      }
+        Keycode::S => { commit_text(state); switch_tool(state, Tool::Select);    }
+        Keycode::E => { commit_text(state); switch_tool(state, Tool::Eraser);    }
+        Keycode::H => { commit_text(state); switch_tool(state, Tool::Highlight); }
 
         // ── Colour palette ────────────────────────────────────────────────────
         Keycode::Num1 => state.color = PALETTE[0],
@@ -239,14 +290,29 @@ fn handle_keydown(
         Keycode::RightBracket => { state.brush_size = (state.brush_size + 4).min(200); state.tool_sizes[state.active_tool.index()] = state.brush_size; }
 
         // ── Undo / Redo ───────────────────────────────────────────────────────
-        Keycode::Z if ctrl && shift => redo(state, canvas),
-        Keycode::Y if ctrl          => redo(state, canvas),
-        Keycode::Z if ctrl          => undo(state, canvas),
+        Keycode::Z if ctrl && shift => {
+            state.scene.redo();
+            state.draw_locked_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+        }
+        Keycode::Y if ctrl => {
+            state.scene.redo();
+            state.draw_locked_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+        }
+        Keycode::Z if ctrl => {
+            state.scene.undo();
+            state.draw_locked_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+        }
 
-        // ── Clear ─────────────────────────────────────────────────────────────
+        // ── Clear / Delete selected ───────────────────────────────────────────
         Keycode::Delete | Keycode::Backspace => {
-            push_undo(state, canvas);
-            canvas.clear();
+            if state.active_tool == Tool::Select {
+                if let Some(idx) = state.scene.selected.take() {
+                    state.scene.push_undo();
+                    state.scene.objects.remove(idx);
+                }
+            } else {
+                state.scene.clear();
+            }
         }
 
         // ── Fullscreen toggle ─────────────────────────────────────────────────
@@ -289,7 +355,7 @@ fn handle_toolbar_click(mx: i32, my: i32, layout: &ToolbarLayout, state: &mut Ap
     }
 }
 
-// ── Preview rebuild ───────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Switch to a different tool, saving the current brush size and restoring
 /// the new tool's remembered size.
@@ -299,49 +365,23 @@ fn switch_tool(state: &mut AppState, tool: Tool) {
     state.brush_size  = state.tool_sizes[tool.index()];
 }
 
-fn rebuild_preview(state: &mut AppState, canvas: &mut Canvas, x1: i32, y1: i32) {
-    if let Some(ref base) = state.preview_base {
-        canvas.restore(base.clone());
-    }
-    let (x0, y0) = state.drag_start;
-    let (r, g, b) = state.color;
-    let t = state.brush_size as i32;
-    match state.active_tool {
-        Tool::Line   => draw_line(canvas, x0, y0, x1, y1, r, g, b, 255, t),
-        Tool::Rect   => draw_rect_outline(canvas, x0, y0, x1, y1, r, g, b, 255, t),
-        Tool::Circle => draw_ellipse_outline(canvas, x0, y0, x1, y1, r, g, b, 255, t),
-        Tool::Arrow  => draw_arrow(canvas, x0, y0, x1, y1, r, g, b, 255, t),
-        _ => {}
-    }
-}
-
-// ── Undo / Redo ───────────────────────────────────────────────────────────────
-
-pub fn push_undo(state: &mut AppState, canvas: &Canvas) {
-    state.undo_stack.push_back(canvas.snapshot());
-    if state.undo_stack.len() > state.undo_limit { state.undo_stack.pop_front(); }
-    state.redo_stack.clear();
-}
-
-pub fn undo(state: &mut AppState, canvas: &mut Canvas) {
-    if let Some(snap) = state.undo_stack.pop_back() {
-        state.redo_stack.push_back(canvas.snapshot());
-        canvas.restore(snap);
-        state.draw_locked_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
-    }
-}
-
-pub fn redo(state: &mut AppState, canvas: &mut Canvas) {
-    if let Some(snap) = state.redo_stack.pop_back() {
-        state.undo_stack.push_back(canvas.snapshot());
-        canvas.restore(snap);
-        state.draw_locked_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
-    }
-}
-
-// ── Text commit ───────────────────────────────────────────────────────────────
-
-fn commit_text(state: &mut AppState, _canvas: &mut Canvas) {
+fn commit_text(state: &mut AppState) {
     if !state.text_buffer.is_empty() { state.pending_text_commit = true; }
     state.text_input_active = false;
+}
+
+/// Returns a live preview `DrawObject` for the current shape drag, if any.
+/// main.rs calls this to render the ghost shape on top of the committed scene.
+pub fn preview_object(state: &AppState) -> Option<DrawObject> {
+    if !state.mouse_down { return None; }
+    let (x0, y0) = state.drag_start;
+    let (x1, y1) = state.drag_cur;
+    let s = ShapeObj { x0, y0, x1, y1, color: state.color, size: state.brush_size };
+    match state.active_tool {
+        Tool::Line   => Some(DrawObject::Line(s)),
+        Tool::Rect   => Some(DrawObject::Rect(s)),
+        Tool::Circle => Some(DrawObject::Circle(s)),
+        Tool::Arrow  => Some(DrawObject::Arrow(s)),
+        _ => None,
+    }
 }

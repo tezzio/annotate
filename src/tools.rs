@@ -2,7 +2,7 @@ use crate::canvas::Canvas;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
-    Pen, Line, Rect, Circle, Arrow, Text, Eraser, Highlight,
+    Pen, Line, Rect, Circle, Arrow, Text, Select, Eraser, Highlight,
 }
 
 impl Tool {
@@ -14,8 +14,9 @@ impl Tool {
             Tool::Circle    => 3,
             Tool::Arrow     => 4,
             Tool::Text      => 5,
-            Tool::Eraser    => 6,
-            Tool::Highlight => 7,
+            Tool::Select    => 6,
+            Tool::Eraser    => 7,
+            Tool::Highlight => 8,
         }
     }
 }

@@ -31,6 +31,7 @@ fn tool_fa_icon(tool: Tool) -> char {
         Tool::Circle    => '\u{f111}', // circle
         Tool::Arrow     => '\u{f061}', // arrow-right
         Tool::Text      => '\u{f031}', // font
+        Tool::Select    => '\u{f245}', // mouse-pointer
         Tool::Eraser    => '\u{f12d}', // eraser
         Tool::Highlight => '\u{f5c1}', // highlighter
     }
@@ -70,7 +71,7 @@ impl ToolbarLayout {
         // Tool buttons — left side
         let tools_order = [
             Tool::Pen, Tool::Line, Tool::Rect, Tool::Circle,
-            Tool::Arrow, Tool::Text, Tool::Eraser, Tool::Highlight,
+            Tool::Arrow, Tool::Text, Tool::Select, Tool::Eraser, Tool::Highlight,
         ];
         let mut x = TOOL_BTN_PAD;
         for tool in tools_order {

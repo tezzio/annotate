@@ -2,11 +2,11 @@ mod config;
 mod capture;
 mod canvas;
 mod tools;
+mod scene;
 mod ui;
 mod input;
 
 use std::{
-    collections::VecDeque,
     sync::mpsc::Receiver,
     time::{Duration, Instant},
 };
@@ -20,6 +20,7 @@ use sdl2::{
 use canvas::Canvas;
 use capture::Frame;
 use tools::Tool;
+use scene::Scene;
 use ui::{DevicePicker, ToolbarLayout, TOOLBAR_HEIGHT, MENU_HEIGHT};
 
 // ── Application state ─────────────────────────────────────────────────────────
@@ -30,18 +31,15 @@ pub struct AppState {
     pub color:               (u8, u8, u8),
     pub brush_size:          u32,
     /// Per-tool remembered sizes; indexed by Tool::index()
-    pub tool_sizes:          [u32; 8],
+    pub tool_sizes:          [u32; 9],
 
     // Mouse drag
     pub mouse_down:          bool,
     pub drag_start:          (i32, i32),
     pub drag_cur:            (i32, i32),
-    pub preview_base:        Option<Vec<u8>>,
 
-    // Undo / redo
-    pub undo_stack:          VecDeque<Vec<u8>>,
-    pub redo_stack:          VecDeque<Vec<u8>>,
-    pub undo_limit:          usize,
+    // Scene (object model)
+    pub scene:               Scene,
 
     // Text input
     pub text_input_active:   bool,
@@ -53,6 +51,9 @@ pub struct AppState {
     pub show_device_picker:  bool,
     pub device_picker:       Option<DevicePicker>,
     pub picker_confirmed:    Option<usize>,
+
+    // Set when a select-drag undo snapshot was pushed; cancelled if no movement
+    pub pending_select_undo: bool,
 
     // Draw lock (set after undo/redo to absorb accidental mouse-down)
     pub draw_locked_until:   Option<Instant>,
@@ -76,7 +77,7 @@ impl AppState {
         let undo_limit = cfg.undo_stack_limit;
         let tool_size  = cfg.tool_size.max(1);
         let is_full    = cfg.fullscreen && !cfg.windowed;
-        let tool_sizes: [u32; 8] = [8, tool_size, tool_size, tool_size, tool_size, tool_size, 40, 12];
+        let tool_sizes: [u32; 9] = [8, tool_size, tool_size, tool_size, tool_size, tool_size, tool_size, 40, 12];
         let brush_size = tool_sizes[Tool::Pen.index()];
         Self {
             active_tool:         Tool::Pen,
@@ -86,10 +87,7 @@ impl AppState {
             mouse_down:          false,
             drag_start:          (0, 0),
             drag_cur:            (0, 0),
-            preview_base:        None,
-            undo_stack:          VecDeque::new(),
-            redo_stack:          VecDeque::new(),
-            undo_limit,
+            scene:               Scene::new(undo_limit),
             text_input_active:   false,
             text_buffer:         String::new(),
             text_pos:            (0, 0),
@@ -100,6 +98,7 @@ impl AppState {
             toggle_fullscreen:   false,
             is_fullscreen:       is_full,
             window_size:         (cfg.width, cfg.height),
+            pending_select_undo: false,
             draw_locked_until:   None,
             pending_menu_click:  None,
             menu_close_requested: false,
@@ -233,12 +232,9 @@ fn main() {
         if let Some((mx, my)) = state.pending_menu_click.take() {
             let action = menu_bar.click(mx, my, canvas_w as i32);
             match action {
-                ui::MenuAction::Undo  => input::undo(&mut state, &mut ann_canvas),
-                ui::MenuAction::Redo  => input::redo(&mut state, &mut ann_canvas),
-                ui::MenuAction::Clear => {
-                    input::push_undo(&mut state, &ann_canvas);
-                    ann_canvas.clear();
-                }
+                ui::MenuAction::Undo  => { state.scene.undo(); }
+                ui::MenuAction::Redo  => { state.scene.redo(); }
+                ui::MenuAction::Clear => { state.scene.clear(); }
                 _ => {}
             }
             if let ui::MenuAction::SelectDevice(idx) = action {
@@ -319,6 +315,11 @@ fn main() {
         }
 
         // Annotation overlay (excludes toolbar strip and menu bar)
+        state.scene.render_to(&mut ann_canvas);
+        // Draw live shape preview on top
+        if let Some(prev_obj) = input::preview_object(&state) {
+            prev_obj.render(&mut ann_canvas);
+        }
         ann_canvas.upload_texture(&mut overlay_tex);
         let overlay_src = Rect::new(0, MENU_HEIGHT, canvas_w, canvas_h.saturating_sub(TOOLBAR_HEIGHT as u32 + MENU_HEIGHT as u32));
         let overlay_dst = overlay_src;
@@ -361,7 +362,7 @@ fn main() {
         }
 
         // Menu bar (always on top)
-        menu_bar.draw(&mut sdl_canvas, &font, canvas_w as i32, !state.undo_stack.is_empty(), !state.redo_stack.is_empty());
+        menu_bar.draw(&mut sdl_canvas, &font, canvas_w as i32, !state.scene.undo_stack.is_empty(), !state.scene.redo_stack.is_empty());
 
         sdl_canvas.present();
 
