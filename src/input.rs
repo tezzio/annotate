@@ -41,133 +41,31 @@ pub fn process_event(
 
         // ── Mouse button down ─────────────────────────────────────────────────
         Event::MouseButtonDown { mouse_btn: MouseButton::Left, x, y, .. } => {
-            let (mx, my) = (*x, *y);
-
-            // Device picker intercepts all clicks when visible
-            if state.show_device_picker {
-                if let Some(picker) = &mut state.device_picker {
-                    if let Some(idx) = picker.click_hit(mx, my, canvas.width as i32, canvas.height as i32) {
-                        picker.selected = idx;
-                        state.picker_confirmed = Some(idx);
-                        state.show_device_picker = false;
-                    }
-                }
-                return true;
-            }
-
-            // Menu bar
-            if my < MENU_HEIGHT {
-                // handled in main.rs via menu_bar.click()
-                state.pending_menu_click = Some((mx, my));
-                return true;
-            }
-            // Close menu if clicking outside it while it's open
-            state.menu_close_requested = true;
-
-            // Toolbar hit-test
-            if my >= canvas.height as i32 - TOOLBAR_HEIGHT {
-                handle_toolbar_click(mx, my, layout, state);
-                return true;
-            }
-
-            // Drawing area — below menu bar, above toolbar
-            push_undo(state, canvas);
-            state.mouse_down = true;
-            state.drag_start = (mx, my);
-            state.drag_cur   = (mx, my);
-
-            match state.active_tool {
-                Tool::Pen => {
-                    draw_circle_fill(
-                        canvas,
-                        mx, my,
-                        state.brush_size as i32 / 2,
-                        state.color.0, state.color.1, state.color.2, 255,
-                    );
-                }
-                Tool::Eraser => {
-                    draw_erase(canvas, mx, my, state.brush_size as i32);
-                }
-                Tool::Highlight => {
-                    draw_highlight(canvas, mx, my, state.brush_size as i32 * 2,
-                        state.color.0, state.color.1, state.color.2);
-                }
-                Tool::Text => {
-                    // Commit any existing text first
-                    commit_text(state, canvas);
-                    state.text_pos = (mx, my);
-                    state.text_buffer.clear();
-                    state.text_input_active = true;
-                    sdl2::hint::set("SDL_IME_SHOW_UI", "1");
-                }
-                _ => {
-                    // Shape tools: start preview
-                    state.preview_base = Some(canvas.snapshot());
-                }
-            }
+            handle_press(*x, *y, state, canvas, layout);
         }
 
         // ── Mouse motion ──────────────────────────────────────────────────────
         Event::MouseMotion { x, y, .. } => {
-            let (mx, my) = (*x, *y);
-            if !state.mouse_down { return true; }
-            if state.show_device_picker { return true; }
-            if my < MENU_HEIGHT { return true; }
-            if my >= canvas.height as i32 - TOOLBAR_HEIGHT { return true; }
-
-            let prev = state.drag_cur;
-            state.drag_cur = (mx, my);
-
-            match state.active_tool {
-                Tool::Pen => {
-                    draw_line(
-                        canvas,
-                        prev.0, prev.1, mx, my,
-                        state.color.0, state.color.1, state.color.2, 255,
-                        state.brush_size as i32,
-                    );
-                }
-                Tool::Eraser => {
-                    draw_erase(canvas, mx, my, state.brush_size as i32);
-                }
-                Tool::Highlight => {
-                    draw_highlight(canvas, mx, my, state.brush_size as i32 * 2,
-                        state.color.0, state.color.1, state.color.2);
-                }
-                _ => {
-                    // Rebuild preview from snapshot
-                    rebuild_preview(state, canvas, mx, my);
-                }
-            }
+            handle_move(*x, *y, state, canvas);
         }
 
         // ── Mouse button up ───────────────────────────────────────────────────
         Event::MouseButtonUp { mouse_btn: MouseButton::Left, x, y, .. } => {
-            if !state.mouse_down { return true; }
-            state.mouse_down = false;
+            handle_release(*x, *y, state, canvas);
+        }
 
-            let (x1, y1) = (*x, *y);
-            let (x0, y0) = state.drag_start;
-
-            if state.active_tool != Tool::Pen
-                && state.active_tool != Tool::Eraser
-                && state.active_tool != Tool::Highlight
-                && state.active_tool != Tool::Text
-            {
-                // Commit shape onto real canvas
-                if let Some(base) = state.preview_base.take() {
-                    canvas.restore(base);
-                }
-                let (r, g, b) = state.color;
-                let t = state.brush_size as i32;
-                match state.active_tool {
-                    Tool::Line   => draw_line(canvas, x0, y0, x1, y1, r, g, b, 255, t),
-                    Tool::Rect   => draw_rect_outline(canvas, x0, y0, x1, y1, r, g, b, 255, t),
-                    Tool::Circle => draw_ellipse_outline(canvas, x0, y0, x1, y1, r, g, b, 255, t),
-                    Tool::Arrow  => draw_arrow(canvas, x0, y0, x1, y1, r, g, b, 255, t),
-                    _ => {}
-                }
-            }
+        // ── Touch / stylus (single-touch) ─────────────────────────────────────
+        Event::FingerDown { x, y, .. } => {
+            let (mx, my) = finger_to_px(*x, *y, canvas);
+            handle_press(mx, my, state, canvas, layout);
+        }
+        Event::FingerMotion { x, y, .. } => {
+            let (mx, my) = finger_to_px(*x, *y, canvas);
+            handle_move(mx, my, state, canvas);
+        }
+        Event::FingerUp { x, y, .. } => {
+            let (mx, my) = finger_to_px(*x, *y, canvas);
+            handle_release(mx, my, state, canvas);
         }
 
         Event::Window { win_event: WindowEvent::Resized(w, h), .. }
@@ -178,6 +76,90 @@ pub fn process_event(
         _ => {}
     }
     true
+}
+
+// ── Touch coordinate helper ──────────────────────────────────────────────────
+
+/// Convert SDL2 normalized finger coords (0.0–1.0) to canvas pixel coords.
+fn finger_to_px(x: f32, y: f32, canvas: &Canvas) -> (i32, i32) {
+    ((x * canvas.width as f32).round() as i32, (y * canvas.height as f32).round() as i32)
+}
+
+// ── Shared press / move / release handlers ────────────────────────────────────
+
+fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &mut Canvas, layout: &ToolbarLayout) {
+    if state.show_device_picker {
+        if let Some(picker) = &mut state.device_picker {
+            if let Some(idx) = picker.click_hit(mx, my, canvas.width as i32, canvas.height as i32) {
+                picker.selected = idx;
+                state.picker_confirmed = Some(idx);
+                state.show_device_picker = false;
+            }
+        }
+        return;
+    }
+    if my < MENU_HEIGHT {
+        state.pending_menu_click = Some((mx, my));
+        return;
+    }
+    state.menu_close_requested = true;
+    if my >= canvas.height as i32 - TOOLBAR_HEIGHT {
+        handle_toolbar_click(mx, my, layout, state);
+        return;
+    }
+    if state.draw_locked_until.map_or(false, |t| std::time::Instant::now() < t) { return; }
+    push_undo(state, canvas);
+    state.mouse_down = true;
+    state.drag_start = (mx, my);
+    state.drag_cur   = (mx, my);
+    match state.active_tool {
+        Tool::Pen       => { draw_circle_fill(canvas, mx, my, state.brush_size as i32 / 2, state.color.0, state.color.1, state.color.2, 255); }
+        Tool::Eraser    => { draw_erase(canvas, mx, my, state.brush_size as i32); }
+        Tool::Highlight => { draw_highlight(canvas, mx, my, state.brush_size as i32 * 2, state.color.0, state.color.1, state.color.2); }
+        Tool::Text => {
+            commit_text(state, canvas);
+            state.text_pos = (mx, my);
+            state.text_buffer.clear();
+            state.text_input_active = true;
+            sdl2::hint::set("SDL_IME_SHOW_UI", "1");
+        }
+        _ => { state.preview_base = Some(canvas.snapshot()); }
+    }
+}
+
+fn handle_move(mx: i32, my: i32, state: &mut AppState, canvas: &mut Canvas) {
+    if !state.mouse_down || state.show_device_picker { return; }
+    if my < MENU_HEIGHT || my >= canvas.height as i32 - TOOLBAR_HEIGHT { return; }
+    let prev = state.drag_cur;
+    state.drag_cur = (mx, my);
+    match state.active_tool {
+        Tool::Pen => { draw_line(canvas, prev.0, prev.1, mx, my, state.color.0, state.color.1, state.color.2, 255, state.brush_size as i32); }
+        Tool::Eraser    => { draw_erase(canvas, mx, my, state.brush_size as i32); }
+        Tool::Highlight => { draw_highlight(canvas, mx, my, state.brush_size as i32 * 2, state.color.0, state.color.1, state.color.2); }
+        _ => { rebuild_preview(state, canvas, mx, my); }
+    }
+}
+
+fn handle_release(x1: i32, y1: i32, state: &mut AppState, canvas: &mut Canvas) {
+    if !state.mouse_down { return; }
+    state.mouse_down = false;
+    let (x0, y0) = state.drag_start;
+    if state.active_tool != Tool::Pen
+        && state.active_tool != Tool::Eraser
+        && state.active_tool != Tool::Highlight
+        && state.active_tool != Tool::Text
+    {
+        if let Some(base) = state.preview_base.take() { canvas.restore(base); }
+        let (r, g, b) = state.color;
+        let t = state.brush_size as i32;
+        match state.active_tool {
+            Tool::Line   => draw_line(canvas, x0, y0, x1, y1, r, g, b, 255, t),
+            Tool::Rect   => draw_rect_outline(canvas, x0, y0, x1, y1, r, g, b, 255, t),
+            Tool::Circle => draw_ellipse_outline(canvas, x0, y0, x1, y1, r, g, b, 255, t),
+            Tool::Arrow  => draw_arrow(canvas, x0, y0, x1, y1, r, g, b, 255, t),
+            _ => {}
+        }
+    }
 }
 
 // ── Keyboard handler ──────────────────────────────────────────────────────────
@@ -341,17 +323,19 @@ pub fn push_undo(state: &mut AppState, canvas: &Canvas) {
     state.redo_stack.clear();
 }
 
-fn undo(state: &mut AppState, canvas: &mut Canvas) {
+pub fn undo(state: &mut AppState, canvas: &mut Canvas) {
     if let Some(snap) = state.undo_stack.pop_back() {
         state.redo_stack.push_back(canvas.snapshot());
         canvas.restore(snap);
+        state.draw_locked_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
     }
 }
 
-fn redo(state: &mut AppState, canvas: &mut Canvas) {
+pub fn redo(state: &mut AppState, canvas: &mut Canvas) {
     if let Some(snap) = state.redo_stack.pop_back() {
         state.undo_stack.push_back(canvas.snapshot());
         canvas.restore(snap);
+        state.draw_locked_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
     }
 }
 

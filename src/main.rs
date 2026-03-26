@@ -54,6 +54,9 @@ pub struct AppState {
     pub device_picker:       Option<DevicePicker>,
     pub picker_confirmed:    Option<usize>,
 
+    // Draw lock (set after undo/redo to absorb accidental mouse-down)
+    pub draw_locked_until:   Option<Instant>,
+
     // Menu bar
     pub pending_menu_click:  Option<(i32, i32)>,
     pub menu_close_requested: bool,
@@ -97,6 +100,7 @@ impl AppState {
             toggle_fullscreen:   false,
             is_fullscreen:       is_full,
             window_size:         (cfg.width, cfg.height),
+            draw_locked_until:   None,
             pending_menu_click:  None,
             menu_close_requested: false,
             cfg,
@@ -228,6 +232,11 @@ fn main() {
         // ── Menu bar clicks ────────────────────────────────────────────────
         if let Some((mx, my)) = state.pending_menu_click.take() {
             let action = menu_bar.click(mx, my, canvas_w as i32);
+            match action {
+                ui::MenuAction::Undo => input::undo(&mut state, &mut ann_canvas),
+                ui::MenuAction::Redo => input::redo(&mut state, &mut ann_canvas),
+                _ => {}
+            }
             if let ui::MenuAction::SelectDevice(idx) = action {
                 menu_bar.active_idx = idx;
                 if idx == 0 {
@@ -348,7 +357,7 @@ fn main() {
         }
 
         // Menu bar (always on top)
-        menu_bar.draw(&mut sdl_canvas, &font, canvas_w as i32);
+        menu_bar.draw(&mut sdl_canvas, &font, canvas_w as i32, !state.undo_stack.is_empty(), !state.redo_stack.is_empty());
 
         sdl_canvas.present();
 

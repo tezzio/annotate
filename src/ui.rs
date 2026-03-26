@@ -13,12 +13,12 @@ use crate::{
 
 // ── Layout constants ──────────────────────────────────────────────────────────
 
-pub const TOOLBAR_HEIGHT: i32 = 64;
-pub const MENU_HEIGHT:    i32 = 30;
-const TOOL_BTN_SIZE:  i32 = 48;
+pub const TOOLBAR_HEIGHT: i32 = 100;
+pub const MENU_HEIGHT:    i32 = 52;
+const TOOL_BTN_SIZE:  i32 = 76;
 const TOOL_BTN_PAD:   i32 = 8;
-const PALETTE_SWATCH: i32 = 28;
-const PALETTE_PAD:    i32 = 5;
+const PALETTE_SWATCH: i32 = 44;
+const PALETTE_PAD:    i32 = 6;
 
 // ── FontAwesome 6 Solid codepoints ───────────────────────────────────────────
 
@@ -210,6 +210,8 @@ pub fn draw_toolbar(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
     None,
+    Undo,
+    Redo,
     /// User clicked a device entry; index 0 = "No input", 1+ = devices list
     SelectDevice(usize),
 }
@@ -222,11 +224,18 @@ pub struct MenuBar {
     pub devices: Vec<DeviceInfo>,
     /// Which device is currently active (0 = no input, 1+ = devices[idx-1])
     pub active_idx: usize,
+    /// Machine hostname shown as the bar title
+    pub hostname: String,
 }
 
 impl MenuBar {
     pub fn new(devices: Vec<DeviceInfo>) -> Self {
-        Self { open: false, devices, active_idx: 0 }
+        let hostname = std::fs::read_to_string("/etc/hostname")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let hostname = if hostname.is_empty() { "annotator".to_string() } else { hostname };
+        Self { open: false, devices, active_idx: 0, hostname }
     }
 
     fn entry_count(&self) -> usize { self.devices.len() + 1 }
@@ -239,6 +248,9 @@ impl MenuBar {
             format!("{}  [{}]", d.name, d.path.display())
         }
     }
+
+    fn undo_rect(&self) -> Rect { Rect::new(220, 0, 72, MENU_HEIGHT as u32) }
+    fn redo_rect(&self) -> Rect { Rect::new(296, 0, 72, MENU_HEIGHT as u32) }
 
     fn menu_item_rect(&self, canvas_w: i32) -> Rect {
         // The "Input" menu item in the bar
@@ -260,7 +272,7 @@ impl MenuBar {
     }
 
     /// Draw the menu bar (and dropdown if open)
-    pub fn draw(&self, sdl: &mut SdlCanvas<Window>, font: &Font, canvas_w: i32) {
+    pub fn draw(&self, sdl: &mut SdlCanvas<Window>, font: &Font, canvas_w: i32, has_undo: bool, has_redo: bool) {
         // Background bar
         sdl.set_draw_color(Color::RGB(0x14, 0x14, 0x14));
         sdl.fill_rect(Rect::new(0, 0, canvas_w as u32, MENU_HEIGHT as u32)).ok();
@@ -273,7 +285,7 @@ impl MenuBar {
         // App title — left
         render_text(
             sdl, font, &tc,
-            "Court Annotator",
+            &self.hostname,
             Color::RGB(120, 120, 120),
             Rect::new(12, 0, 220, MENU_HEIGHT as u32),
         );
@@ -286,6 +298,16 @@ impl MenuBar {
         }
         let item_color = if self.open { Color::RGB(255,255,255) } else { Color::RGB(200, 200, 200) };
         render_text(sdl, font, &tc, "Input  ▾", item_color, item_rect);
+
+        // Undo button
+        let undo_r = self.undo_rect();
+        let undo_col = if has_undo { Color::RGB(200, 200, 200) } else { Color::RGB(70, 70, 70) };
+        render_text(sdl, font, &tc, "↩ Undo", undo_col, undo_r);
+
+        // Redo button
+        let redo_r = self.redo_rect();
+        let redo_col = if has_redo { Color::RGB(200, 200, 200) } else { Color::RGB(70, 70, 70) };
+        render_text(sdl, font, &tc, "↪ Redo", redo_col, redo_r);
 
         // Dropdown
         if self.open {
@@ -333,6 +355,12 @@ impl MenuBar {
         // Click inside menu bar
         if self.menu_item_rect(canvas_w).contains_point((mx, my)) {
             self.open = !self.open;
+        } else if self.undo_rect().contains_point((mx, my)) {
+            if self.open { self.open = false; }
+            return MenuAction::Undo;
+        } else if self.redo_rect().contains_point((mx, my)) {
+            if self.open { self.open = false; }
+            return MenuAction::Redo;
         } else if self.open {
             self.open = false;
         }
