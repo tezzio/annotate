@@ -1,0 +1,29 @@
+# Court Annotator — default configuration
+# This file is copied to ~/.config/annotator/config.toml on first run.
+# Edit that copy to change runtime behaviour.
+
+# Output canvas resolution
+width  = 1920
+height = 1080
+
+# Display mode
+# fullscreen = true  →  FULLSCREEN_DESKTOP (production / court machine)
+# windowed   = true  →  normal resizable window at (width × height) — dev/debug
+# windowed takes precedence over fullscreen when both are true
+fullscreen = true
+windowed   = false
+
+# Undo / redo history depth
+undo_stack_limit = 20
+
+# Default capture device.  Leave commented to show the picker on every launch.
+# device_path = "/dev/video0"
+
+# Override the bundled DejaVu Sans font with a system font (optional)
+# font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+
+# Default tool colour (RRGGBB hex string)
+tool_color = "ffffff"
+
+# Default brush / stroke size in pixels
+tool_size = 4
