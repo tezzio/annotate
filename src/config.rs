@@ -20,14 +20,6 @@ pub struct Config {
     #[serde(default)]
     pub windowed: bool,
 
-    /// V4L2 device path to open automatically.  None = show picker on launch.
-    #[serde(default)]
-    pub device_path: Option<String>,
-
-    /// Override the embedded DejaVu Sans font with a path on disk.
-    #[serde(default)]
-    pub font_path: Option<String>,
-
     /// Default stroke / tool colour as RRGGBB hex (no leading #)
     #[serde(default = "default_tool_color")]
     pub tool_color: String,
@@ -59,8 +51,6 @@ impl Default for Config {
             height: default_height(),
             fullscreen: default_fullscreen(),
             windowed: false,
-            device_path: None,
-            font_path: None,
             tool_color: default_tool_color(),
             tool_size: default_tool_size(),
             undo_stack_limit: default_undo_stack_limit(),

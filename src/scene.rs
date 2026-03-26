@@ -160,17 +160,20 @@ pub struct Scene {
     pub undo_limit: usize,
     /// Index of the selected object, if any.
     pub selected:   Option<usize>,
+    /// Set whenever the scene is modified; cleared by render_to().
+    pub dirty:      bool,
 }
 
 impl Scene {
     pub fn new(undo_limit: usize) -> Self {
-        Self { objects: Vec::new(), undo_stack: VecDeque::new(), redo_stack: VecDeque::new(), undo_limit, selected: None }
+        Self { objects: Vec::new(), undo_stack: VecDeque::new(), redo_stack: VecDeque::new(), undo_limit, selected: None, dirty: true }
     }
 
     pub fn push_undo(&mut self) {
         self.undo_stack.push_back(self.objects.clone());
         if self.undo_stack.len() > self.undo_limit { self.undo_stack.pop_front(); }
         self.redo_stack.clear();
+        self.dirty = true;
     }
 
     pub fn undo(&mut self) {
@@ -178,6 +181,7 @@ impl Scene {
             self.redo_stack.push_back(self.objects.clone());
             self.objects = prev;
             self.selected = None;
+            self.dirty = true;
         }
     }
 
@@ -186,6 +190,7 @@ impl Scene {
             self.undo_stack.push_back(self.objects.clone());
             self.objects = next;
             self.selected = None;
+            self.dirty = true;
         }
     }
 
@@ -193,19 +198,23 @@ impl Scene {
         self.push_undo();
         self.objects.clear();
         self.selected = None;
+        self.dirty = true;
     }
 
     pub fn add(&mut self, obj: DrawObject) {
         self.objects.push(obj);
+        self.dirty = true;
     }
 
-    /// Render all objects into `canvas` (clear first).
-    pub fn render_to(&self, canvas: &mut Canvas) {
+    /// Render all objects into `canvas` (clear first). Only re-renders when dirty.
+    pub fn render_to(&mut self, canvas: &mut Canvas) {
+        if !self.dirty { return; }
         canvas.clear();
         for obj in &self.objects {
             obj.render(canvas);
         }
         canvas.dirty = true;
+        self.dirty = false;
     }
 
     /// Hit-test from the top (last-drawn) object down. Returns Some(index).

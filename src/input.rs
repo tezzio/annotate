@@ -6,7 +6,7 @@ use crate::{
     canvas::Canvas,
     scene::{DrawObject, PenStroke, ShapeObj, EraseObj, HighlightStroke},
     tools::{Tool, PALETTE},
-    ui::{ToolbarLayout, TOOLBAR_HEIGHT, MENU_HEIGHT},
+    ui::{PickerStage, ToolbarLayout, TOOLBAR_HEIGHT, MENU_HEIGHT},
     AppState,
 };
 
@@ -37,6 +37,10 @@ pub fn process_event(
         }
 
         // ── Mouse button down ─────────────────────────────────────────────────
+        // Accept both real mouse and SDL-synthesized touch events (u32::MAX).
+        // Finger events are NOT handled separately — SDL's auto touch→mouse
+        // synthesis gives correct window-local pixels; raw FingerDown coords
+        // are normalized to the full desktop and break on multi-monitor setups.
         Event::MouseButtonDown { mouse_btn: MouseButton::Left, x, y, .. } => {
             handle_press(*x, *y, state, canvas, layout);
         }
@@ -51,20 +55,6 @@ pub fn process_event(
             handle_release(*x, *y, state);
         }
 
-        // ── Touch / stylus (single-touch) ─────────────────────────────────────
-        Event::FingerDown { x, y, .. } => {
-            let (mx, my) = finger_to_px(*x, *y, canvas);
-            handle_press(mx, my, state, canvas, layout);
-        }
-        Event::FingerMotion { x, y, .. } => {
-            let (mx, my) = finger_to_px(*x, *y, canvas);
-            handle_move(mx, my, state, canvas);
-        }
-        Event::FingerUp { x, y, .. } => {
-            let (mx, my) = finger_to_px(*x, *y, canvas);
-            handle_release(mx, my, state);
-        }
-
         Event::Window { win_event: WindowEvent::Resized(w, h), .. }
         | Event::Window { win_event: WindowEvent::SizeChanged(w, h), .. } => {
             state.window_size = (*w as u32, *h as u32);
@@ -75,21 +65,13 @@ pub fn process_event(
     true
 }
 
-// ── Touch coordinate helper ──────────────────────────────────────────────────
-
-/// Convert SDL2 normalized finger coords (0.0–1.0) to canvas pixel coords.
-fn finger_to_px(x: f32, y: f32, canvas: &Canvas) -> (i32, i32) {
-    ((x * canvas.width as f32).round() as i32, (y * canvas.height as f32).round() as i32)
-}
-
 // ── Shared press / move / release handlers ────────────────────────────────────
 
 fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, layout: &ToolbarLayout) {
     if state.show_device_picker {
         if let Some(picker) = &mut state.device_picker {
-            if let Some(idx) = picker.click_hit(mx, my, canvas.width as i32, canvas.height as i32) {
-                picker.selected = idx;
-                state.picker_confirmed = Some(idx);
+            if let Some(result) = picker.click_enter(mx, my, canvas.width as i32, canvas.height as i32) {
+                state.picker_confirmed = Some(result);
                 state.show_device_picker = false;
             }
         }
@@ -148,6 +130,9 @@ fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, layout:
                 size:   state.brush_size,
             }));
         }
+        Tool::Laser => {
+            state.laser_trail.push((mx, my, std::time::Instant::now(), state.color));
+        }
         // Shape tools: push undo here; object committed on release
         _ => {
             state.scene.push_undo();
@@ -156,8 +141,14 @@ fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, layout:
 }
 
 fn handle_move(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas) {
-    if !state.mouse_down || state.show_device_picker { return; }
+    if state.show_device_picker { return; }
     if my < MENU_HEIGHT || my >= canvas.height as i32 - TOOLBAR_HEIGHT { return; }
+    // Laser pointer tracks hover — no mouse button required
+    if state.active_tool == Tool::Laser {
+        state.laser_trail.push((mx, my, std::time::Instant::now(), state.color));
+        return;
+    }
+    if !state.mouse_down { return; }
     let prev = state.drag_cur;
     state.drag_cur = (mx, my);
     let (dx, dy) = (mx - prev.0, my - prev.1);
@@ -166,22 +157,26 @@ fn handle_move(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas) {
             if let Some(idx) = state.scene.selected {
                 if let Some(obj) = state.scene.objects.get_mut(idx) {
                     obj.translate(dx, dy);
+                    state.scene.dirty = true;
                 }
             }
         }
         Tool::Pen => {
             if let Some(DrawObject::Pen(s)) = state.scene.objects.last_mut() {
                 s.points.push((mx, my));
+                state.scene.dirty = true;
             }
         }
         Tool::Eraser => {
             if let Some(DrawObject::Erase(e)) = state.scene.objects.last_mut() {
                 e.points.push((mx, my));
+                state.scene.dirty = true;
             }
         }
         Tool::Highlight => {
             if let Some(DrawObject::Highlight(h)) = state.scene.objects.last_mut() {
                 h.points.push((mx, my));
+                state.scene.dirty = true;
             }
         }
         // shape tools: preview is drawn by main.rs via preview_object()
@@ -244,15 +239,27 @@ fn handle_keydown(
     if state.show_device_picker {
         if let Some(picker) = &mut state.device_picker {
             match k {
-                Keycode::Up    => picker.move_up(),
-                Keycode::Down  => picker.move_down(),
+                Keycode::Up => {
+                    picker.move_up();
+                    picker.scroll_to_cursor(state.window_size.1 as i32);
+                }
+                Keycode::Down => {
+                    picker.move_down();
+                    picker.scroll_to_cursor(state.window_size.1 as i32);
+                }
                 Keycode::Return | Keycode::KpEnter => {
-                    let idx = picker.selected;
-                    state.picker_confirmed = Some(idx);
-                    state.show_device_picker = false;
+                    if let Some(result) = picker.enter() {
+                        state.picker_confirmed = Some(result);
+                        state.show_device_picker = false;
+                    }
                 }
                 Keycode::Escape | Keycode::F2 => {
-                    state.show_device_picker = false;
+                    if picker.stage == PickerStage::Modes {
+                        picker.stage = PickerStage::Devices;
+                        picker.mode_cursor = 0;
+                    } else {
+                        state.show_device_picker = false;
+                    }
                 }
                 _ => {}
             }
@@ -350,6 +357,8 @@ fn handle_toolbar_click(mx: i32, my: i32, layout: &ToolbarLayout, state: &mut Ap
     } else if layout.brush_plus.contains_point((mx, my)) {
         state.brush_size = (state.brush_size + 4).min(200);
         state.tool_sizes[state.active_tool.index()] = state.brush_size;
+    } else if layout.freeze_frame.contains_point((mx, my)) {
+        state.freeze_frame = !state.freeze_frame;
     } else if layout.change_input.contains_point((mx, my)) {
         state.show_device_picker = true;
     }

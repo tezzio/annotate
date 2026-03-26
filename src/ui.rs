@@ -20,6 +20,41 @@ const TOOL_BTN_PAD:   i32 = 8;
 const PALETTE_SWATCH: i32 = 44;
 const PALETTE_PAD:    i32 = 6;
 
+// ── Text surface cache ──────────────────────────────────────────────────────
+
+/// Pre-rasterized surface cache. Avoids calling SDL2_TTF on every render frame
+/// for text that hasn't changed (tool icons, labels, static UI strings).
+pub struct TextCache {
+    map: std::collections::HashMap<u64, sdl2::surface::Surface<'static>>,
+}
+
+impl TextCache {
+    pub fn new() -> Self { Self { map: std::collections::HashMap::new() } }
+
+    fn key(font: &Font, text: &str, color: Color) -> u64 {
+        use std::hash::{Hash, Hasher};
+        use std::collections::hash_map::DefaultHasher;
+        let mut h = DefaultHasher::new();
+        (font as *const Font as usize).hash(&mut h);
+        text.hash(&mut h);
+        [color.r, color.g, color.b, color.a].hash(&mut h);
+        h.finish()
+    }
+
+    /// Return a reference to a pre-rasterized surface, rendering it on first
+    /// access.  The returned reference is valid until the cache is mutated.
+    pub fn surface<'a>(&'a mut self, font: &Font, text: &str, color: Color)
+        -> &'a sdl2::surface::Surface<'static>
+    {
+        let k = Self::key(font, text, color);
+        self.map.entry(k).or_insert_with(|| {
+            font.render(text).blended(color).unwrap_or_else(|_| {
+                sdl2::surface::Surface::new(1, 1, sdl2::pixels::PixelFormatEnum::RGBA8888).unwrap()
+            })
+        })
+    }
+}
+
 // ── FontAwesome 6 Solid codepoints ───────────────────────────────────────────
 
 /// Return the FontAwesome 6 Solid unicode character for each tool.
@@ -34,6 +69,7 @@ fn tool_fa_icon(tool: Tool) -> char {
         Tool::Select    => '\u{f245}', // mouse-pointer
         Tool::Eraser    => '\u{f12d}', // eraser
         Tool::Highlight => '\u{f5c1}', // highlighter
+        Tool::Laser     => '\u{f140}', // bullseye
     }
 }
 
@@ -46,6 +82,7 @@ pub struct ToolbarLayout {
     pub brush_minus:    Rect,
     pub brush_plus:     Rect,
     pub brush_label:    Rect,
+    pub freeze_frame:   Rect,
     pub change_input:   Rect,
 }
 
@@ -58,6 +95,7 @@ impl Default for ToolbarLayout {
             brush_minus:  z,
             brush_plus:   z,
             brush_label:  z,
+            freeze_frame: z,
             change_input: z,
         }
     }
@@ -71,7 +109,7 @@ impl ToolbarLayout {
         // Tool buttons — left side
         let tools_order = [
             Tool::Pen, Tool::Line, Tool::Rect, Tool::Circle,
-            Tool::Arrow, Tool::Text, Tool::Select, Tool::Eraser, Tool::Highlight,
+            Tool::Arrow, Tool::Text, Tool::Select, Tool::Eraser, Tool::Highlight, Tool::Laser,
         ];
         let mut x = TOOL_BTN_PAD;
         for tool in tools_order {
@@ -101,9 +139,11 @@ impl ToolbarLayout {
         const BRUSH_GAP:     i32 = 6;
         const RIGHT_PAD:     i32 = 8;
         let by  = y_base + (TOOLBAR_HEIGHT - TOOL_BTN_SIZE) / 2;
-        // change_input sits flush to the right with a small margin
+        // change_input sits flush to the right
         let ci_x = canvas_width - TOOL_BTN_SIZE - RIGHT_PAD;
-        let bx = ci_x - BRUSH_GAP
+        // freeze sits immediately left of change_input
+        let fz_x = ci_x - BRUSH_GAP - TOOL_BTN_SIZE;
+        let bx = fz_x - BRUSH_GAP
             - BRUSH_BTN_W - BRUSH_GAP - BRUSH_LABEL_W - BRUSH_GAP - BRUSH_BTN_W;
         layout.brush_minus = Rect::new(bx, by, BRUSH_BTN_W as u32, TOOL_BTN_SIZE as u32);
         layout.brush_label = Rect::new(
@@ -114,6 +154,7 @@ impl ToolbarLayout {
             bx + BRUSH_BTN_W + BRUSH_GAP + BRUSH_LABEL_W + BRUSH_GAP, by,
             BRUSH_BTN_W as u32, TOOL_BTN_SIZE as u32,
         );
+        layout.freeze_frame = Rect::new(fz_x, by, TOOL_BTN_SIZE as u32, TOOL_BTN_SIZE as u32);
 
         // Change Input button — far right
         layout.change_input = Rect::new(
@@ -139,6 +180,8 @@ pub fn draw_toolbar(
     brush_size: u32,
     canvas_height: i32,
     canvas_width: i32,
+    freeze_frame: bool,
+    cache: &mut TextCache,
 ) {
     let y_base = canvas_height - TOOLBAR_HEIGHT;
 
@@ -168,7 +211,7 @@ pub fn draw_toolbar(
         // FA icon glyph
         let icon = tool_fa_icon(*tool).to_string();
         let icon_color = if is_active { Color::RGB(255, 255, 255) } else { Color::RGB(190, 190, 190) };
-        render_text_centered(sdl, icon_font, &tc, &icon, icon_color, *rect);
+        render_text_centered(sdl, icon_font, &tc, cache, &icon, icon_color, *rect);
     }
 
     // Palette swatches
@@ -194,9 +237,20 @@ pub fn draw_toolbar(
     sdl.draw_rect(layout.brush_plus).ok();
     let white = Color::RGB(220, 220, 220);
     let grey  = Color::RGB(170, 170, 170);
-    render_text_centered(sdl, font, &tc, "−", white, layout.brush_minus);
-    render_text_centered(sdl, font, &tc, "+", white, layout.brush_plus);
-    render_text_centered(sdl, font, &tc, &brush_size.to_string(), grey, layout.brush_label);
+    render_text_centered(sdl, font, &tc, cache, "−", white, layout.brush_minus);
+    render_text_centered(sdl, font, &tc, cache, "+", white, layout.brush_plus);
+    render_text_centered(sdl, font, &tc, cache, &brush_size.to_string(), grey, layout.brush_label);
+
+    // Freeze frame button — fa-pause when live, fa-play when frozen
+    let fz_bg = if freeze_frame { Color::RGB(0x5a, 0x3a, 0x00) } else { Color::RGB(0x2a, 0x2a, 0x2a) };
+    let fz_border = if freeze_frame { Color::RGB(0xff, 0xaa, 0x00) } else { Color::RGB(0x44, 0x44, 0x44) };
+    let fz_icon_col = if freeze_frame { Color::RGB(0xff, 0xcc, 0x55) } else { Color::RGB(190, 190, 190) };
+    let fz_icon = if freeze_frame { '\u{f04b}' } else { '\u{f04c}' }; // fa-play / fa-pause
+    sdl.set_draw_color(fz_bg);
+    sdl.fill_rect(layout.freeze_frame).ok();
+    sdl.set_draw_color(fz_border);
+    sdl.draw_rect(layout.freeze_frame).ok();
+    render_text_centered(sdl, icon_font, &tc, cache, &fz_icon.to_string(), fz_icon_col, layout.freeze_frame);
 
     // Change Input button (video camera icon)
     sdl.set_draw_color(Color::RGB(0x2a, 0x2a, 0x2a));
@@ -204,7 +258,7 @@ pub fn draw_toolbar(
     sdl.set_draw_color(Color::RGB(0x44, 0x66, 0x44));
     sdl.draw_rect(layout.change_input).ok();
     let cam_icon = '\u{f03d}'.to_string(); // fa-video
-    render_text_centered(sdl, icon_font, &tc, &cam_icon, Color::RGB(120, 200, 120), layout.change_input);
+    render_text_centered(sdl, icon_font, &tc, cache, &cam_icon, Color::RGB(120, 200, 120), layout.change_input);
 }
 
 // ── Menu bar ──────────────────────────────────────────────────────────────────
@@ -262,6 +316,11 @@ impl MenuBar {
         Rect::new(canvas_w - 120, 0, 120, MENU_HEIGHT as u32)
     }
 
+    fn fps_rect(&self, canvas_w: i32) -> Rect {
+        // FPS counter sits to the left of the Input button
+        Rect::new(canvas_w - 360, 0, 230, MENU_HEIGHT as u32)
+    }
+
     fn dropdown_rect(&self, canvas_w: i32) -> Rect {
         let row_h     = 36i32;
         let panel_w   = 480i32;
@@ -277,7 +336,7 @@ impl MenuBar {
     }
 
     /// Draw the menu bar (and dropdown if open)
-    pub fn draw(&self, sdl: &mut SdlCanvas<Window>, font: &Font, canvas_w: i32, has_undo: bool, has_redo: bool) {
+    pub fn draw(&self, sdl: &mut SdlCanvas<Window>, font: &Font, canvas_w: i32, has_undo: bool, has_redo: bool, capture_fps: f32, display_fps: f32, cache: &mut TextCache) {
         // Background bar
         sdl.set_draw_color(Color::RGB(0x14, 0x14, 0x14));
         sdl.fill_rect(Rect::new(0, 0, canvas_w as u32, MENU_HEIGHT as u32)).ok();
@@ -289,11 +348,19 @@ impl MenuBar {
 
         // App title — left
         render_text(
-            sdl, font, &tc,
+            sdl, font, &tc, cache,
             &self.hostname,
             Color::RGB(120, 120, 120),
             Rect::new(12, 0, 220, MENU_HEIGHT as u32),
         );
+
+        // FPS counter — to the left of Input button
+        let fps_label = if capture_fps > 0.0 {
+            format!("in {:.0}  disp {:.0}", capture_fps, display_fps)
+        } else {
+            format!("disp {:.0}", display_fps)
+        };
+        render_text(sdl, font, &tc, cache, &fps_label, Color::RGB(90, 180, 90), self.fps_rect(canvas_w));
 
         // "Input" menu button — right
         let item_rect = self.menu_item_rect(canvas_w);
@@ -302,21 +369,21 @@ impl MenuBar {
             sdl.fill_rect(item_rect).ok();
         }
         let item_color = if self.open { Color::RGB(255,255,255) } else { Color::RGB(200, 200, 200) };
-        render_text(sdl, font, &tc, "Input  ▾", item_color, item_rect);
+        render_text(sdl, font, &tc, cache, "Input  ▾", item_color, item_rect);
 
         // Undo button
         let undo_r = self.undo_rect();
         let undo_col = if has_undo { Color::RGB(200, 200, 200) } else { Color::RGB(70, 70, 70) };
-        render_text(sdl, font, &tc, "↩ Undo", undo_col, undo_r);
+        render_text(sdl, font, &tc, cache, "↩ Undo", undo_col, undo_r);
 
         // Redo button
         let redo_r = self.redo_rect();
         let redo_col = if has_redo { Color::RGB(200, 200, 200) } else { Color::RGB(70, 70, 70) };
-        render_text(sdl, font, &tc, "↪ Redo", redo_col, redo_r);
+        render_text(sdl, font, &tc, cache, "↪ Redo", redo_col, redo_r);
 
         // Clear button
         let clear_r = self.clear_rect();
-        render_text(sdl, font, &tc, "✕ Clear", Color::RGB(200, 80, 80), clear_r);
+        render_text(sdl, font, &tc, cache, "✕ Clear", Color::RGB(200, 80, 80), clear_r);
 
         // Dropdown
         if self.open {
@@ -336,7 +403,7 @@ impl MenuBar {
                 let bullet = if is_active { "● " } else { "  " };
                 let label = format!("{}{}", bullet, self.entry_label(i));
                 let color = if is_active { Color::RGB(120, 220, 120) } else { Color::RGB(200, 200, 200) };
-                render_text(sdl, font, &tc, &label,
+                render_text(sdl, font, &tc, cache, &label,
                     color,
                     Rect::new(rr.x + 8, rr.y, (rr.width() - 8) as u32, rr.height()));
             }
@@ -385,16 +452,23 @@ impl MenuBar {
 
 // ── Device picker modal ───────────────────────────────────────────────────────
 
+#[derive(PartialEq)]
+pub enum PickerStage { Devices, Modes }
+
 pub struct DevicePicker {
-    pub devices: Vec<DeviceInfo>,
-    pub selected: usize,
+    pub devices:       Vec<DeviceInfo>,
+    pub device_cursor: usize,
+    pub mode_cursor:   usize,
+    pub stage:         PickerStage,
+    pub scroll_offset: usize,  // first visible row index
 }
 
 impl DevicePicker {
     pub fn new(devices: Vec<DeviceInfo>) -> Self {
-        Self { devices, selected: 0 }
+        Self { devices, device_cursor: 0, mode_cursor: 0, stage: PickerStage::Devices, scroll_offset: 0 }
     }
 
+    /// Backward-compat alias used in a few places.
     pub fn entry_count(&self) -> usize { self.devices.len() + 1 }
 
     pub fn label(&self, idx: usize) -> String {
@@ -406,65 +480,279 @@ impl DevicePicker {
         }
     }
 
-    pub fn move_up(&mut self)   { if self.selected > 0 { self.selected -= 1; } }
-    pub fn move_down(&mut self) { if self.selected + 1 < self.entry_count() { self.selected += 1; } }
+    fn caps_label(&self, idx: usize) -> String {
+        if idx == 0 { String::new() }
+        else { self.devices[idx - 1].caps_summary.clone() }
+    }
 
-    pub fn draw(&self, sdl: &mut SdlCanvas<Window>, font: &Font, canvas_w: i32, canvas_h: i32) {
+    /// Ensure the cursor is within the visible scroll window for the given canvas height.
+    pub fn scroll_to_cursor(&mut self, canvas_h: i32) {
+        let row_h       = 56i32;
+        let header_h    = 64i32;
+        let footer_h    = 36i32;
+        let avail_h     = canvas_h - 40;
+        let max_visible = ((avail_h - header_h - footer_h) / row_h).max(1) as usize;
+        let cursor = match self.stage {
+            PickerStage::Devices => self.device_cursor,
+            PickerStage::Modes   => self.mode_cursor,
+        };
+        // Scroll down: cursor went below visible window
+        if cursor >= self.scroll_offset + max_visible {
+            self.scroll_offset = cursor + 1 - max_visible;
+        }
+        // Scroll up: cursor went above visible window
+        if cursor < self.scroll_offset {
+            self.scroll_offset = cursor;
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        match self.stage {
+            PickerStage::Devices => {
+                if self.device_cursor > 0 {
+                    self.device_cursor -= 1;
+                    if self.device_cursor < self.scroll_offset {
+                        self.scroll_offset = self.device_cursor;
+                    }
+                }
+            }
+            PickerStage::Modes => {
+                if self.mode_cursor > 0 {
+                    self.mode_cursor -= 1;
+                    if self.mode_cursor < self.scroll_offset {
+                        self.scroll_offset = self.mode_cursor;
+                    }
+                }
+            }
+        }
+    }
+    pub fn move_down(&mut self) {
+        match self.stage {
+            PickerStage::Devices => {
+                if self.device_cursor + 1 < self.entry_count() {
+                    self.device_cursor += 1;
+                }
+            }
+            PickerStage::Modes => {
+                let n = self.current_mode_count();
+                if self.mode_cursor + 1 < n { self.mode_cursor += 1; }
+            }
+        }
+    }
+
+    fn current_mode_count(&self) -> usize {
+        if self.device_cursor == 0 { 0 }
+        else { self.devices[self.device_cursor - 1].modes.len() }
+    }
+
+    /// Call on Enter key or row click. Returns Some((device_idx, mode_idx)) when confirmed.
+    pub fn enter(&mut self) -> Option<(usize, usize)> {
+        match self.stage {
+            PickerStage::Devices => {
+                if self.device_cursor == 0 {
+                    return Some((0, 0));  // no input
+                }
+                let modes = &self.devices[self.device_cursor - 1].modes;
+                if modes.len() <= 1 {
+                    Some((self.device_cursor, 0))
+                } else {
+                    self.stage = PickerStage::Modes;
+                    self.mode_cursor = 0;
+                    self.scroll_offset = 0;
+                    None
+                }
+            }
+            PickerStage::Modes => {
+                let result = Some((self.device_cursor, self.mode_cursor));
+                self.stage = PickerStage::Devices;
+                result
+            }
+        }
+    }
+
+    /// Call on click. Sets the cursor to the clicked row then calls enter().
+    /// Returns Some if a selection was confirmed.
+    pub fn click_enter(&mut self, mx: i32, my: i32, canvas_w: i32, canvas_h: i32) -> Option<(usize, usize)> {
+        let panel_w     = 720i32;
+        let row_h       = 56i32;
+        let header_h    = 64i32;
+        let footer_h    = 36i32;
+        let avail_h     = canvas_h - 40;
+        let max_visible = ((avail_h - header_h - footer_h) / row_h).max(1) as usize;
+        let px          = (canvas_w - panel_w) / 2;
+
+        match self.stage {
+            PickerStage::Devices => {
+                let total   = self.entry_count();
+                let visible = total.min(max_visible);
+                let scroll  = self.scroll_offset.min(total.saturating_sub(visible));
+                let panel_h = header_h + row_h * visible as i32 + footer_h;
+                let py      = (canvas_h - panel_h) / 2;
+                for vi in 0..visible {
+                    let i  = scroll + vi;
+                    let ry = py + header_h + (vi as i32) * row_h;
+                    if Rect::new(px + 8, ry, (panel_w - 16) as u32, (row_h - 4) as u32)
+                        .contains_point((mx, my))
+                    {
+                        self.device_cursor = i;
+                        return self.enter();
+                    }
+                }
+                None
+            }
+            PickerStage::Modes => {
+                let total   = self.current_mode_count();
+                let visible = total.min(max_visible);
+                let scroll  = self.scroll_offset.min(total.saturating_sub(visible));
+                let panel_h = header_h + row_h * visible as i32 + footer_h;
+                let py      = (canvas_h - panel_h) / 2;
+                for vi in 0..visible {
+                    let i  = scroll + vi;
+                    let ry = py + header_h + (vi as i32) * row_h;
+                    if Rect::new(px + 8, ry, (panel_w - 16) as u32, (row_h - 4) as u32)
+                        .contains_point((mx, my))
+                    {
+                        self.mode_cursor = i;
+                        return self.enter();
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    pub fn draw(&self, sdl: &mut SdlCanvas<Window>, font: &Font, canvas_w: i32, canvas_h: i32, cache: &mut TextCache) {
         sdl.set_draw_color(Color::RGBA(0, 0, 0, 180));
         sdl.fill_rect(Rect::new(0, 0, canvas_w as u32, canvas_h as u32)).ok();
 
-        let panel_w = 640i32;
-        let row_h   = 44i32;
-        let count   = self.entry_count() as i32;
-        let panel_h = 64 + row_h * count + 32;
-        let px = (canvas_w - panel_w) / 2;
-        let py = (canvas_h - panel_h) / 2;
-
-        sdl.set_draw_color(Color::RGB(0x22, 0x22, 0x22));
-        sdl.fill_rect(Rect::new(px, py, panel_w as u32, panel_h as u32)).ok();
-        sdl.set_draw_color(Color::RGB(0x44, 0x44, 0x44));
-        sdl.draw_rect(Rect::new(px, py, panel_w as u32, panel_h as u32)).ok();
-
+        let panel_w  = 720i32;
+        let row_h    = 56i32;
+        let header_h = 64i32;
+        let footer_h = 36i32;
         let tc = sdl.texture_creator();
-        render_text(sdl, font, &tc, "Select capture device",
-            Color::RGB(220, 220, 220),
-            Rect::new(px + 16, py + 16, (panel_w - 32) as u32, 32));
 
-        for i in 0..self.entry_count() {
-            let ry = py + 64 + (i as i32) * row_h;
-            let row_rect = Rect::new(px + 8, ry, (panel_w - 16) as u32, (row_h - 4) as u32);
-            if i == self.selected {
-                sdl.set_draw_color(Color::RGB(0x2a, 0x4a, 0x7a));
-                sdl.fill_rect(row_rect).ok();
-                sdl.set_draw_color(Color::RGB(0x4a, 0x9e, 0xff));
-                sdl.draw_rect(row_rect).ok();
+        // Maximum rows we can show without overflowing the screen
+        let avail_h      = canvas_h - 40;  // 20px margin top+bottom
+        let max_visible  = ((avail_h - header_h - footer_h) / row_h).max(1) as usize;
+        let px           = (canvas_w - panel_w) / 2;
+
+        match self.stage {
+            PickerStage::Devices => {
+                let total        = self.entry_count();
+                let visible      = total.min(max_visible);
+                let scroll       = self.scroll_offset.min(total.saturating_sub(visible));
+                let panel_h      = header_h + row_h * visible as i32 + footer_h;
+                let py           = (canvas_h - panel_h) / 2;
+
+                sdl.set_draw_color(Color::RGB(0x22, 0x22, 0x22));
+                sdl.fill_rect(Rect::new(px, py, panel_w as u32, panel_h as u32)).ok();
+                sdl.set_draw_color(Color::RGB(0x44, 0x44, 0x44));
+                sdl.draw_rect(Rect::new(px, py, panel_w as u32, panel_h as u32)).ok();
+
+                let title = if total > max_visible {
+                    format!("Select capture device  ({}/{})", self.device_cursor + 1, total)
+                } else {
+                    "Select capture device".to_string()
+                };
+                render_text(sdl, font, &tc, cache, &title,
+                    Color::RGB(220, 220, 220),
+                    Rect::new(px + 16, py + 16, (panel_w - 32) as u32, 32));
+
+                // Scroll indicator arrows
+                if scroll > 0 {
+                    render_text(sdl, font, &tc, cache, "\u{25b2} more",
+                        Color::RGB(150, 150, 150),
+                        Rect::new(px + panel_w - 80, py + 18, 70, 20));
+                }
+                if scroll + visible < total {
+                    render_text(sdl, font, &tc, cache, "\u{25bc} more",
+                        Color::RGB(150, 150, 150),
+                        Rect::new(px + panel_w - 80, py + panel_h - footer_h + 8, 70, 20));
+                }
+
+                for vi in 0..visible {
+                    let i  = scroll + vi;
+                    let ry = py + header_h + (vi as i32) * row_h;
+                    let row_rect = Rect::new(px + 8, ry, (panel_w - 16) as u32, (row_h - 4) as u32);
+                    let is_sel = i == self.device_cursor;
+                    if is_sel {
+                        sdl.set_draw_color(Color::RGB(0x2a, 0x4a, 0x7a));
+                        sdl.fill_rect(row_rect).ok();
+                        sdl.set_draw_color(Color::RGB(0x4a, 0x9e, 0xff));
+                        sdl.draw_rect(row_rect).ok();
+                    }
+                    let name_col = if is_sel { Color::RGB(255,255,255) } else { Color::RGB(180,180,180) };
+                    let caps_col = if is_sel { Color::RGB(140,210,255) } else { Color::RGB(100,140,100) };
+                    render_text(sdl, font, &tc, cache, &self.label(i), name_col,
+                        Rect::new(px + 20, ry + 4, (panel_w - 40) as u32, 22));
+                    let caps = self.caps_label(i);
+                    if !caps.is_empty() {
+                        render_text(sdl, font, &tc, cache, &caps, caps_col,
+                            Rect::new(px + 28, ry + 28, (panel_w - 48) as u32, 20));
+                    }
+                }
+                render_text(sdl, font, &tc, cache,
+                    "\u{2191}\u{2193} navigate   Enter to select   F2 to cancel",
+                    Color::RGB(100, 100, 100),
+                    Rect::new(px + 16, py + panel_h - footer_h + 8, (panel_w - 32) as u32, 20));
             }
-            let color = if i == self.selected { Color::RGB(255,255,255) } else { Color::RGB(180,180,180) };
-            render_text(sdl, font, &tc, &self.label(i), color,
-                Rect::new(px + 20, ry + 4, (panel_w - 40) as u32, (row_h - 8) as u32));
-        }
 
-        render_text(sdl, font, &tc,
-            "↑↓ navigate   Enter / click to confirm   F2 to cancel",
-            Color::RGB(100, 100, 100),
-            Rect::new(px + 16, py + panel_h - 28, (panel_w - 32) as u32, 20));
-    }
+            PickerStage::Modes => {
+                let dev          = &self.devices[self.device_cursor - 1];
+                let total        = dev.modes.len();
+                let visible      = total.min(max_visible);
+                let scroll       = self.scroll_offset.min(total.saturating_sub(visible));
+                let panel_h      = header_h + row_h * visible as i32 + footer_h;
+                let py           = (canvas_h - panel_h) / 2;
 
-    pub fn click_hit(&self, mx: i32, my: i32, canvas_w: i32, canvas_h: i32) -> Option<usize> {
-        let panel_w = 640i32;
-        let row_h   = 44i32;
-        let count   = self.entry_count() as i32;
-        let panel_h = 64 + row_h * count + 32;
-        let px = (canvas_w - panel_w) / 2;
-        let py = (canvas_h - panel_h) / 2;
-        for i in 0..self.entry_count() {
-            let ry = py + 64 + (i as i32) * row_h;
-            if Rect::new(px + 8, ry, (panel_w - 16) as u32, (row_h - 4) as u32)
-                .contains_point((mx, my)) {
-                return Some(i);
+                sdl.set_draw_color(Color::RGB(0x22, 0x22, 0x22));
+                sdl.fill_rect(Rect::new(px, py, panel_w as u32, panel_h as u32)).ok();
+                sdl.set_draw_color(Color::RGB(0x44, 0x44, 0x44));
+                sdl.draw_rect(Rect::new(px, py, panel_w as u32, panel_h as u32)).ok();
+
+                let title = if total > max_visible {
+                    format!("Select format \u{2014} {}  ({}/{})", dev.name, self.mode_cursor + 1, total)
+                } else {
+                    format!("Select format \u{2014} {}", dev.name)
+                };
+                render_text(sdl, font, &tc, cache, &title,
+                    Color::RGB(220, 220, 220),
+                    Rect::new(px + 16, py + 16, (panel_w - 32) as u32, 32));
+
+                // Scroll indicator arrows
+                if scroll > 0 {
+                    render_text(sdl, font, &tc, cache, "\u{25b2} more",
+                        Color::RGB(150, 150, 150),
+                        Rect::new(px + panel_w - 80, py + 18, 70, 20));
+                }
+                if scroll + visible < total {
+                    render_text(sdl, font, &tc, cache, "\u{25bc} more",
+                        Color::RGB(150, 150, 150),
+                        Rect::new(px + panel_w - 80, py + panel_h - footer_h + 8, 70, 20));
+                }
+
+                for vi in 0..visible {
+                    let i    = scroll + vi;
+                    let mode = &dev.modes[i];
+                    let ry   = py + header_h + (vi as i32) * row_h;
+                    let row_rect = Rect::new(px + 8, ry, (panel_w - 16) as u32, (row_h - 4) as u32);
+                    let is_sel = i == self.mode_cursor;
+                    if is_sel {
+                        sdl.set_draw_color(Color::RGB(0x2a, 0x4a, 0x7a));
+                        sdl.fill_rect(row_rect).ok();
+                        sdl.set_draw_color(Color::RGB(0x4a, 0x9e, 0xff));
+                        sdl.draw_rect(row_rect).ok();
+                    }
+                    let col = if is_sel { Color::RGB(255,255,255) } else { Color::RGB(180,180,180) };
+                    render_text(sdl, font, &tc, cache, &mode.label(), col,
+                        Rect::new(px + 20, ry + 14, (panel_w - 40) as u32, 24));
+                }
+                render_text(sdl, font, &tc, cache,
+                    "\u{2191}\u{2193} navigate   Enter to confirm   Esc to go back",
+                    Color::RGB(100, 100, 100),
+                    Rect::new(px + 16, py + panel_h - footer_h + 8, (panel_w - 32) as u32, 20));
             }
         }
-        None
     }
 }
 
@@ -475,13 +763,14 @@ pub fn render_text(
     sdl: &mut SdlCanvas<Window>,
     font: &Font,
     tc: &sdl2::render::TextureCreator<sdl2::video::WindowContext>,
+    cache: &mut TextCache,
     text: &str,
     color: Color,
     dst: Rect,
 ) {
     if text.is_empty() { return; }
-    let surface = match font.render(text).blended(color) { Ok(s) => s, Err(_) => return };
-    let texture = match tc.create_texture_from_surface(&surface) { Ok(t) => t, Err(_) => return };
+    let surface = cache.surface(font, text, color);
+    let texture = match tc.create_texture_from_surface(surface) { Ok(t) => t, Err(_) => return };
     let q = texture.query();
     let tw = q.width.min(dst.width()) as i32;
     let th = q.height.min(dst.height()) as i32;
@@ -495,13 +784,14 @@ fn render_text_centered(
     sdl: &mut SdlCanvas<Window>,
     font: &Font,
     tc: &sdl2::render::TextureCreator<sdl2::video::WindowContext>,
+    cache: &mut TextCache,
     text: &str,
     color: Color,
     dst: Rect,
 ) {
     if text.is_empty() { return; }
-    let surface = match font.render(text).blended(color) { Ok(s) => s, Err(_) => return };
-    let texture = match tc.create_texture_from_surface(&surface) { Ok(t) => t, Err(_) => return };
+    let surface = cache.surface(font, text, color);
+    let texture = match tc.create_texture_from_surface(surface) { Ok(t) => t, Err(_) => return };
     let q = texture.query();
     let tw = q.width.min(dst.width())  as i32;
     let th = q.height.min(dst.height()) as i32;
