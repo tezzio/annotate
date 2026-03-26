@@ -233,8 +233,12 @@ fn main() {
         if let Some((mx, my)) = state.pending_menu_click.take() {
             let action = menu_bar.click(mx, my, canvas_w as i32);
             match action {
-                ui::MenuAction::Undo => input::undo(&mut state, &mut ann_canvas),
-                ui::MenuAction::Redo => input::redo(&mut state, &mut ann_canvas),
+                ui::MenuAction::Undo  => input::undo(&mut state, &mut ann_canvas),
+                ui::MenuAction::Redo  => input::redo(&mut state, &mut ann_canvas),
+                ui::MenuAction::Clear => {
+                    input::push_undo(&mut state, &ann_canvas);
+                    ann_canvas.clear();
+                }
                 _ => {}
             }
             if let ui::MenuAction::SelectDevice(idx) = action {

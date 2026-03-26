@@ -98,9 +98,11 @@ impl ToolbarLayout {
         const BRUSH_BTN_W:   i32 = TOOL_BTN_SIZE;  // square
         const BRUSH_LABEL_W: i32 = 60;
         const BRUSH_GAP:     i32 = 6;
+        const RIGHT_PAD:     i32 = 8;
         let by  = y_base + (TOOLBAR_HEIGHT - TOOL_BTN_SIZE) / 2;
-        // change_input sits at canvas_width - 52; leave 10px gap before it
-        let bx = canvas_width - 52 - 10
+        // change_input sits flush to the right with a small margin
+        let ci_x = canvas_width - TOOL_BTN_SIZE - RIGHT_PAD;
+        let bx = ci_x - BRUSH_GAP
             - BRUSH_BTN_W - BRUSH_GAP - BRUSH_LABEL_W - BRUSH_GAP - BRUSH_BTN_W;
         layout.brush_minus = Rect::new(bx, by, BRUSH_BTN_W as u32, TOOL_BTN_SIZE as u32);
         layout.brush_label = Rect::new(
@@ -114,7 +116,7 @@ impl ToolbarLayout {
 
         // Change Input button — far right
         layout.change_input = Rect::new(
-            canvas_width - 52,
+            ci_x,
             y_base + (TOOLBAR_HEIGHT - TOOL_BTN_SIZE) / 2,
             TOOL_BTN_SIZE as u32,
             TOOL_BTN_SIZE as u32,
@@ -212,6 +214,7 @@ pub enum MenuAction {
     None,
     Undo,
     Redo,
+    Clear,
     /// User clicked a device entry; index 0 = "No input", 1+ = devices list
     SelectDevice(usize),
 }
@@ -251,6 +254,7 @@ impl MenuBar {
 
     fn undo_rect(&self) -> Rect { Rect::new(220, 0, 72, MENU_HEIGHT as u32) }
     fn redo_rect(&self) -> Rect { Rect::new(296, 0, 72, MENU_HEIGHT as u32) }
+    fn clear_rect(&self) -> Rect { Rect::new(372, 0, 80, MENU_HEIGHT as u32) }
 
     fn menu_item_rect(&self, canvas_w: i32) -> Rect {
         // The "Input" menu item in the bar
@@ -309,6 +313,10 @@ impl MenuBar {
         let redo_col = if has_redo { Color::RGB(200, 200, 200) } else { Color::RGB(70, 70, 70) };
         render_text(sdl, font, &tc, "↪ Redo", redo_col, redo_r);
 
+        // Clear button
+        let clear_r = self.clear_rect();
+        render_text(sdl, font, &tc, "✕ Clear", Color::RGB(200, 80, 80), clear_r);
+
         // Dropdown
         if self.open {
             let dr = self.dropdown_rect(canvas_w);
@@ -361,6 +369,9 @@ impl MenuBar {
         } else if self.redo_rect().contains_point((mx, my)) {
             if self.open { self.open = false; }
             return MenuAction::Redo;
+        } else if self.clear_rect().contains_point((mx, my)) {
+            if self.open { self.open = false; }
+            return MenuAction::Clear;
         } else if self.open {
             self.open = false;
         }
