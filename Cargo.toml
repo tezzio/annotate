@@ -9,3 +9,9 @@ v4l          = "0.14"
 jpeg-decoder = "0.3"
 serde        = { version = "1", features = ["derive"] }
 toml         = "0.8"
+
+[build-dependencies]
+ureq    = "2"
+tar     = "0.4"
+bzip2   = { version = "0.4", features = ["static"] }
+zip     = { version = "2", default-features = false, features = ["deflate"] }

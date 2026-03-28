@@ -121,8 +121,8 @@ impl AppState {
 
 // ── Embedded fonts ────────────────────────────────────────────────────────────
 
-const FONT_BYTES:      &[u8] = include_bytes!("../assets/DejaVuSans.ttf");
-const ICON_FONT_BYTES: &[u8] = include_bytes!("../assets/fa-solid.otf");
+const FONT_BYTES:      &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/DejaVuSans.ttf"));
+const ICON_FONT_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa-solid.otf"));
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
