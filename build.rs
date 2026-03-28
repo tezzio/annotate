@@ -80,10 +80,81 @@ fn fetch_fa_solid(assets: &Path) {
     }
 }
 
+fn build_iso(out: &Path, manifest_dir: &Path) {
+    use std::process::Command;
+
+    let br_dir = out.join("buildroot");
+    let br_out = out.join("buildroot-output");
+    let external = manifest_dir.join("buildroot");
+
+    // ── Clone buildroot if not already present ────────────────────────────────
+    if !br_dir.join("Makefile").exists() {
+        println!("cargo:warning=Cloning buildroot (depth 1)...");
+        let status = Command::new("git")
+            .args([
+                "clone", "--depth=1",
+                "https://github.com/buildroot/buildroot.git",
+                br_dir.to_str().unwrap(),
+            ])
+            .status()
+            .expect("git not found — required to clone buildroot");
+        assert!(status.success(), "git clone buildroot failed");
+    }
+
+    fs::create_dir_all(&br_out).expect("failed to create buildroot output dir");
+
+    let nproc = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+
+    // ── make defconfig ────────────────────────────────────────────────────────
+    println!("cargo:warning=Configuring buildroot (annotator_defconfig)...");
+    let status = Command::new("make")
+        .args([
+            "-C", br_dir.to_str().unwrap(),
+            &format!("O={}", br_out.display()),
+            &format!("BR2_EXTERNAL={}", external.display()),
+            "annotator_defconfig",
+        ])
+        .env_remove("ANNOTATOR_BUILD_ISO")
+        .status()
+        .expect("make not found");
+    assert!(status.success(), "make annotator_defconfig failed");
+
+    // ── make ──────────────────────────────────────────────────────────────────
+    // ANNOTATOR_OVERRIDE_SRCDIR tells buildroot to use the local repo instead
+    // of downloading the annotator source from GitHub.
+    // ANNOTATOR_BUILD_ISO is explicitly removed so the cargo invocation inside
+    // the annotator package build does not recurse back into build_iso().
+    println!("cargo:warning=Building buildroot ISO (this takes a while)...");
+    let status = Command::new("make")
+        .args([
+            "-C", br_dir.to_str().unwrap(),
+            &format!("O={}", br_out.display()),
+            &format!("-j{nproc}"),
+            &format!("ANNOTATOR_OVERRIDE_SRCDIR={}", manifest_dir.display()),
+        ])
+        .env_remove("ANNOTATOR_BUILD_ISO")
+        .status()
+        .expect("make not found");
+    assert!(status.success(), "buildroot make failed");
+
+    let iso = br_out.join("images/rootfs.iso9660");
+    println!("cargo:warning=ISO ready: {}", iso.display());
+}
+
 fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let out = Path::new(&out_dir);
+
+    // Tell Cargo to re-run this script when the ISO flag changes.
+    println!("cargo:rerun-if-env-changed=ANNOTATOR_BUILD_ISO");
 
     fetch_dejavu(out);
     fetch_fa_solid(out);
+
+    if std::env::var("ANNOTATOR_BUILD_ISO").is_ok() {
+        build_iso(out, Path::new(&manifest_dir));
+    }
 }

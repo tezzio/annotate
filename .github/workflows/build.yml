@@ -6,36 +6,48 @@ on:
   pull_request:
 
 jobs:
-  build:
+  buildroot-iso:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies
+      - name: Install buildroot host dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential pkg-config \
-            libsdl2-dev libsdl2-ttf-dev \
-            v4l-utils
+            build-essential gcc g++ make patch git cpio rsync \
+            bc libssl-dev libncurses-dev libelf-dev bison flex \
+            python3 python3-pip unzip wget file \
+            libsdl2-dev libsdl2-ttf-dev
 
-      - name: Cache Rust toolchain & registry
+      - name: Cache buildroot downloads
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          path: target/release/build/annotator-*/out/buildroot-output/dl
+          key: buildroot-dl-${{ hashFiles('buildroot/configs/annotator_defconfig', 'buildroot/board/annotator/linux.config') }}
+          restore-keys: buildroot-dl-
 
-      - name: Build (release)
-        run: cargo build --release
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: target/release/build/annotator-*/out/buildroot-output/ccache
+          key: buildroot-ccache-${{ hashFiles('buildroot/configs/annotator_defconfig', 'buildroot/board/annotator/linux.config') }}
+          restore-keys: buildroot-ccache-
+
+      - name: Build ISO
+        run: ANNOTATOR_BUILD_ISO=1 cargo build --release
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: annotator-linux-x86_64
           path: target/release/annotator
+          if-no-files-found: error
+
+      - name: Upload ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: annotator-iso
+          path: target/release/build/annotator-*/out/buildroot-output/images/rootfs.iso9660
           if-no-files-found: error

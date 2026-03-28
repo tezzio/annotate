@@ -44,9 +44,8 @@ BR2_PACKAGE_XORG7=y
 BR2_PACKAGE_XSERVER_XORG_SERVER=y
 BR2_PACKAGE_XAPP_XINIT=y
 
-# Input drivers — evdev (mouse + touch-as-mouse) + vmmouse for QEMU
+# Input drivers — evdev (mouse + touch-as-mouse)
 BR2_PACKAGE_XDRIVER_XF86_INPUT_EVDEV=y
-BR2_PACKAGE_XDRIVER_XF86_INPUT_VMMOUSE=y
 
 # Video driver — intel (i915) + VESA fallback (covers QEMU std VGA)
 BR2_PACKAGE_XDRIVER_XF86_VIDEO_INTEL=y
