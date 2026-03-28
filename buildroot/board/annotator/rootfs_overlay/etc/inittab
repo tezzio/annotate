@@ -1,0 +1,7 @@
+# /etc/inittab — minimal: auto-start X session as root on tty1
+::sysinit:/etc/init.d/rcS
+::ctrlaltdel:/sbin/reboot
+::shutdown:/sbin/swapoff -a
+::shutdown:/bin/umount -a -r
+tty1::respawn:/bin/sh -l -c "exec /usr/bin/startx /root/.xinitrc"
+ttyS0::askfirst:/bin/sh

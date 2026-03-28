@@ -1,0 +1,7 @@
+config BR2_PACKAGE_ANNOTATOR
+	bool "annotator"
+	depends on BR2_PACKAGE_SDL2
+	depends on BR2_PACKAGE_SDL2_TTF
+	help
+	  Court annotation overlay application.
+	  Requires SDL2, SDL2_ttf, and V4L2 kernel support.
