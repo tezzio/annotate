@@ -162,8 +162,7 @@ fn main() {
 
     let mut sdl_canvas = window
         .into_canvas()
-        .accelerated()
-        .present_vsync()
+        .software()
         .build()
         .expect("create renderer");
 

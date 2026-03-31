@@ -3,5 +3,8 @@
 ::ctrlaltdel:/sbin/reboot
 ::shutdown:/sbin/swapoff -a
 ::shutdown:/bin/umount -a -r
-tty1::respawn:/bin/sh -l -c "exec /usr/bin/startx /root/.xinitrc"
+# -keeptty  : keep controlling tty so Xorg can reopen it after VT switch
+# -nolisten tcp : no network X connections
+# vt1       : explicitly bind to VT1 (the tty we're running on)
+tty1::respawn:/bin/sh -l -c "dmesg | grep -E 'drm|DRM|bochs|fb|EFI|error' > /dev/ttyS0 2>&1; ls /dev/dri/ /dev/fb* > /dev/ttyS0 2>&1; echo '=== input devices ===' > /dev/ttyS0; ls -la /dev/input/ > /dev/ttyS0 2>&1; chmod a+rw /dev/input/event* /dev/input/mice 2>/dev/null; mkdir -p /etc/X11/xorg.conf.d; n=0; for dev in /dev/input/event*; do [ -e \"\$dev\" ] || continue; printf 'Section \"InputDevice\"\n    Identifier \"ev%d\"\n    Driver \"evdev\"\n    Option \"Device\" \"%s\"\n    Option \"AutoServerLayout\" \"true\"\nEndSection\n\n' \"\$n\" \"\$dev\"; n=\$((n+1)); done > /etc/X11/xorg.conf.d/99-inputs.conf; cat /etc/X11/xorg.conf.d/99-inputs.conf > /dev/ttyS0; chvt 7; /usr/bin/startx /root/.xinitrc -- -keeptty -nolisten tcp vt7 2>/dev/ttyS0; cat /var/log/Xorg.*.log > /dev/ttyS0 2>/dev/null; sleep 3"
 ttyS0::askfirst:/bin/sh

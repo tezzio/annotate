@@ -1,0 +1,8 @@
+# /etc/fstab — minimal mounts for annotator ISO
+proc        /proc    proc     defaults          0 0
+sysfs       /sys     sysfs    defaults          0 0
+devtmpfs    /dev     devtmpfs defaults          0 0
+# /tmp must be a writable tmpfs so X11 can create /tmp/.X11-unix/X0
+tmpfs       /tmp     tmpfs    mode=1777,nosuid  0 0
+# /run needed by Xorg for its lock file (/run/user, /run/Xorg.*)
+tmpfs       /run     tmpfs    mode=0755,nosuid  0 0

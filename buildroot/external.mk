@@ -1,1 +1,1 @@
-source "$BR2_EXTERNAL_ANNOTATOR_PATH/package/annotator/annotator.mk"
+include $(BR2_EXTERNAL_ANNOTATOR_PATH)/package/annotator/annotator.mk

@@ -1,0 +1,46 @@
+#!/bin/sh
+# S20input — Prepare /dev/input for Xorg before the X session starts.
+#
+# Runs after S10udev (eudev). All input drivers are built into the kernel
+# (CONFIG_VIRTIO_INPUT=y, CONFIG_USB_HID=y, CONFIG_INPUT_EVDEV=y, etc.) so
+# no modprobe is needed.
+#
+# Two things this does:
+#  1. Ensure /dev/input/* are world-readable (eudev may leave them root-only).
+#  2. Generate /etc/X11/xorg.conf.d/99-inputs.conf with an explicit
+#     InputDevice stanza for every /dev/input/event* node found so far.
+#     This is belt-and-suspenders alongside the evdev InputClass catch-all in
+#     10-annotator.conf — the same approach that fixed input detection in the
+#     previous libs-based build.
+
+case "$1" in
+    start)
+        # 1. Permissions
+        chmod 755 /dev/input 2>/dev/null || true
+        chmod a+rw /dev/input/event* /dev/input/mice /dev/input/mouse* 2>/dev/null || true
+
+        # 2. Generate explicit InputDevice sections for every event node
+        mkdir -p /etc/X11/xorg.conf.d
+        {
+            n=0
+            for dev in /dev/input/event*; do
+                [ -e "$dev" ] || continue
+                printf 'Section "InputDevice"\n'
+                printf '    Identifier "ev%d"\n' "$n"
+                printf '    Driver     "evdev"\n'
+                printf '    Option     "Device" "%s"\n' "$dev"
+                printf '    Option     "AutoServerLayout" "true"\n'
+                printf 'EndSection\n\n'
+                n=$((n+1))
+            done
+        } > /etc/X11/xorg.conf.d/99-inputs.conf
+        ;;
+    stop|restart|reload)
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}"
+        exit 1
+        ;;
+esac
+
+exit 0

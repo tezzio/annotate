@@ -24,10 +24,11 @@ BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y
 BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE="$(BR2_EXTERNAL_ANNOTATOR_PATH)/board/annotator/linux.config"
 BR2_LINUX_KERNEL_NEEDS_HOST_LIBELF=y
 
-# ── Bootloader: GRUB2 (BIOS/legacy for QEMU -M pc) ───────────────────────────
+# ── Bootloader: GRUB2 EFI (x86_64-efi, OVMF) ───────────────────────────────
 BR2_TARGET_GRUB2=y
-BR2_TARGET_GRUB2_I386_PC=y
-BR2_TARGET_GRUB2_BUILTIN_MODULES_PC="boot linux iso9660 part_msdos part_gpt normal biosdisk"
+BR2_TARGET_GRUB2_X86_64_EFI=y
+BR2_TARGET_GRUB2_BUILTIN_MODULES_EFI="boot linux iso9660 normal"
+BR2_TARGET_GRUB2_BUILTIN_CONFIG_EFI="$(BR2_EXTERNAL_ANNOTATOR_PATH)/board/annotator/grub-efi-builtin.cfg"
 
 # ── Filesystem: ISO image with initrd ─────────────────────────────────────────
 BR2_TARGET_ROOTFS_CPIO=y
@@ -39,17 +40,34 @@ BR2_TARGET_ROOTFS_ISO9660_BOOT_MENU="$(BR2_EXTERNAL_ANNOTATOR_PATH)/board/annota
 # BR2_TARGET_ROOTFS_TAR is not set
 # BR2_TARGET_ROOTFS_EXT2 is not set
 
+# ── Device management (udev) ─────────────────────────────────────────────────
+# Required by xf86-input-evdev and xf86-input-libinput (depend on BR2_PACKAGE_HAS_UDEV)
+# EUDEV uses devtmpfs + udev rules for /dev population
+BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_EUDEV=y
+
 # ── X.Org server ──────────────────────────────────────────────────────────────
 BR2_PACKAGE_XORG7=y
 BR2_PACKAGE_XSERVER_XORG_SERVER=y
 BR2_PACKAGE_XAPP_XINIT=y
+# xauth is called by startx/xinit to manage .Xauthority cookies
+BR2_PACKAGE_XAPP_XAUTH=y
 
-# Input drivers — evdev (mouse + touch-as-mouse)
+# Input drivers — evdev (explicit device binding) + libinput (auto-detection)
+# Note: xf86-input-mouse was removed upstream in 2.0.0; use evdev/libinput instead.
 BR2_PACKAGE_XDRIVER_XF86_INPUT_EVDEV=y
+BR2_PACKAGE_XDRIVER_XF86_INPUT_LIBINPUT=y
 
 # Video driver — intel (i915) + VESA fallback (covers QEMU std VGA)
 BR2_PACKAGE_XDRIVER_XF86_VIDEO_INTEL=y
 BR2_PACKAGE_XDRIVER_XF86_VIDEO_VESA=y
+BR2_PACKAGE_XDRIVER_XF86_VIDEO_FBDEV=y
+
+# Keyboard layout data — without this X cannot configure any keyboard
+BR2_PACKAGE_XKEYBOARD_CONFIG=y
+
+# ── Cursor font + theme (without this X11 renders an invisible cursor) ────────
+BR2_PACKAGE_XFONT_CURSOR_MISC=y
+BR2_PACKAGE_XCURSOR_THEMES=y
 
 # ── SDL2 ──────────────────────────────────────────────────────────────────────
 BR2_PACKAGE_SDL2=y
@@ -59,8 +77,7 @@ BR2_PACKAGE_SDL2_TTF=y
 # ── Annotator app ─────────────────────────────────────────────────────────────
 BR2_PACKAGE_ANNOTATOR=y
 
-# ── Host Rust (needed to build annotator) ────────────────────────────────────
-BR2_PACKAGE_HOST_RUSTC=y
-
 # ── No network stack at runtime ───────────────────────────────────────────────
 # (network is only needed in build.rs at compile time, not at runtime)
+# The annotator binary is pre-compiled by build.rs and injected via
+# ANNOTATOR_PREBUILT_BIN, so host Rust is not needed inside buildroot.
