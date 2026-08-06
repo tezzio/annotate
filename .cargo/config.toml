@@ -1,0 +1,27 @@
+# Cargo configuration for the annotator project.
+#
+# This file configures cross-compilation targets without making the user
+# pass --target on every command.
+
+# Default native build: x86_64 (the dev machine).
+[build]
+# Default to the host triple.  Override on the command line for cross builds.
+# e.g. `cargo build --target aarch64-unknown-linux-gnu`
+
+# AArch64 (Raspberry Pi 3B+, generic arm64 Linux) cross-compile settings.
+# Requires the cross toolchain (e.g. `apt install gcc-aarch64-linux-gnu`) and
+# the aarch64 SDL2 dev libs available via the cross package manager.
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+# If you have a sysroot with the cross SDL2 libraries, point pkg-config at it:
+# PKG_CONFIG_ALLOW_CROSS=1
+# PKG_CONFIG_SYSROOT_DIR=/path/to/sysroot
+# [env]
+# PKG_CONFIG_ALLOW_CROSS = "1"
+
+# Use clang as the cross compiler if preferred (Raspberry Pi OS toolchains
+# sometimes need this).  Uncomment to enable:
+# CC = "aarch64-linux-gnu-gcc"
+# CXX = "aarch64-linux-gnu-g++"
+# AR = "aarch64-linux-gnu-ar"

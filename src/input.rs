@@ -6,7 +6,7 @@ use crate::{
     canvas::Canvas,
     scene::{DrawObject, PenStroke, ShapeObj, EraseObj, HighlightStroke},
     tools::{Tool, PALETTE},
-    ui::{PickerStage, ToolbarLayout, TOOLBAR_HEIGHT, MENU_HEIGHT},
+    ui::{PickerStage, MENU_HEIGHT},
     AppState,
 };
 
@@ -14,10 +14,10 @@ use crate::{
 
 /// Process a single SDL event.  Returns `false` when the application should quit.
 pub fn process_event(
-    event:   &Event,
-    state:   &mut AppState,
-    canvas:  &mut Canvas,
-    layout:  &ToolbarLayout,
+    event:     &Event,
+    state:     &mut AppState,
+    canvas:    &mut Canvas,
+    v2_layout: &mut crate::ui::v2::V2Layout,
 ) -> bool {
     match event {
         // ── Quit ──────────────────────────────────────────────────────────────
@@ -42,7 +42,7 @@ pub fn process_event(
         // synthesis gives correct window-local pixels; raw FingerDown coords
         // are normalized to the full desktop and break on multi-monitor setups.
         Event::MouseButtonDown { mouse_btn: MouseButton::Left, x, y, .. } => {
-            handle_press(*x, *y, state, canvas, layout);
+            handle_press(*x, *y, state, canvas, v2_layout);
         }
 
         // ── Mouse motion ──────────────────────────────────────────────────────
@@ -67,7 +67,12 @@ pub fn process_event(
 
 // ── Shared press / move / release handlers ────────────────────────────────────
 
-fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, layout: &ToolbarLayout) {
+fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, v2_layout: &mut crate::ui::v2::V2Layout) {
+    // Settings overlay is open — all clicks go to the overlay, not toolbar/picker
+    if state.show_settings_overlay {
+        return;
+    }
+
     if state.show_device_picker {
         if let Some(picker) = &mut state.device_picker {
             if let Some(result) = picker.click_enter(mx, my, canvas.width as i32, canvas.height as i32) {
@@ -82,8 +87,14 @@ fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, layout:
         return;
     }
     state.menu_close_requested = true;
-    if my >= canvas.height as i32 - TOOLBAR_HEIGHT {
-        handle_toolbar_click(mx, my, layout, state);
+
+    // V2: clicks in the left rail are toolbar clicks. If the popout is open,
+    // the clickable area extends to the right of the rail (for swatches).
+    let popout_extends_right = v2_layout.popout_open
+        && mx >= crate::ui::v2::RAIL_WIDTH
+        && mx <= crate::ui::v2::RAIL_WIDTH + 6 + 32 + 8;  // rail edge + gap + swatch + margin
+    if mx < crate::ui::v2::RAIL_WIDTH || popout_extends_right {
+        crate::ui::v2::click_v2_toolbar(mx, my, v2_layout, state);
         return;
     }
     if state.draw_locked_until.map_or(false, |t| std::time::Instant::now() < t) { return; }
@@ -109,7 +120,9 @@ fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, layout:
         }
         Tool::Pen => {
             state.scene.push_undo();
-            state.scene.add(DrawObject::Pen(PenStroke {
+            // Start the stroke in state.active_stroke instead of the scene,
+            // so the committed overlay isn't re-rasterized on every mouse-move.
+            state.active_stroke = Some(DrawObject::Pen(PenStroke {
                 points: vec![(mx, my)],
                 color:  state.color,
                 size:   state.brush_size,
@@ -117,14 +130,14 @@ fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, layout:
         }
         Tool::Eraser => {
             state.scene.push_undo();
-            state.scene.add(DrawObject::Erase(EraseObj {
+            state.active_stroke = Some(DrawObject::Erase(EraseObj {
                 points: vec![(mx, my)],
                 size:   state.brush_size,
             }));
         }
         Tool::Highlight => {
             state.scene.push_undo();
-            state.scene.add(DrawObject::Highlight(HighlightStroke {
+            state.active_stroke = Some(DrawObject::Highlight(HighlightStroke {
                 points: vec![(mx, my)],
                 color:  state.color,
                 size:   state.brush_size,
@@ -140,9 +153,9 @@ fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, layout:
     }
 }
 
-fn handle_move(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas) {
+fn handle_move(mx: i32, my: i32, state: &mut AppState, _canvas: &Canvas) {
     if state.show_device_picker { return; }
-    if my < MENU_HEIGHT || my >= canvas.height as i32 - TOOLBAR_HEIGHT { return; }
+    if my < MENU_HEIGHT || mx < crate::ui::v2::RAIL_WIDTH { return; }
     // Laser pointer tracks hover — no mouse button required
     if state.active_tool == Tool::Laser {
         state.laser_trail.push((mx, my, std::time::Instant::now(), state.color));
@@ -162,21 +175,18 @@ fn handle_move(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas) {
             }
         }
         Tool::Pen => {
-            if let Some(DrawObject::Pen(s)) = state.scene.objects.last_mut() {
+            if let Some(DrawObject::Pen(s)) = state.active_stroke.as_mut() {
                 s.points.push((mx, my));
-                state.scene.dirty = true;
             }
         }
         Tool::Eraser => {
-            if let Some(DrawObject::Erase(e)) = state.scene.objects.last_mut() {
+            if let Some(DrawObject::Erase(e)) = state.active_stroke.as_mut() {
                 e.points.push((mx, my));
-                state.scene.dirty = true;
             }
         }
         Tool::Highlight => {
-            if let Some(DrawObject::Highlight(h)) = state.scene.objects.last_mut() {
+            if let Some(DrawObject::Highlight(h)) = state.active_stroke.as_mut() {
                 h.points.push((mx, my));
-                state.scene.dirty = true;
             }
         }
         // shape tools: preview is drawn by main.rs via preview_object()
@@ -194,7 +204,12 @@ fn handle_release(x1: i32, y1: i32, state: &mut AppState) {
         Tool::Rect   => { state.scene.add(DrawObject::Rect(s)); }
         Tool::Circle => { state.scene.add(DrawObject::Circle(s)); }
         Tool::Arrow  => { state.scene.add(DrawObject::Arrow(s)); }
-        // Pen/Eraser/Highlight: already appended point-by-point
+        // Pen/Eraser/Highlight: commit the active stroke into the scene
+        Tool::Pen | Tool::Eraser | Tool::Highlight => {
+            if let Some(stroke) = state.active_stroke.take() {
+                state.scene.add(stroke);
+            }
+        }
         Tool::Select => {
             if state.pending_select_undo {
                 state.pending_select_undo = false;
@@ -215,6 +230,11 @@ fn handle_keydown(
     mods: Mod,
     state: &mut AppState,
 ) -> bool {
+    // Settings overlay is open — defer all keys to the overlay handler in main.rs
+    if state.show_settings_overlay {
+        return true;
+    }
+
     let ctrl  = mods.contains(Mod::LCTRLMOD)  || mods.contains(Mod::RCTRLMOD);
     let shift = mods.contains(Mod::LSHIFTMOD) || mods.contains(Mod::RSHIFTMOD);
 
@@ -333,42 +353,11 @@ fn handle_keydown(
     true
 }
 
-// ── Toolbar click handler ─────────────────────────────────────────────────────
-
-fn handle_toolbar_click(mx: i32, my: i32, layout: &ToolbarLayout, state: &mut AppState) {
-    // Tool buttons
-    for (tool, rect) in &layout.tools {
-        if rect.contains_point((mx, my)) {
-            switch_tool(state, *tool);
-            return;
-        }
-    }
-    // Palette
-    for (i, rect) in layout.palette.iter().enumerate() {
-        if rect.contains_point((mx, my)) {
-            state.color = PALETTE[i];
-            return;
-        }
-    }
-    // Brush size
-    if layout.brush_minus.contains_point((mx, my)) {
-        state.brush_size = state.brush_size.saturating_sub(4).max(1);
-        state.tool_sizes[state.active_tool.index()] = state.brush_size;
-    } else if layout.brush_plus.contains_point((mx, my)) {
-        state.brush_size = (state.brush_size + 4).min(200);
-        state.tool_sizes[state.active_tool.index()] = state.brush_size;
-    } else if layout.freeze_frame.contains_point((mx, my)) {
-        state.freeze_frame = !state.freeze_frame;
-    } else if layout.change_input.contains_point((mx, my)) {
-        state.show_device_picker = true;
-    }
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Switch to a different tool, saving the current brush size and restoring
 /// the new tool's remembered size.
-fn switch_tool(state: &mut AppState, tool: Tool) {
+pub fn switch_tool(state: &mut AppState, tool: Tool) {
     state.tool_sizes[state.active_tool.index()] = state.brush_size;
     state.active_tool = tool;
     state.brush_size  = state.tool_sizes[tool.index()];

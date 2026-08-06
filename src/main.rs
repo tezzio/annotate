@@ -25,7 +25,7 @@ use canvas::Canvas;
 use capture::{Frame, FrameFormat};
 use scene::{DrawObject, Scene};
 use tools::Tool;
-use ui::{DevicePicker, TextCache, ToolbarLayout, TOOLBAR_HEIGHT, MENU_HEIGHT};
+use ui::{DevicePicker, OverlaySettings, OverlayAction, TextCache, Toggle, toolbar_height, MENU_HEIGHT};
 
 // ── Application state ─────────────────────────────────────────────────────────
 
@@ -44,6 +44,12 @@ pub struct AppState {
     pub mouse_down:          bool,
     pub drag_start:          (i32, i32),
     pub drag_cur:            (i32, i32),
+
+    /// Active stroke being drawn (pen/eraser/highlight).  Lives outside the
+    /// scene while in progress so the scene's committed texture isn't
+    /// re-rasterized every frame as points are added.  On mouse-up, the stroke
+    /// is appended to `scene.objects` and this is cleared.
+    pub active_stroke:       Option<DrawObject>,
 
     // Scene (object model)
     pub scene:               Scene,
@@ -79,6 +85,11 @@ pub struct AppState {
 
     // Config ref
     pub cfg: config::Config,
+
+    // Overlay settings panel
+    pub show_settings_overlay: bool,
+    pub settings:             Option<OverlaySettings>,
+    pub settings_action:     Option<OverlayAction>,
 }
 
 impl AppState {
@@ -97,6 +108,7 @@ impl AppState {
             mouse_down:          false,
             drag_start:          (0, 0),
             drag_cur:            (0, 0),
+            active_stroke:       None,
             scene:               Scene::new(undo_limit),
             text_input_active:   false,
             text_buffer:         String::new(),
@@ -115,6 +127,9 @@ impl AppState {
             pending_menu_click:  None,
             menu_close_requested: false,
             cfg,
+            show_settings_overlay: false,
+            settings:             None,
+            settings_action:     None,
         }
     }
 }
@@ -158,13 +173,38 @@ fn main() {
         win_builder.resizable();
     }
 
+    // Create a window we can fall back on if hardware rendering fails.
+    // (When CanvasBuilder::build() fails, the window it holds is already consumed,
+    // so we need a second window to attempt the software renderer.)
+    let win2 = video
+        .window("Court Annotator", win_w, win_h)
+        .position_centered()
+        .build()
+        .expect("fallback window");
+
     let window = win_builder.build().expect("create window");
 
-    let mut sdl_canvas = window
+    // Try hardware-accelerated rendering first; fall back to software if unavailable.
+    // SDL2 picks the best available backend (OpenGL/GLES/Metal/Vulkan) automatically.
+    // On VMs without GPU passthrough this returns Err — we use the second window
+    // with a software renderer instead.
+    let (mut sdl_canvas, using_hardware) = match window
         .into_canvas()
-        .software()
+        .accelerated()
+        .present_vsync()
         .build()
-        .expect("create renderer");
+    {
+        Ok(c) => (c, true),
+        Err(reason) => {
+            eprintln!("[annotator] hardware canvas failed ({reason}), falling back to software");
+            let c = win2.into_canvas().software().build().expect("software renderer must succeed");
+            (c, false)
+        }
+    };
+    eprintln!(
+        "[annotator] renderer: {}",
+        if using_hardware { "hardware (accelerated)" } else { "software (fallback)" }
+    );
 
     sdl_canvas.set_blend_mode(BlendMode::Blend);
 
@@ -174,16 +214,25 @@ fn main() {
 
     let texture_creator = sdl_canvas.texture_creator();
 
-    // ── Annotation canvas ──────────────────────────────────────────────────
-    let mut ann_canvas = Canvas::new(canvas_w, canvas_h);
-
-    let mut overlay_tex = texture_creator
+    // ── Annotation overlay (two layers) ──────────────────────────────────
+    // `committed_*` holds the finalized scene (rarely re-rasterized).
+    // `active_*` holds the stroke currently being drawn (re-rasterized each
+    //  frame while mouse is down).  Each frame, committed is blitted first,
+    //  then active is blitted on top.
+    let mut committed_canvas = Canvas::new(canvas_w, canvas_h);
+    let mut committed_tex = texture_creator
         .create_texture_streaming(PixelFormatEnum::ABGR8888, canvas_w, canvas_h)
-        .expect("overlay texture");
-    overlay_tex.set_blend_mode(BlendMode::Blend);
+        .expect("committed overlay texture");
+    committed_tex.set_blend_mode(BlendMode::Blend);
 
-    ann_canvas.dirty = true;
-    ann_canvas.upload_texture(&mut overlay_tex);
+    let mut active_canvas = Canvas::new(canvas_w, canvas_h);
+    let mut active_tex = texture_creator
+        .create_texture_streaming(PixelFormatEnum::ABGR8888, canvas_w, canvas_h)
+        .expect("active overlay texture");
+    active_tex.set_blend_mode(BlendMode::Blend);
+
+    committed_canvas.dirty = true;
+    committed_canvas.upload_texture(&mut committed_tex);
 
     // ── Video texture ──────────────────────────────────────────────────────
     let mut video_tex = texture_creator
@@ -194,8 +243,24 @@ fn main() {
     let mut video_tex_fmt = PixelFormatEnum::RGB24;
 
     // ── App state ──────────────────────────────────────────────────────────
+    let undo_limit = cfg.undo_stack_limit;
     let mut state = AppState::new(cfg);
     state.window_size = (canvas_w, canvas_h);
+
+    // ── Settings overlay ────────────────────────────────────────────────────
+    let renderer_info = if using_hardware { "hardware (accelerated)".into() } else { "software (fallback)".into() };
+    state.settings = Some(OverlaySettings {
+        cursor: 0,
+        laser_fade: 1.2,
+        laser_on: Toggle::On,
+        show_fps: Toggle::On,
+        fullscreen: Toggle::from_bool(state.is_fullscreen),
+        undo_limit,
+        renderer_info,
+        scroll_offset: 0,
+    });
+    state.show_settings_overlay = false;
+    state.settings_action = None;
 
     // ── Device enumeration ─────────────────────────────────────────────────
     let devices = capture::enumerate_devices();
@@ -210,8 +275,8 @@ fn main() {
     let mut capture_fps_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let mut capture_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // ── Toolbar layout ─────────────────────────────────────────────────────
-    let mut toolbar_layout = ToolbarLayout::build(canvas_w as i32, canvas_h as i32);
+    // ── UI: V2 side-rail layout ──────────────────────────────────────────────
+    let mut v2_layout = ui::v2::V2Layout::build(canvas_w as i32, canvas_h as i32);
 
     // ── Event loop ─────────────────────────────────────────────────────────
     let mut event_pump = sdl_context.event_pump().expect("event pump");
@@ -231,8 +296,72 @@ fn main() {
         let frame_start = Instant::now();
 
         for event in event_pump.poll_iter() {
-            if !input::process_event(&event, &mut state, &mut ann_canvas, &toolbar_layout) {
+            if !input::process_event(&event, &mut state, &mut committed_canvas, &mut v2_layout) {
                 break 'main;
+            }
+
+            // ── Settings overlay keyboard / mouse events ──────────────────────
+            if state.show_settings_overlay {
+                match &event {
+                    sdl2::event::Event::KeyDown { keycode: Some(k), .. } => {
+                        match *k {
+                            sdl2::keyboard::Keycode::Escape => {
+                                state.show_settings_overlay = false;
+                            }
+                            sdl2::keyboard::Keycode::Up => {
+                                if let Some(s) = &mut state.settings {
+                                    s.move_up();
+                                }
+                            }
+                            sdl2::keyboard::Keycode::Down => {
+                                if let Some(s) = &mut state.settings {
+                                    s.move_down(canvas_h as i32);
+                                }
+                            }
+                            sdl2::keyboard::Keycode::Left => {
+                                if let Some(s) = &mut state.settings {
+                                    s.adjust(false);
+                                }
+                            }
+                            sdl2::keyboard::Keycode::Right => {
+                                if let Some(s) = &mut state.settings {
+                                    s.adjust(true);
+                                }
+                            }
+                            sdl2::keyboard::Keycode::Return | sdl2::keyboard::Keycode::KpEnter => {
+                                if let Some(s) = &mut state.settings {
+                                    let action = s.enter();
+                                    if action == OverlayAction::ToggleFullscreen {
+                                        state.toggle_fullscreen = true;
+                                        state.show_settings_overlay = false;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    sdl2::event::Event::MouseButtonDown { x, y, .. } => {
+                        if let Some(s) = &mut state.settings {
+                            let canvas_w_i = canvas_w as i32;
+                            let canvas_h_i = canvas_h as i32;
+                            let action = s.click(*x as i32, *y as i32, canvas_w_i, canvas_h_i);
+                            match action {
+                                OverlayAction::Close => { state.show_settings_overlay = false; }
+                                OverlayAction::ToggleFullscreen => {
+                                    state.toggle_fullscreen = true;
+                                    state.show_settings_overlay = false;
+                                }
+                                OverlayAction::None => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                // F3 opens the settings overlay
+                if let sdl2::event::Event::KeyDown { keycode: Some(sdl2::keyboard::Keycode::F3), .. } = &event {
+                    state.show_settings_overlay = true;
+                }
             }
         }
 
@@ -242,19 +371,24 @@ fn main() {
             canvas_w = new_w;
             canvas_h = new_h;
             // Recreate pixel canvas and textures at the new size
-            ann_canvas = Canvas::new(canvas_w, canvas_h);
-            overlay_tex = texture_creator
+            committed_canvas = Canvas::new(canvas_w, canvas_h);
+            committed_tex = texture_creator
                 .create_texture_streaming(PixelFormatEnum::ABGR8888, canvas_w, canvas_h)
-                .expect("overlay texture");
-            overlay_tex.set_blend_mode(BlendMode::Blend);
+                .expect("committed overlay texture");
+            committed_tex.set_blend_mode(BlendMode::Blend);
+            active_canvas = Canvas::new(canvas_w, canvas_h);
+            active_tex = texture_creator
+                .create_texture_streaming(PixelFormatEnum::ABGR8888, canvas_w, canvas_h)
+                .expect("active overlay texture");
+            active_tex.set_blend_mode(BlendMode::Blend);
             video_tex = texture_creator
                 .create_texture_streaming(video_tex_fmt, canvas_w, canvas_h)
                 .expect("video texture");
             video_tex_w = canvas_w;
             video_tex_h = canvas_h;
-            ann_canvas.dirty = true;
-            ann_canvas.upload_texture(&mut overlay_tex);
-            toolbar_layout = ToolbarLayout::build(canvas_w as i32, canvas_h as i32);
+            committed_canvas.dirty = true;
+            committed_canvas.upload_texture(&mut committed_tex);
+            v2_layout = ui::v2::V2Layout::build(canvas_w as i32, canvas_h as i32);
         }
 
         // ── Menu bar clicks ────────────────────────────────────────────────
@@ -264,6 +398,7 @@ fn main() {
                 ui::MenuAction::Undo  => { state.scene.undo(); }
                 ui::MenuAction::Redo  => { state.scene.redo(); }
                 ui::MenuAction::Clear => { state.scene.clear(); }
+                ui::MenuAction::OpenSettings => { state.show_settings_overlay = true; }
                 _ => {}
             }
             if let ui::MenuAction::SelectDevice(idx) = action {
@@ -339,7 +474,7 @@ fn main() {
         if state.pending_text_commit {
             state.pending_text_commit = false;
             blit_text_to_canvas(
-                &mut ann_canvas,
+                &mut committed_canvas,
                 &state.text_buffer,
                 state.text_pos,
                 state.color,
@@ -407,26 +542,60 @@ fn main() {
             fps_timer    = Instant::now();
         }
 
-        // Annotation overlay — only re-renders when scene is actually dirty
-        // (committed stroke, undo/redo, clear).  Shape previews are drawn
-        // separately via SDL2 draw calls below, avoiding the expensive
-        // 8MB CPU canvas clear+redraw+GPU upload every preview frame.
-        state.scene.render_to(&mut ann_canvas);
-        ann_canvas.upload_texture(&mut overlay_tex);
-        let overlay_src = Rect::new(0, MENU_HEIGHT, canvas_w, canvas_h.saturating_sub(TOOLBAR_HEIGHT as u32 + MENU_HEIGHT as u32));
-        let overlay_dst = overlay_src;
-        sdl_canvas.copy(&overlay_tex, overlay_src, overlay_dst).ok();
+        // ── Annotation overlay (two layers) ──────────────────────────────
+        // Layer 1: committed scene (re-rasterized only when scene.dirty)
+        let was_scene_dirty = state.scene.dirty;
+        let was_canvas_dirty = committed_canvas.dirty;
+        state.scene.render_to(&mut committed_canvas);
+        committed_canvas.upload_texture(&mut committed_tex);
+        if debug && (was_scene_dirty || was_canvas_dirty) {
+            eprintln!("[debug] render_to: scene_dirty={} canvas_dirty={} objects={}", was_scene_dirty, was_canvas_dirty, state.scene.objects.len());
+        }
+        let overlay_src = Rect::new(0, MENU_HEIGHT, canvas_w, canvas_h.saturating_sub(toolbar_height(canvas_w as i32) as u32 + MENU_HEIGHT as u32));
+        sdl_canvas.copy(&committed_tex, overlay_src, overlay_src).ok();
+
+        // Layer 2: active stroke (re-rasterized every frame it's being drawn).
+        // Only the active stroke is rasterized — no full canvas clear.
+        if let Some(ref active) = state.active_stroke {
+            active_canvas.clear();
+            active.render(&mut active_canvas);
+            active_canvas.dirty = true;
+            active_canvas.upload_texture(&mut active_tex);
+            sdl_canvas.copy(&active_tex, overlay_src, overlay_src).ok();
+        }
 
         // Shape tool preview — draw directly via SDL2 GPU calls (no CPU canvas work)
         if let Some(prev_obj) = input::preview_object(&state) {
             draw_preview_sdl(&mut sdl_canvas, &prev_obj);
         }
-
+        // Selection bounding box — drawn on top of everything when the Select
+        // tool has a hit.  Figma/Canva style: a thin accent-colored rectangle
+        // with a 2-pixel margin around the object's bounds.
+        if state.active_tool == Tool::Select {
+            if let Some(idx) = state.scene.selected {
+                if let Some(obj) = state.scene.objects.get(idx) {
+                    let (bx, by, bw, bh) = obj.bounds();
+                    let pad = 4i32;
+                    let x = bx - pad;
+                    let y = by - pad;
+                    let w = (bw + pad * 2).max(1) as u32;
+                    let h = (bh + pad * 2).max(1) as u32;
+                    let r = Rect::new(x, y, w, h);
+                    // 2px border accent — draw two concentric rects for a
+                    // subtle inset effect
+                    sdl_canvas.set_draw_color(Color::RGB(0x4a, 0x9e, 0xff));
+                    sdl_canvas.draw_rect(r).ok();
+                    let r2 = Rect::new(x + 2, y + 2, w.saturating_sub(4), h.saturating_sub(4));
+                    sdl_canvas.set_draw_color(Color::RGB(0x4a, 0x9e, 0xff));
+                    sdl_canvas.draw_rect(r2).ok();
+                }
+            }
+        }
         // Laser pointer trail — Tron-style solid fading line, never committed to scene
         {
-            const FADE_SECS: f32 = 1.2;
+            let laser_fade = state.settings.as_ref().map(|s| s.laser_fade).unwrap_or(1.2);
             let now = Instant::now();
-            state.laser_trail.retain(|(_, _, t, _)| now.duration_since(*t).as_secs_f32() < FADE_SECS);
+            state.laser_trail.retain(|(_, _, t, _)| now.duration_since(*t).as_secs_f32() < laser_fade);
             let tlen = state.laser_trail.len();
             let size = (state.tool_sizes[Tool::Laser.index()] as i32).max(1).min(20);
             let half = size / 2;
@@ -435,7 +604,7 @@ fn main() {
                 let (x0, y0, t0, (r, g, b)) = state.laser_trail[i - 1];
                 let (x1, y1, _, _) = state.laser_trail[i];
                 let age = now.duration_since(t0).as_secs_f32();
-                let frac = (1.0 - age / FADE_SECS).max(0.0_f32);
+                let frac = (1.0 - age / laser_fade).max(0.0_f32);
                 let alpha = (frac * frac * 230.0) as u8;
                 sdl_canvas.set_draw_color(Color::RGBA(r, g, b, alpha));
                 let dx = (x1 - x0) as f32;
@@ -482,17 +651,15 @@ fn main() {
             );
         }
 
-        // Toolbar
-        ui::draw_toolbar(
+        // Tool rail (V2)
+        ui::v2::draw_v2_toolbar(
             &mut sdl_canvas,
             &font,
             &icon_font,
-            &toolbar_layout,
+            &v2_layout,
             state.active_tool,
             state.color,
             state.brush_size,
-            canvas_h as i32,
-            canvas_w as i32,
             state.freeze_frame,
             &mut text_cache,
         );
@@ -504,9 +671,17 @@ fn main() {
             }
         }
 
+        // Settings overlay — modal panel drawn above everything else
+        if state.show_settings_overlay {
+            if let Some(ref mut settings) = state.settings {
+                settings.draw(&mut sdl_canvas, &font, canvas_w as i32, canvas_h as i32, &mut text_cache);
+            }
+        }
+
         // Menu bar (always on top)
         let capture_fps = capture_fps_counter.load(Ordering::Relaxed) as f32 / 10.0;
-        menu_bar.draw(&mut sdl_canvas, &font, canvas_w as i32, !state.scene.undo_stack.is_empty(), !state.scene.redo_stack.is_empty(), capture_fps, display_fps, &mut text_cache);
+        let show_fps = state.settings.as_ref().map(|s| s.show_fps == Toggle::On).unwrap_or(true);
+        menu_bar.draw(&mut sdl_canvas, &font, canvas_w as i32, !state.scene.undo_stack.is_empty(), !state.scene.redo_stack.is_empty(), show_fps, capture_fps, display_fps, &mut text_cache);
 
         sdl_canvas.present();
 
@@ -613,7 +788,7 @@ fn draw_preview_sdl(sdl: &mut sdl2::render::Canvas<sdl2::video::Window>, obj: &D
 }
 
 fn scale_rect(canvas_w: u32, canvas_h: u32, frame_w: u32, frame_h: u32) -> Rect {
-    let avail_h = canvas_h.saturating_sub(TOOLBAR_HEIGHT as u32 + MENU_HEIGHT as u32);
+    let avail_h = canvas_h.saturating_sub(toolbar_height(canvas_w as i32) as u32 + MENU_HEIGHT as u32);
     let avail_w = canvas_w;
     // Scale frame to fit within available area, preserving aspect ratio
     let scale = (avail_w as f32 / frame_w as f32).min(avail_h as f32 / frame_h as f32);

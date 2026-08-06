@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# cross.sh — build annotator using a reproducible Debian sysroot for native or
+# cross targets.
+#
+# Workflow:
+#   1. ./setup-sysroot.sh                      # create target/aarch64-sysroot
+#   2. ./setup-sysroot.sh --arch x86_64        # create target/x86_64-sysroot
+#   3. ./cross.sh --target x86_64-unknown-linux-gnu
+#   4. ./cross.sh --target aarch64-unknown-linux-gnu
+#
+# The sysroot is reproducible, lives inside the project's target/ dir, and is
+# used by pkg-config and the linker to avoid requiring platform SDL2 dev libs
+# installed directly on the host.
+#
+# Requirements (Ubuntu 25.10 / Debian):
+#   sudo apt install debootstrap qemu-user-static gcc-aarch64-linux-gnu pkg-config
+#
+# Usage:
+#   ./cross.sh                                   # default: aarch64 build
+#   ./cross.sh --target x86_64-unknown-linux-gnu  # native x86_64 build
+#   SYSROOT=/path/to/sysroot ./cross.sh
+#   ./cross.sh --target aarch64-unknown-linux-musl   # static binary
+#
+# Output: target/<target>/release/annotator
+set -euo pipefail
+
+TARGET="${TARGET:-aarch64-unknown-linux-gnu}"
+JOBS="$(nproc)"
+PROJECT_DIR="$(pwd)"
+
+# Command-line target always overrides the environment/default.  Previously
+# `--target ...` was documented but never parsed, so every invocation built
+# the default AArch64 target.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --target)
+            [ $# -ge 2 ] || { echo "ERROR: --target requires a value." >&2; exit 1; }
+            TARGET="$2"
+            shift 2
+            ;;
+        -h|--help)
+            sed -n '2,24p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "ERROR: unknown argument: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+case "$TARGET" in
+    aarch64-unknown-linux-gnu|aarch64-unknown-linux-musl)
+        SYSROOT="${SYSROOT:-$PROJECT_DIR/target/aarch64-sysroot}"
+        PKGDIR=aarch64-linux-gnu
+        ;;
+    x86_64-unknown-linux-gnu|x86_64-unknown-linux-musl)
+        SYSROOT="${SYSROOT:-$PROJECT_DIR/target/x86_64-sysroot}"
+        PKGDIR=x86_64-linux-gnu
+        ;;
+    *)
+        echo "ERROR: unsupported target: $TARGET" >&2
+        echo "Supported targets: aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl, x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl" >&2
+        exit 1
+        ;;
+esac
+
+if [ ! -d "$SYSROOT" ]; then
+    echo "ERROR: sysroot not found: $SYSROOT" >&2
+    echo "Run ./setup-sysroot.sh --arch ${TARGET%%-*} first." >&2
+    exit 1
+fi
+
+if [ ! -d "$SYSROOT/usr/lib/$PKGDIR" ]; then
+    echo "ERROR: sysroot does not contain expected libs at $SYSROOT/usr/lib/$PKGDIR" >&2
+    echo "Run ./setup-sysroot.sh --arch ${TARGET%%-*} first." >&2
+    exit 1
+fi
+
+echo "==> Building annotator for $TARGET"
+echo "    Sysroot: $SYSROOT"
+
+if [ "$TARGET" = "aarch64-unknown-linux-gnu" ] || [ "$TARGET" = "aarch64-unknown-linux-musl" ]; then
+    if ! command -v "aarch64-linux-gnu-gcc" &>/dev/null; then
+        echo "==> Installing aarch64 cross toolchain (requires sudo)..."
+        sudo apt update
+        sudo apt install -y gcc-aarch64-linux-gnu pkg-config
+    fi
+elif [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
+    if ! command -v pkg-config &>/dev/null; then
+        echo "==> Installing pkg-config (requires sudo)..."
+        sudo apt update
+        sudo apt install -y pkg-config
+    fi
+fi
+
+if [ -d "$SYSROOT" ]; then
+    export PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
+    export PKG_CONFIG_PATH="$SYSROOT/usr/lib/$PKGDIR/pkgconfig:$SYSROOT/usr/share/pkgconfig"
+    export PKG_CONFIG_LIBDIR="$SYSROOT/usr/lib/$PKGDIR/pkgconfig:$SYSROOT/usr/share/pkgconfig"
+    export SDL2_LIB_DIR="$SYSROOT/usr/lib/$PKGDIR"
+    export SDL2_TTF_LIB_DIR="$SYSROOT/usr/lib/$PKGDIR"
+    export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=--sysroot=${SYSROOT}"
+    if [ "$TARGET" != "x86_64-unknown-linux-gnu" ]; then
+        export PKG_CONFIG_ALLOW_CROSS=1
+    fi
+    echo "==> Using sysroot: $SYSROOT"
+fi
+
+if [ "$TARGET" = "aarch64-unknown-linux-musl" ] || [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
+    echo "==> musl build: SDL2 must be built from source for static linking"
+fi
+
+echo "==> Building..."
+cargo build --release --target "$TARGET" -j "$JOBS"
+
+OUT="target/$TARGET/release/annotator"
+if [ -f "$OUT" ]; then
+    case "$TARGET" in
+        x86_64-*) expected_machine="Advanced Micro Devices X86-64";;
+        aarch64-*) expected_machine="AArch64";;
+    esac
+    if ! readelf -h "$OUT" | grep -Fq "Machine:                           $expected_machine"; then
+        echo "ERROR: $OUT was not built for $TARGET." >&2
+        exit 1
+    fi
+    echo ""
+    echo "Done!  Binary: $OUT"
+    if [ "$TARGET" = "x86_64-unknown-linux-gnu" ] && [ -d "$SYSROOT" ]; then
+        echo "==> Installing annotator into sysroot: $SYSROOT/usr/bin/annotator"
+        sudo install -Dm755 "$OUT" "$SYSROOT/usr/bin/annotator"
+    fi
+    if [ "$TARGET" = "aarch64-unknown-linux-gnu" ]; then
+        echo "Run on the Pi:  scp $OUT pi@raspberrypi.local:~/annotator"
+        echo "On the Pi:       ./annotator"
+    fi
+else
+    echo "ERROR: build did not produce $OUT" >&2
+    exit 1
+fi

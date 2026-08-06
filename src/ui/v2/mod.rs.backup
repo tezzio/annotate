@@ -1,0 +1,344 @@
+//! V2 — modern side rail UI: vertical tool rail on left, compact side panel on right.
+
+use sdl2::{pixels::Color, rect::Rect, render::Canvas as SdlCanvas, ttf::Font, video::Window};
+
+use crate::{input::switch_tool, tools::{Tool, PALETTE}, AppState};
+use crate::ui::{render_text_centered, tool_fa_icon, MENU_HEIGHT};
+
+// ── Layout constants ─────────────────────────────────────────────────────────
+
+pub const RAIL_WIDTH: i32 = 52;
+pub const SIDE_PANEL_WIDTH: i32 = 100;
+const RAIL_BTN_SIZE: i32 = 44;
+const RAIL_GAP: i32 = 4;
+const SWATCH_SIZE: i32 = 32;
+const COLOR_TILE_SIZE: i32 = 64;
+
+// ── Tool rail ───────────────────────────────────────────────────────────────
+
+pub struct ToolRail {
+    pub buttons: Vec<(Tool, Rect)>,
+}
+
+impl Default for ToolRail {
+    fn default() -> Self { Self { buttons: Vec::new() } }
+}
+
+impl ToolRail {
+    pub fn build(canvas_height: i32) -> Self {
+        let tools = [
+            Tool::Pen, Tool::Line, Tool::Rect, Tool::Circle,
+            Tool::Arrow, Tool::Text, Tool::Select, Tool::Eraser,
+            Tool::Highlight, Tool::Laser,
+        ];
+
+        let total_h = tools.len() as i32 * RAIL_BTN_SIZE
+                    + (tools.len() as i32 - 1) * RAIL_GAP;
+        let y_start = (canvas_height - MENU_HEIGHT - total_h) / 2 + MENU_HEIGHT;
+
+        let buttons: Vec<_> = tools.iter().enumerate().map(|(i, tool)| {
+            let y = y_start + i as i32 * (RAIL_BTN_SIZE + RAIL_GAP);
+            let rect = Rect::new(
+                (RAIL_WIDTH - RAIL_BTN_SIZE) / 2,
+                y,
+                RAIL_BTN_SIZE as u32,
+                RAIL_BTN_SIZE as u32,
+            );
+            (*tool, rect)
+        }).collect();
+
+        Self { buttons }
+    }
+}
+
+// ── Side panel ──────────────────────────────────────────────────────────────
+
+pub struct SidePanel {
+    /// Single large color tile showing the currently active color.
+    /// Clicking it opens a popout listing all 8 colors.
+    pub color_tile:    Rect,
+    pub brush_minus:  Rect,
+    pub brush_plus:   Rect,
+    pub brush_label:  Rect,
+    pub freeze:       Rect,
+    pub change_input: Rect,
+}
+
+impl Default for SidePanel {
+    fn default() -> Self {
+        let z = Rect::new(0, 0, 1, 1);
+        Self {
+            color_tile:   z,
+            brush_minus:  z,
+            brush_plus:   z,
+            brush_label:  z,
+            freeze:       z,
+            change_input: z,
+        }
+    }
+}
+
+impl SidePanel {
+    pub fn build(canvas_w: i32, _canvas_h: i32) -> Self {
+        let x = canvas_w - SIDE_PANEL_WIDTH;
+        let y_top = MENU_HEIGHT;
+
+        // Color tile — large, prominent, clickable
+        let color_tile = Rect::new(
+            x + (SIDE_PANEL_WIDTH - COLOR_TILE_SIZE) / 2,
+            y_top + 16,
+            COLOR_TILE_SIZE as u32,
+            COLOR_TILE_SIZE as u32,
+        );
+
+        // Brush size controls: [−] [size] [+] arranged compactly (32px each)
+        let brush_size_w = 36i32;
+        let brush_size_h = 24i32;
+        let brush_minus = Rect::new(
+            x + 8,
+            color_tile.y + COLOR_TILE_SIZE + 18,
+            brush_size_w as u32,
+            brush_size_h as u32,
+        );
+        let brush_label = Rect::new(
+            brush_minus.x + brush_size_w + 2,
+            brush_minus.y,
+            brush_size_w as u32,
+            brush_size_h as u32,
+        );
+        let brush_plus = Rect::new(
+            brush_label.x + brush_size_w + 2,
+            brush_minus.y,
+            brush_size_w as u32,
+            brush_size_h as u32,
+        );
+
+        // Freeze + change input on a single row, compact
+        let btn_size = 32i32;
+        let ctrl_y = brush_minus.y + brush_size_h + 14;
+        let freeze = Rect::new(
+            x + 14,
+            ctrl_y,
+            btn_size as u32,
+            btn_size as u32,
+        );
+        let change_input = Rect::new(
+            x + SIDE_PANEL_WIDTH - 14 - btn_size,
+            ctrl_y,
+            btn_size as u32,
+            btn_size as u32,
+        );
+
+        Self { color_tile, brush_minus, brush_plus, brush_label, freeze, change_input }
+    }
+
+    /// Compute the popout palette rect for a given color tile rect.
+    /// Popout appears to the LEFT of the tile, with 8 colored swatches in a vertical column.
+    pub fn popout_rect(color_tile: Rect) -> Rect {
+        let sw = SWATCH_SIZE;
+        let gap = 4i32;
+        let count = 8;
+        let popout_w = sw + 16;
+        let popout_h = (sw + gap) * count + gap + 8;
+        let px = color_tile.x - popout_w - 6;
+        let py = color_tile.y;
+        Rect::new(px, py, popout_w as u32, popout_h as u32)
+    }
+
+    /// Get the rect of the i-th swatch inside the popout palette.
+    pub fn popout_swatch_rect(color_tile: Rect, i: usize) -> Rect {
+        let pr = Self::popout_rect(color_tile);
+        let sw = SWATCH_SIZE;
+        let gap = 4i32;
+        let sw_x = pr.x + (pr.width() as i32 - sw) / 2;
+        let sw_y = pr.y + 4 + i as i32 * (sw + gap);
+        Rect::new(sw_x, sw_y, sw as u32, sw as u32)
+    }
+}
+
+// ── Combined V2 layout ──────────────────────────────────────────────────────
+
+#[derive(Default)]
+pub struct V2Layout {
+    pub rail:        ToolRail,
+    pub side_panel:  SidePanel,
+    /// Whether the color popout is currently open.
+    pub popout_open: bool,
+}
+
+impl V2Layout {
+    pub fn build(canvas_w: i32, canvas_h: i32) -> Self {
+        Self {
+            rail:        ToolRail::build(canvas_h),
+            side_panel:  SidePanel::build(canvas_w, canvas_h),
+            popout_open: false,
+        }
+    }
+}
+
+// ── Drawing ─────────────────────────────────────────────────────────────────
+
+/// Draw the V2 side-rail UI.
+pub fn draw_v2_toolbar(
+    sdl: &mut SdlCanvas<Window>,
+    font: &Font,
+    icon_font: &Font,
+    layout: &V2Layout,
+    active_tool: Tool,
+    active_color: (u8, u8, u8),
+    brush_size: u32,
+    freeze_frame: bool,
+    cache: &mut crate::ui::TextCache,
+) {
+    let canvas_w = sdl.output_size().expect("output_size").0 as i32;
+    let canvas_h = sdl.output_size().expect("output_size").1 as i32;
+    let tc = sdl.texture_creator();
+
+    // ── Left rail ──────────────────────────────────────────────────────────
+    sdl.set_draw_color(Color::RGB(18, 18, 20));
+    sdl.fill_rect(Rect::new(0, MENU_HEIGHT, RAIL_WIDTH as u32, (canvas_h - MENU_HEIGHT) as u32)).ok();
+    sdl.set_draw_color(Color::RGB(35, 35, 40));
+    sdl.fill_rect(Rect::new(RAIL_WIDTH - 2, MENU_HEIGHT, 2, (canvas_h - MENU_HEIGHT) as u32)).ok();
+
+    for (tool, rect) in &layout.rail.buttons {
+        let is_active = *tool == active_tool;
+        let bg     = if is_active { Color::RGB(30, 60, 110) } else { Color::RGB(28, 28, 32) };
+        let border = if is_active { Color::RGB(74, 158, 255) } else { Color::RGB(55, 55, 60) };
+        sdl.set_draw_color(bg);
+        sdl.fill_rect(*rect).ok();
+        sdl.set_draw_color(border);
+        sdl.draw_rect(*rect).ok();
+        let icon = tool_fa_icon(*tool).to_string();
+        let icon_color = if is_active { Color::RGB(255, 255, 255) } else { Color::RGB(160, 160, 170) };
+        render_text_centered(sdl, icon_font, &tc, cache, &icon, icon_color, *rect);
+    }
+
+    // ── Right side panel ───────────────────────────────────────────────────
+    let panel_x = canvas_w - SIDE_PANEL_WIDTH;
+    let panel_h = canvas_h - MENU_HEIGHT;
+
+    sdl.set_draw_color(Color::RGB(18, 18, 20));
+    sdl.fill_rect(Rect::new(panel_x, MENU_HEIGHT, SIDE_PANEL_WIDTH as u32, panel_h as u32)).ok();
+    sdl.set_draw_color(Color::RGB(35, 35, 40));
+    sdl.fill_rect(Rect::new(panel_x, MENU_HEIGHT, 2, panel_h as u32)).ok();
+
+    // Color tile — single large swatch showing the active color
+    let ct = layout.side_panel.color_tile;
+    let (ar, ag, ab) = active_color;
+    sdl.set_draw_color(Color::RGB(ar, ag, ab));
+    sdl.fill_rect(ct).ok();
+    let tile_border = if layout.popout_open { Color::RGB(74, 158, 255) } else { Color::RGB(55, 55, 60) };
+    sdl.set_draw_color(tile_border);
+    sdl.draw_rect(ct).ok();
+    // Small dropdown indicator chevron in the corner
+    let chev = if layout.popout_open { "\u{f077}" } else { "\u{f078}" };
+    render_text_centered(sdl, icon_font, &tc, cache, chev,
+        Color::RGB(180, 180, 190),
+        Rect::new(ct.x + ct.width() as i32 - 18, ct.y + ct.height() as i32 - 18, 16, 16));
+
+    // Popout palette (drawn after the tile so it sits on top)
+    if layout.popout_open {
+        let pr = SidePanel::popout_rect(ct);
+        sdl.set_draw_color(Color::RGB(25, 25, 28));
+        sdl.fill_rect(pr).ok();
+        sdl.set_draw_color(Color::RGB(45, 45, 50));
+        sdl.draw_rect(pr).ok();
+
+        for i in 0..8 {
+            let sr = SidePanel::popout_swatch_rect(ct, i);
+            let (r, g, b) = PALETTE[i];
+            sdl.set_draw_color(Color::RGB(r, g, b));
+            sdl.fill_rect(sr).ok();
+            if (r, g, b) == active_color {
+                sdl.set_draw_color(Color::RGB(74, 158, 255));
+                sdl.draw_rect(Rect::new(sr.x - 2, sr.y - 2, sr.width() + 4, sr.height() + 4)).ok();
+            } else {
+                sdl.set_draw_color(Color::RGB(55, 55, 60));
+                sdl.draw_rect(sr).ok();
+            }
+        }
+    }
+
+    // Brush size controls (compact row)
+    sdl.set_draw_color(Color::RGB(28, 28, 32));
+    sdl.fill_rect(layout.side_panel.brush_minus).ok();
+    sdl.fill_rect(layout.side_panel.brush_plus).ok();
+    sdl.set_draw_color(Color::RGB(55, 55, 60));
+    sdl.draw_rect(layout.side_panel.brush_minus).ok();
+    sdl.draw_rect(layout.side_panel.brush_plus).ok();
+
+    let white = Color::RGB(220, 220, 220);
+    let grey  = Color::RGB(140, 140, 150);
+    render_text_centered(sdl, font, &tc, cache, "−", white, layout.side_panel.brush_minus);
+    render_text_centered(sdl, font, &tc, cache, "+", white, layout.side_panel.brush_plus);
+    render_text_centered(sdl, font, &tc, cache, &brush_size.to_string(), grey, layout.side_panel.brush_label);
+
+    let fz_bg     = if freeze_frame { Color::RGB(60, 40, 0) } else { Color::RGB(28, 28, 32) };
+    let fz_border = if freeze_frame { Color::RGB(255, 170, 0) } else { Color::RGB(55, 55, 60) };
+    let fz_icon_col = if freeze_frame { Color::RGB(255, 204, 85) } else { Color::RGB(160, 160, 170) };
+    let fz_icon = if freeze_frame { '\u{f04b}' } else { '\u{f04c}' };
+    sdl.set_draw_color(fz_bg);
+    sdl.fill_rect(layout.side_panel.freeze).ok();
+    sdl.set_draw_color(fz_border);
+    sdl.draw_rect(layout.side_panel.freeze).ok();
+    render_text_centered(sdl, icon_font, &tc, cache, &fz_icon.to_string(), fz_icon_col, layout.side_panel.freeze);
+
+    sdl.set_draw_color(Color::RGB(28, 28, 32));
+    sdl.fill_rect(layout.side_panel.change_input).ok();
+    sdl.set_draw_color(Color::RGB(50, 100, 50));
+    sdl.draw_rect(layout.side_panel.change_input).ok();
+    let cam_icon = '\u{f03d}'.to_string();
+    render_text_centered(sdl, icon_font, &tc, cache, &cam_icon, Color::RGB(100, 200, 100), layout.side_panel.change_input);
+}
+
+/// Returns true if (mx, my) is inside the V2 toolbar area (left rail).
+pub fn is_in_v2_area(mx: i32, _my: i32) -> bool {
+    mx < RAIL_WIDTH
+}
+
+/// Handle a click in the V2 toolbar area.
+pub fn click_v2_toolbar(mx: i32, my: i32, layout: &mut V2Layout, state: &mut AppState) {
+    // Popout open: check popout swatches first, and clicking outside closes it
+    if layout.popout_open {
+        for i in 0..8 {
+            let sr = SidePanel::popout_swatch_rect(layout.side_panel.color_tile, i);
+            if sr.contains_point((mx, my)) {
+                state.color = PALETTE[i];
+                layout.popout_open = false;
+                return;
+            }
+        }
+        // If clicked inside color tile, fall through to toggle behavior below
+        if !layout.side_panel.color_tile.contains_point((mx, my)) {
+            layout.popout_open = false;
+            return;
+        }
+    }
+
+    // Tool buttons in left rail
+    for (tool, rect) in &layout.rail.buttons {
+        if rect.contains_point((mx, my)) {
+            switch_tool(state, *tool);
+            return;
+        }
+    }
+
+    // Color tile — toggle popout
+    if layout.side_panel.color_tile.contains_point((mx, my)) {
+        layout.popout_open = !layout.popout_open;
+        return;
+    }
+
+    // Brush controls
+    if layout.side_panel.brush_minus.contains_point((mx, my)) {
+        state.brush_size = state.brush_size.saturating_sub(4).max(1);
+        state.tool_sizes[state.active_tool.index()] = state.brush_size;
+    } else if layout.side_panel.brush_plus.contains_point((mx, my)) {
+        state.brush_size = (state.brush_size + 4).min(200);
+        state.tool_sizes[state.active_tool.index()] = state.brush_size;
+    } else if layout.side_panel.freeze.contains_point((mx, my)) {
+        state.freeze_frame = !state.freeze_frame;
+    } else if layout.side_panel.change_input.contains_point((mx, my)) {
+        state.show_device_picker = true;
+    }
+}

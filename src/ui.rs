@@ -1,3 +1,5 @@
+//! UI module — V2 side-rail toolbar.
+
 use sdl2::{
     pixels::Color,
     rect::Rect,
@@ -8,19 +10,24 @@ use sdl2::{
 
 use crate::{
     capture::DeviceInfo,
-    tools::{Tool, PALETTE},
+    tools::Tool,
 };
 
-// ── Layout constants ──────────────────────────────────────────────────────────
+/// Toolbar height — slightly shorter on narrow viewports to give the canvas more room.
+/// 1280 px → 80 px
+/// 1920+ px → 100 px
+pub fn toolbar_height(w: i32) -> i32 {
+    let min  = 80f32;
+    let base = 100f32;
+    let t = ((w as f32 - 1280.0) / (1920.0 - 1280.0)).clamp(0.0, 1.0);
+    (base - (base - min) * t) as i32
+}
 
-pub const TOOLBAR_HEIGHT: i32 = 100;
-pub const MENU_HEIGHT:    i32 = 52;
-const TOOL_BTN_SIZE:  i32 = 76;
-const TOOL_BTN_PAD:   i32 = 8;
-const PALETTE_SWATCH: i32 = 44;
-const PALETTE_PAD:    i32 = 6;
+// ── V2: Modern side-rail UI ─────────────────────────────────────────────────
 
-// ── Text surface cache ──────────────────────────────────────────────────────
+pub mod v2;
+
+// ── Text surface cache ────────────────────────────────────────────────────────
 
 /// Pre-rasterized surface cache. Avoids calling SDL2_TTF on every render frame
 /// for text that hasn't changed (tool icons, labels, static UI strings).
@@ -58,7 +65,7 @@ impl TextCache {
 // ── FontAwesome 6 Solid codepoints ───────────────────────────────────────────
 
 /// Return the FontAwesome 6 Solid unicode character for each tool.
-fn tool_fa_icon(tool: Tool) -> char {
+pub fn tool_fa_icon(tool: Tool) -> char {
     match tool {
         Tool::Pen       => '\u{f304}', // pen
         Tool::Line      => '\u{f547}', // ruler-horizontal
@@ -73,195 +80,7 @@ fn tool_fa_icon(tool: Tool) -> char {
     }
 }
 
-// ── Toolbar ───────────────────────────────────────────────────────────────────
-
-/// Pre-computed button rects for hit-testing
-pub struct ToolbarLayout {
-    pub tools:          Vec<(Tool, Rect)>,
-    pub palette:        Vec<Rect>,
-    pub brush_minus:    Rect,
-    pub brush_plus:     Rect,
-    pub brush_label:    Rect,
-    pub freeze_frame:   Rect,
-    pub change_input:   Rect,
-}
-
-impl Default for ToolbarLayout {
-    fn default() -> Self {
-        let z = Rect::new(0, 0, 1, 1);
-        Self {
-            tools:        Vec::new(),
-            palette:      Vec::new(),
-            brush_minus:  z,
-            brush_plus:   z,
-            brush_label:  z,
-            freeze_frame: z,
-            change_input: z,
-        }
-    }
-}
-
-impl ToolbarLayout {
-    pub fn build(canvas_width: i32, canvas_height: i32) -> Self {
-        let y_base = canvas_height - TOOLBAR_HEIGHT;
-        let mut layout = ToolbarLayout::default();
-
-        // Tool buttons — left side
-        let tools_order = [
-            Tool::Pen, Tool::Line, Tool::Rect, Tool::Circle,
-            Tool::Arrow, Tool::Text, Tool::Select, Tool::Eraser, Tool::Highlight, Tool::Laser,
-        ];
-        let mut x = TOOL_BTN_PAD;
-        for tool in tools_order {
-            let rect = Rect::new(x, y_base + (TOOLBAR_HEIGHT - TOOL_BTN_SIZE) / 2, TOOL_BTN_SIZE as u32, TOOL_BTN_SIZE as u32);
-            layout.tools.push((tool, rect));
-            x += TOOL_BTN_SIZE + TOOL_BTN_PAD;
-        }
-
-        // Colour palette — after tools
-        x += TOOL_BTN_PAD * 2;
-        for _ in 0..8 {
-            let rect = Rect::new(
-                x,
-                y_base + (TOOLBAR_HEIGHT - PALETTE_SWATCH) / 2,
-                PALETTE_SWATCH as u32,
-                PALETTE_SWATCH as u32,
-            );
-            layout.palette.push(rect);
-            x += PALETTE_SWATCH + PALETTE_PAD;
-        }
-
-        // Brush size controls — right-anchored group of [−] [size] [+]
-        // All three elements share the same height as tool buttons.
-        // Right edge butts against the change_input button with a small gap.
-        const BRUSH_BTN_W:   i32 = TOOL_BTN_SIZE;  // square
-        const BRUSH_LABEL_W: i32 = 60;
-        const BRUSH_GAP:     i32 = 6;
-        const RIGHT_PAD:     i32 = 8;
-        let by  = y_base + (TOOLBAR_HEIGHT - TOOL_BTN_SIZE) / 2;
-        // change_input sits flush to the right
-        let ci_x = canvas_width - TOOL_BTN_SIZE - RIGHT_PAD;
-        // freeze sits immediately left of change_input
-        let fz_x = ci_x - BRUSH_GAP - TOOL_BTN_SIZE;
-        let bx = fz_x - BRUSH_GAP
-            - BRUSH_BTN_W - BRUSH_GAP - BRUSH_LABEL_W - BRUSH_GAP - BRUSH_BTN_W;
-        layout.brush_minus = Rect::new(bx, by, BRUSH_BTN_W as u32, TOOL_BTN_SIZE as u32);
-        layout.brush_label = Rect::new(
-            bx + BRUSH_BTN_W + BRUSH_GAP, by,
-            BRUSH_LABEL_W as u32, TOOL_BTN_SIZE as u32,
-        );
-        layout.brush_plus  = Rect::new(
-            bx + BRUSH_BTN_W + BRUSH_GAP + BRUSH_LABEL_W + BRUSH_GAP, by,
-            BRUSH_BTN_W as u32, TOOL_BTN_SIZE as u32,
-        );
-        layout.freeze_frame = Rect::new(fz_x, by, TOOL_BTN_SIZE as u32, TOOL_BTN_SIZE as u32);
-
-        // Change Input button — far right
-        layout.change_input = Rect::new(
-            ci_x,
-            y_base + (TOOLBAR_HEIGHT - TOOL_BTN_SIZE) / 2,
-            TOOL_BTN_SIZE as u32,
-            TOOL_BTN_SIZE as u32,
-        );
-
-        layout
-    }
-}
-
-/// Render the toolbar.
-/// `icon_font` — FontAwesome 6 Solid loaded at ~22pt
-pub fn draw_toolbar(
-    sdl: &mut SdlCanvas<Window>,
-    font: &Font,
-    icon_font: &Font,
-    layout: &ToolbarLayout,
-    active_tool: Tool,
-    active_color: (u8, u8, u8),
-    brush_size: u32,
-    canvas_height: i32,
-    canvas_width: i32,
-    freeze_frame: bool,
-    cache: &mut TextCache,
-) {
-    let y_base = canvas_height - TOOLBAR_HEIGHT;
-
-    // Background bar
-    sdl.set_draw_color(Color::RGB(0x1a, 0x1a, 0x1a));
-    sdl.fill_rect(Rect::new(0, y_base, canvas_width as u32, TOOLBAR_HEIGHT as u32)).ok();
-
-    // Top border line
-    sdl.set_draw_color(Color::RGB(0x44, 0x44, 0x44));
-    sdl.draw_line((0, y_base), (canvas_width, y_base)).ok();
-
-    let tc = sdl.texture_creator();
-
-    // Tool buttons
-    for (tool, rect) in &layout.tools {
-        let is_active = *tool == active_tool;
-        let bg = if is_active { Color::RGB(0x2a, 0x4a, 0x7a) } else { Color::RGB(0x2a, 0x2a, 0x2a) };
-        sdl.set_draw_color(bg);
-        sdl.fill_rect(*rect).ok();
-        if is_active {
-            sdl.set_draw_color(Color::RGB(0x4a, 0x9e, 0xff));
-        } else {
-            sdl.set_draw_color(Color::RGB(0x44, 0x44, 0x44));
-        }
-        sdl.draw_rect(*rect).ok();
-
-        // FA icon glyph
-        let icon = tool_fa_icon(*tool).to_string();
-        let icon_color = if is_active { Color::RGB(255, 255, 255) } else { Color::RGB(190, 190, 190) };
-        render_text_centered(sdl, icon_font, &tc, cache, &icon, icon_color, *rect);
-    }
-
-    // Palette swatches
-    for (i, rect) in layout.palette.iter().enumerate() {
-        let (r, g, b) = PALETTE[i];
-        sdl.set_draw_color(Color::RGB(r, g, b));
-        sdl.fill_rect(*rect).ok();
-        if (r, g, b) == active_color {
-            sdl.set_draw_color(Color::RGB(0x4a, 0x9e, 0xff));
-            sdl.draw_rect(Rect::new(rect.x - 2, rect.y - 2, rect.width() + 4, rect.height() + 4)).ok();
-        } else {
-            sdl.set_draw_color(Color::RGB(0x55, 0x55, 0x55));
-            sdl.draw_rect(*rect).ok();
-        }
-    }
-
-    // Brush size controls
-    sdl.set_draw_color(Color::RGB(0x2a, 0x2a, 0x2a));
-    sdl.fill_rect(layout.brush_minus).ok();
-    sdl.fill_rect(layout.brush_plus).ok();
-    sdl.set_draw_color(Color::RGB(0x44, 0x44, 0x44));
-    sdl.draw_rect(layout.brush_minus).ok();
-    sdl.draw_rect(layout.brush_plus).ok();
-    let white = Color::RGB(220, 220, 220);
-    let grey  = Color::RGB(170, 170, 170);
-    render_text_centered(sdl, font, &tc, cache, "−", white, layout.brush_minus);
-    render_text_centered(sdl, font, &tc, cache, "+", white, layout.brush_plus);
-    render_text_centered(sdl, font, &tc, cache, &brush_size.to_string(), grey, layout.brush_label);
-
-    // Freeze frame button — fa-pause when live, fa-play when frozen
-    let fz_bg = if freeze_frame { Color::RGB(0x5a, 0x3a, 0x00) } else { Color::RGB(0x2a, 0x2a, 0x2a) };
-    let fz_border = if freeze_frame { Color::RGB(0xff, 0xaa, 0x00) } else { Color::RGB(0x44, 0x44, 0x44) };
-    let fz_icon_col = if freeze_frame { Color::RGB(0xff, 0xcc, 0x55) } else { Color::RGB(190, 190, 190) };
-    let fz_icon = if freeze_frame { '\u{f04b}' } else { '\u{f04c}' }; // fa-play / fa-pause
-    sdl.set_draw_color(fz_bg);
-    sdl.fill_rect(layout.freeze_frame).ok();
-    sdl.set_draw_color(fz_border);
-    sdl.draw_rect(layout.freeze_frame).ok();
-    render_text_centered(sdl, icon_font, &tc, cache, &fz_icon.to_string(), fz_icon_col, layout.freeze_frame);
-
-    // Change Input button (video camera icon)
-    sdl.set_draw_color(Color::RGB(0x2a, 0x2a, 0x2a));
-    sdl.fill_rect(layout.change_input).ok();
-    sdl.set_draw_color(Color::RGB(0x44, 0x66, 0x44));
-    sdl.draw_rect(layout.change_input).ok();
-    let cam_icon = '\u{f03d}'.to_string(); // fa-video
-    render_text_centered(sdl, icon_font, &tc, cache, &cam_icon, Color::RGB(120, 200, 120), layout.change_input);
-}
-
-// ── Menu bar ──────────────────────────────────────────────────────────────────
+// ── Menu bar ─────────────────────────────────────────────────────────────────
 
 /// Actions the menu bar can return from a click
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,20 +89,16 @@ pub enum MenuAction {
     Undo,
     Redo,
     Clear,
-    /// User clicked a device entry; index 0 = "No input", 1+ = devices list
+    OpenSettings,
     SelectDevice(usize),
 }
 
 /// The thin menu bar at the top of the window.
 pub struct MenuBar {
-    /// Whether the Input dropdown is currently open
-    pub open: bool,
-    /// Cached copies of detected device entries
-    pub devices: Vec<DeviceInfo>,
-    /// Which device is currently active (0 = no input, 1+ = devices[idx-1])
+    pub open:        bool,
+    pub devices:     Vec<DeviceInfo>,
     pub active_idx: usize,
-    /// Machine hostname shown as the bar title
-    pub hostname: String,
+    pub hostname:   String,
 }
 
 impl MenuBar {
@@ -296,9 +111,9 @@ impl MenuBar {
         Self { open: false, devices, active_idx: 0, hostname }
     }
 
-    fn entry_count(&self) -> usize { self.devices.len() + 1 }
+    pub fn entry_count(&self) -> usize { self.devices.len() + 1 }
 
-    fn entry_label(&self, idx: usize) -> String {
+    pub fn entry_label(&self, idx: usize) -> String {
         if idx == 0 {
             "No input (black screen)".to_string()
         } else {
@@ -307,24 +122,23 @@ impl MenuBar {
         }
     }
 
-    fn undo_rect(&self) -> Rect { Rect::new(220, 0, 72, MENU_HEIGHT as u32) }
-    fn redo_rect(&self) -> Rect { Rect::new(296, 0, 72, MENU_HEIGHT as u32) }
-    fn clear_rect(&self) -> Rect { Rect::new(372, 0, 80, MENU_HEIGHT as u32) }
-
-    fn menu_item_rect(&self, canvas_w: i32) -> Rect {
-        // The "Input" menu item in the bar
+    pub fn menu_item_rect(&self, canvas_w: i32) -> Rect {
         Rect::new(canvas_w - 120, 0, 120, MENU_HEIGHT as u32)
     }
 
-    fn fps_rect(&self, canvas_w: i32) -> Rect {
-        // FPS counter sits to the left of the Input button
+    pub fn undo_rect(&self) -> Rect { Rect::new(220, 0, 72, MENU_HEIGHT as u32) }
+    pub fn redo_rect(&self) -> Rect { Rect::new(296, 0, 72, MENU_HEIGHT as u32) }
+    pub fn clear_rect(&self) -> Rect { Rect::new(372, 0, 80, MENU_HEIGHT as u32) }
+    pub fn settings_rect(&self) -> Rect { Rect::new(456, 0, 84, MENU_HEIGHT as u32) }
+
+    pub fn fps_rect(&self, canvas_w: i32) -> Rect {
         Rect::new(canvas_w - 360, 0, 230, MENU_HEIGHT as u32)
     }
 
     fn dropdown_rect(&self, canvas_w: i32) -> Rect {
-        let row_h     = 36i32;
-        let panel_w   = 480i32;
-        let panel_h   = row_h * self.entry_count() as i32 + 8;
+        let row_h   = 36i32;
+        let panel_w = 480i32;
+        let panel_h = row_h * self.entry_count() as i32 + 8;
         Rect::new(canvas_w - panel_w, MENU_HEIGHT, panel_w as u32, panel_h as u32)
     }
 
@@ -336,11 +150,20 @@ impl MenuBar {
     }
 
     /// Draw the menu bar (and dropdown if open)
-    pub fn draw(&self, sdl: &mut SdlCanvas<Window>, font: &Font, canvas_w: i32, has_undo: bool, has_redo: bool, capture_fps: f32, display_fps: f32, cache: &mut TextCache) {
-        // Background bar
+    pub fn draw(
+        &self,
+        sdl: &mut SdlCanvas<Window>,
+        font: &Font,
+        canvas_w: i32,
+        has_undo: bool,
+        has_redo: bool,
+        show_fps: bool,
+        capture_fps: f32,
+        display_fps: f32,
+        cache: &mut TextCache,
+    ) {
         sdl.set_draw_color(Color::RGB(0x14, 0x14, 0x14));
         sdl.fill_rect(Rect::new(0, 0, canvas_w as u32, MENU_HEIGHT as u32)).ok();
-        // Bottom border
         sdl.set_draw_color(Color::RGB(0x33, 0x33, 0x33));
         sdl.draw_line((0, MENU_HEIGHT - 1), (canvas_w, MENU_HEIGHT - 1)).ok();
 
@@ -354,36 +177,39 @@ impl MenuBar {
             Rect::new(12, 0, 220, MENU_HEIGHT as u32),
         );
 
-        // FPS counter — to the left of Input button
-        let fps_label = if capture_fps > 0.0 {
-            format!("in {:.0}  disp {:.0}", capture_fps, display_fps)
-        } else {
-            format!("disp {:.0}", display_fps)
-        };
-        render_text(sdl, font, &tc, cache, &fps_label, Color::RGB(90, 180, 90), self.fps_rect(canvas_w));
+        // FPS counter
+        if show_fps {
+            let fps_label = if capture_fps > 0.0 {
+                format!("in {:.0}  disp {:.0}", capture_fps, display_fps)
+            } else {
+                format!("disp {:.0}", display_fps)
+            };
+            render_text(sdl, font, &tc, cache, &fps_label, Color::RGB(90, 180, 90), self.fps_rect(canvas_w));
+        }
 
-        // "Input" menu button — right
+        // "Input" menu button
         let item_rect = self.menu_item_rect(canvas_w);
         if self.open {
             sdl.set_draw_color(Color::RGB(0x2a, 0x2a, 0x2a));
             sdl.fill_rect(item_rect).ok();
         }
-        let item_color = if self.open { Color::RGB(255,255,255) } else { Color::RGB(200, 200, 200) };
+        let item_color = if self.open { Color::RGB(255, 255, 255) } else { Color::RGB(200, 200, 200) };
         render_text(sdl, font, &tc, cache, "Input  ▾", item_color, item_rect);
 
-        // Undo button
+        // Undo / Redo / Clear / Settings
         let undo_r = self.undo_rect();
         let undo_col = if has_undo { Color::RGB(200, 200, 200) } else { Color::RGB(70, 70, 70) };
         render_text(sdl, font, &tc, cache, "↩ Undo", undo_col, undo_r);
 
-        // Redo button
         let redo_r = self.redo_rect();
         let redo_col = if has_redo { Color::RGB(200, 200, 200) } else { Color::RGB(70, 70, 70) };
         render_text(sdl, font, &tc, cache, "↪ Redo", redo_col, redo_r);
 
-        // Clear button
         let clear_r = self.clear_rect();
         render_text(sdl, font, &tc, cache, "✕ Clear", Color::RGB(200, 80, 80), clear_r);
+
+        let settings_r = self.settings_rect();
+        render_text(sdl, font, &tc, cache, "⚙ Settings", Color::RGB(160, 160, 160), settings_r);
 
         // Dropdown
         if self.open {
@@ -403,32 +229,27 @@ impl MenuBar {
                 let bullet = if is_active { "● " } else { "  " };
                 let label = format!("{}{}", bullet, self.entry_label(i));
                 let color = if is_active { Color::RGB(120, 220, 120) } else { Color::RGB(200, 200, 200) };
-                render_text(sdl, font, &tc, cache, &label,
-                    color,
+                render_text(sdl, font, &tc, cache, &label, color,
                     Rect::new(rr.x + 8, rr.y, (rr.width() - 8) as u32, rr.height()));
             }
         }
     }
 
-    /// Handle a mouse click.  Returns the action to take, and updates open state.
+    /// Handle a mouse click in the top MENU_HEIGHT bar.
     pub fn click(&mut self, mx: i32, my: i32, canvas_w: i32) -> MenuAction {
         if my >= MENU_HEIGHT {
-            // Click below menu bar
             if self.open {
-                // Check dropdown rows
                 for i in 0..self.entry_count() {
                     if self.row_rect(canvas_w, i).contains_point((mx, my)) {
                         self.open = false;
                         return MenuAction::SelectDevice(i);
                     }
                 }
-                // Clicked outside dropdown — close
                 self.open = false;
             }
             return MenuAction::None;
         }
 
-        // Click inside menu bar
         if self.menu_item_rect(canvas_w).contains_point((mx, my)) {
             self.open = !self.open;
         } else if self.undo_rect().contains_point((mx, my)) {
@@ -440,13 +261,15 @@ impl MenuBar {
         } else if self.clear_rect().contains_point((mx, my)) {
             if self.open { self.open = false; }
             return MenuAction::Clear;
+        } else if self.settings_rect().contains_point((mx, my)) {
+            if self.open { self.open = false; }
+            return MenuAction::OpenSettings;
         } else if self.open {
             self.open = false;
         }
         MenuAction::None
     }
 
-    /// Close the dropdown (e.g. when a key is pressed)
     pub fn close(&mut self) { self.open = false; }
 }
 
@@ -456,11 +279,11 @@ impl MenuBar {
 pub enum PickerStage { Devices, Modes }
 
 pub struct DevicePicker {
-    pub devices:       Vec<DeviceInfo>,
+    pub devices:        Vec<DeviceInfo>,
     pub device_cursor: usize,
     pub mode_cursor:   usize,
     pub stage:         PickerStage,
-    pub scroll_offset: usize,  // first visible row index
+    pub scroll_offset: usize,
 }
 
 impl DevicePicker {
@@ -468,7 +291,6 @@ impl DevicePicker {
         Self { devices, device_cursor: 0, mode_cursor: 0, stage: PickerStage::Devices, scroll_offset: 0 }
     }
 
-    /// Backward-compat alias used in a few places.
     pub fn entry_count(&self) -> usize { self.devices.len() + 1 }
 
     pub fn label(&self, idx: usize) -> String {
@@ -485,7 +307,6 @@ impl DevicePicker {
         else { self.devices[idx - 1].caps_summary.clone() }
     }
 
-    /// Ensure the cursor is within the visible scroll window for the given canvas height.
     pub fn scroll_to_cursor(&mut self, canvas_h: i32) {
         let row_h       = 56i32;
         let header_h    = 64i32;
@@ -496,11 +317,9 @@ impl DevicePicker {
             PickerStage::Devices => self.device_cursor,
             PickerStage::Modes   => self.mode_cursor,
         };
-        // Scroll down: cursor went below visible window
         if cursor >= self.scroll_offset + max_visible {
             self.scroll_offset = cursor + 1 - max_visible;
         }
-        // Scroll up: cursor went above visible window
         if cursor < self.scroll_offset {
             self.scroll_offset = cursor;
         }
@@ -526,6 +345,7 @@ impl DevicePicker {
             }
         }
     }
+
     pub fn move_down(&mut self) {
         match self.stage {
             PickerStage::Devices => {
@@ -545,12 +365,11 @@ impl DevicePicker {
         else { self.devices[self.device_cursor - 1].modes.len() }
     }
 
-    /// Call on Enter key or row click. Returns Some((device_idx, mode_idx)) when confirmed.
     pub fn enter(&mut self) -> Option<(usize, usize)> {
         match self.stage {
             PickerStage::Devices => {
                 if self.device_cursor == 0 {
-                    return Some((0, 0));  // no input
+                    return Some((0, 0));
                 }
                 let modes = &self.devices[self.device_cursor - 1].modes;
                 if modes.len() <= 1 {
@@ -570,8 +389,6 @@ impl DevicePicker {
         }
     }
 
-    /// Call on click. Sets the cursor to the clicked row then calls enter().
-    /// Returns Some if a selection was confirmed.
     pub fn click_enter(&mut self, mx: i32, my: i32, canvas_w: i32, canvas_h: i32) -> Option<(usize, usize)> {
         let panel_w     = 720i32;
         let row_h       = 56i32;
@@ -631,18 +448,17 @@ impl DevicePicker {
         let footer_h = 36i32;
         let tc = sdl.texture_creator();
 
-        // Maximum rows we can show without overflowing the screen
-        let avail_h      = canvas_h - 40;  // 20px margin top+bottom
-        let max_visible  = ((avail_h - header_h - footer_h) / row_h).max(1) as usize;
-        let px           = (canvas_w - panel_w) / 2;
+        let avail_h     = canvas_h - 40;
+        let max_visible = ((avail_h - header_h - footer_h) / row_h).max(1) as usize;
+        let px          = (canvas_w - panel_w) / 2;
 
         match self.stage {
             PickerStage::Devices => {
-                let total        = self.entry_count();
-                let visible      = total.min(max_visible);
-                let scroll       = self.scroll_offset.min(total.saturating_sub(visible));
-                let panel_h      = header_h + row_h * visible as i32 + footer_h;
-                let py           = (canvas_h - panel_h) / 2;
+                let total   = self.entry_count();
+                let visible = total.min(max_visible);
+                let scroll  = self.scroll_offset.min(total.saturating_sub(visible));
+                let panel_h = header_h + row_h * visible as i32 + footer_h;
+                let py      = (canvas_h - panel_h) / 2;
 
                 sdl.set_draw_color(Color::RGB(0x22, 0x22, 0x22));
                 sdl.fill_rect(Rect::new(px, py, panel_w as u32, panel_h as u32)).ok();
@@ -658,7 +474,6 @@ impl DevicePicker {
                     Color::RGB(220, 220, 220),
                     Rect::new(px + 16, py + 16, (panel_w - 32) as u32, 32));
 
-                // Scroll indicator arrows
                 if scroll > 0 {
                     render_text(sdl, font, &tc, cache, "\u{25b2} more",
                         Color::RGB(150, 150, 150),
@@ -681,8 +496,8 @@ impl DevicePicker {
                         sdl.set_draw_color(Color::RGB(0x4a, 0x9e, 0xff));
                         sdl.draw_rect(row_rect).ok();
                     }
-                    let name_col = if is_sel { Color::RGB(255,255,255) } else { Color::RGB(180,180,180) };
-                    let caps_col = if is_sel { Color::RGB(140,210,255) } else { Color::RGB(100,140,100) };
+                    let name_col = if is_sel { Color::RGB(255, 255, 255) } else { Color::RGB(180, 180, 180) };
+                    let caps_col = if is_sel { Color::RGB(140, 210, 255) } else { Color::RGB(100, 140, 100) };
                     render_text(sdl, font, &tc, cache, &self.label(i), name_col,
                         Rect::new(px + 20, ry + 4, (panel_w - 40) as u32, 22));
                     let caps = self.caps_label(i);
@@ -698,12 +513,12 @@ impl DevicePicker {
             }
 
             PickerStage::Modes => {
-                let dev          = &self.devices[self.device_cursor - 1];
-                let total        = dev.modes.len();
-                let visible      = total.min(max_visible);
-                let scroll       = self.scroll_offset.min(total.saturating_sub(visible));
-                let panel_h      = header_h + row_h * visible as i32 + footer_h;
-                let py           = (canvas_h - panel_h) / 2;
+                let dev     = &self.devices[self.device_cursor - 1];
+                let total   = dev.modes.len();
+                let visible = total.min(max_visible);
+                let scroll  = self.scroll_offset.min(total.saturating_sub(visible));
+                let panel_h = header_h + row_h * visible as i32 + footer_h;
+                let py      = (canvas_h - panel_h) / 2;
 
                 sdl.set_draw_color(Color::RGB(0x22, 0x22, 0x22));
                 sdl.fill_rect(Rect::new(px, py, panel_w as u32, panel_h as u32)).ok();
@@ -719,7 +534,6 @@ impl DevicePicker {
                     Color::RGB(220, 220, 220),
                     Rect::new(px + 16, py + 16, (panel_w - 32) as u32, 32));
 
-                // Scroll indicator arrows
                 if scroll > 0 {
                     render_text(sdl, font, &tc, cache, "\u{25b2} more",
                         Color::RGB(150, 150, 150),
@@ -743,7 +557,7 @@ impl DevicePicker {
                         sdl.set_draw_color(Color::RGB(0x4a, 0x9e, 0xff));
                         sdl.draw_rect(row_rect).ok();
                     }
-                    let col = if is_sel { Color::RGB(255,255,255) } else { Color::RGB(180,180,180) };
+                    let col = if is_sel { Color::RGB(255, 255, 255) } else { Color::RGB(180, 180, 180) };
                     render_text(sdl, font, &tc, cache, &mode.label(), col,
                         Rect::new(px + 20, ry + 14, (panel_w - 40) as u32, 24));
                 }
@@ -755,6 +569,270 @@ impl DevicePicker {
         }
     }
 }
+
+// ── Overlay settings panel ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Toggle { On, Off }
+
+impl Toggle {
+    pub fn next(&mut self) { *self = match self { Toggle::Off => Toggle::On, Toggle::On => Toggle::Off }; }
+    pub fn as_bool(&self) -> bool { *self == Toggle::On }
+    pub fn from_bool(b: bool) -> Self { if b { Toggle::On } else { Toggle::Off } }
+}
+
+pub struct OverlaySettings {
+    pub cursor:        usize,
+    pub laser_fade:   f32,
+    pub laser_on:     Toggle,
+    pub show_fps:     Toggle,
+    pub fullscreen:   Toggle,
+    pub undo_limit:   usize,
+    pub renderer_info: String,
+    pub scroll_offset: usize,
+}
+
+impl OverlaySettings {
+    const ROW_H:     i32 = 56;
+    const PANEL_W:   i32 = 560;
+    const HEADER_H:  i32 = 64;
+    const FOOTER_H:  i32 = 36;
+    const SLIDER_MIN: f32 = 0.2;
+    const SLIDER_MAX: f32 = 3.0;
+    const UNDO_MIN: usize = 5;
+    const UNDO_MAX: usize = 100;
+    const COUNT: usize = 5;
+
+    fn visible_rows(&self, canvas_h: i32) -> usize {
+        let avail_h = canvas_h - 40;
+        let max_vis = ((avail_h - Self::HEADER_H - Self::FOOTER_H) / Self::ROW_H).max(1) as usize;
+        Self::COUNT.min(max_vis)
+    }
+
+    fn panel_h(&self, canvas_h: i32) -> i32 {
+        Self::HEADER_H + Self::ROW_H * self.visible_rows(canvas_h) as i32 + Self::FOOTER_H
+    }
+
+    fn panel_rect(&self, canvas_w: i32, canvas_h: i32) -> Rect {
+        let pw = Self::PANEL_W;
+        let ph = self.panel_h(canvas_h);
+        Rect::new((canvas_w - pw) / 2, (canvas_h - ph) / 2, pw as u32, ph as u32)
+    }
+
+    fn row_y(&self, canvas_h: i32, vi: usize) -> i32 {
+        let ph = self.panel_h(canvas_h);
+        let py = (canvas_h - ph) / 2;
+        py + Self::HEADER_H + (vi as i32) * Self::ROW_H
+    }
+
+    pub fn move_down(&mut self, canvas_h: i32) {
+        if self.cursor + 1 < Self::COUNT {
+            self.cursor += 1;
+            self.scroll_to_cursor(canvas_h);
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            if self.cursor < self.scroll_offset {
+                self.scroll_offset = self.cursor;
+            }
+        }
+    }
+
+    fn scroll_to_cursor(&mut self, canvas_h: i32) {
+        let vis = self.visible_rows(canvas_h);
+        if self.cursor >= self.scroll_offset + vis {
+            self.scroll_offset = self.cursor + 1 - vis;
+        }
+    }
+
+    pub fn adjust(&mut self, right: bool) -> bool {
+        match self.cursor {
+            0 => {
+                let step = 0.1;
+                if right {
+                    self.laser_fade = (self.laser_fade + step).min(Self::SLIDER_MAX);
+                } else {
+                    self.laser_fade = (self.laser_fade - step).max(Self::SLIDER_MIN);
+                }
+                self.laser_fade = (self.laser_fade * 10.0).round() / 10.0;
+                true
+            }
+            1 => { self.laser_on.next(); true }
+            2 => { self.show_fps.next(); true }
+            3 => {
+                let step = 5;
+                if right {
+                    self.undo_limit = self.undo_limit.saturating_add(step).min(Self::UNDO_MAX);
+                } else {
+                    self.undo_limit = self.undo_limit.saturating_sub(step).max(Self::UNDO_MIN);
+                }
+                true
+            }
+            4 => { self.fullscreen.next(); true }
+            _ => false,
+        }
+    }
+
+    pub fn enter(&mut self) -> OverlayAction {
+        match self.cursor {
+            4 => OverlayAction::ToggleFullscreen,
+            _ => OverlayAction::None,
+        }
+    }
+
+    pub fn click(&mut self, mx: i32, my: i32, canvas_w: i32, canvas_h: i32) -> OverlayAction {
+        let pr = self.panel_rect(canvas_w, canvas_h);
+        if !pr.contains_point((mx, my)) { return OverlayAction::Close; }
+
+        if my < pr.y + Self::HEADER_H || my >= pr.y + pr.height() as i32 - Self::FOOTER_H {
+            return OverlayAction::None;
+        }
+
+        let rel_y = my - (pr.y + Self::HEADER_H);
+        let clicked_row = (rel_y / Self::ROW_H) as usize + self.scroll_offset;
+        if clicked_row >= Self::COUNT { return OverlayAction::None; }
+
+        self.cursor = clicked_row;
+        self.scroll_to_cursor(canvas_h);
+
+        let label_w = 200i32;
+        let slider_x = pr.x + label_w;
+        let slider_w = Self::PANEL_W - label_w - 16;
+        if mx > slider_x + 40 {
+            let in_right = mx > slider_x + slider_w / 2;
+            self.adjust(in_right);
+        }
+        OverlayAction::None
+    }
+
+    pub fn draw(&self, sdl: &mut SdlCanvas<Window>, font: &Font, canvas_w: i32, canvas_h: i32, cache: &mut TextCache) {
+        sdl.set_draw_color(Color::RGBA(0, 0, 0, 160));
+        sdl.fill_rect(Rect::new(0, 0, canvas_w as u32, canvas_h as u32)).ok();
+
+        let pr = self.panel_rect(canvas_w, canvas_h);
+        let px = pr.x;
+        let py = pr.y;
+        let pw = pr.width() as i32;
+        let vis = self.visible_rows(canvas_h);
+
+        sdl.set_draw_color(Color::RGB(0x1c, 0x1c, 0x1c));
+        sdl.fill_rect(pr).ok();
+        sdl.set_draw_color(Color::RGB(0x44, 0x44, 0x44));
+        sdl.draw_rect(pr).ok();
+
+        let tc = sdl.texture_creator();
+
+        // Header
+        render_text(sdl, font, &tc, cache, "Settings",
+            Color::RGB(220, 220, 220),
+            Rect::new(px + 16, py + 16, (pw - 32) as u32, 32));
+        sdl.set_draw_color(Color::RGB(0x33, 0x33, 0x33));
+        sdl.draw_line((px, py + Self::HEADER_H), (px + pw, py + Self::HEADER_H)).ok();
+
+        // Rows
+        for vi in 0..vis {
+            let i = self.scroll_offset + vi;
+            let ry = self.row_y(canvas_h, vi);
+            let is_sel = i == self.cursor;
+            let row_rect = Rect::new(px + 8, ry, (pw - 16) as u32, (Self::ROW_H - 4) as u32);
+
+            if is_sel {
+                sdl.set_draw_color(Color::RGB(0x2a, 0x3a, 0x5a));
+                sdl.fill_rect(row_rect).ok();
+                sdl.set_draw_color(Color::RGB(0x4a, 0x9e, 0xff));
+                sdl.draw_rect(row_rect).ok();
+            }
+
+            let label_col = if is_sel { Color::RGB(255, 255, 255) } else { Color::RGB(170, 170, 170) };
+            let val_col   = if is_sel { Color::RGB(140, 210, 255) } else { Color::RGB(120, 120, 120) };
+            let label_x = px + 16;
+            let val_x   = px + 220;
+            let val_w   = pw - 220 - 16;
+
+            match i {
+                0 => {
+                    render_text(sdl, font, &tc, cache, "Laser fade", label_col,
+                        Rect::new(label_x, ry + 4, 200, 24));
+                    let bar_x = val_x;
+                    let bar_y = ry + 24;
+                    let bar_w = val_w - 80;
+                    let bar_h = 16;
+                    let t = (self.laser_fade - Self::SLIDER_MIN) / (Self::SLIDER_MAX - Self::SLIDER_MIN);
+                    let fill_w = (t * bar_w as f32) as i32;
+                    sdl.set_draw_color(Color::RGB(0x33, 0x33, 0x33));
+                    sdl.fill_rect(Rect::new(bar_x, bar_y, bar_w as u32, bar_h as u32)).ok();
+                    sdl.set_draw_color(if is_sel { Color::RGB(0x4a, 0x9e, 0xff) } else { Color::RGB(0x55, 0x55, 0x55) });
+                    sdl.fill_rect(Rect::new(bar_x, bar_y, fill_w as u32, bar_h as u32)).ok();
+                    let val_str = format!("{:.1}s", self.laser_fade);
+                    render_text(sdl, font, &tc, cache, &val_str, val_col,
+                        Rect::new(bar_x + bar_w + 4, bar_y - 4, 72, bar_h as u32 + 8));
+                }
+                1 => {
+                    render_text(sdl, font, &tc, cache, "Laser pointer", label_col,
+                        Rect::new(label_x, ry + 4, 200, 24));
+                    let on_str = if self.laser_on == Toggle::On { "ON" } else { "OFF" };
+                    let on_col = if self.laser_on == Toggle::On { Color::RGB(80, 220, 80) } else { Color::RGB(180, 80, 80) };
+                    render_text(sdl, font, &tc, cache, on_str, on_col,
+                        Rect::new(val_x, ry + 4, 80, 24));
+                    render_text(sdl, font, &tc, cache, "use L key", Color::RGB(90, 90, 90),
+                        Rect::new(val_x, ry + 28, 200, 18));
+                }
+                2 => {
+                    render_text(sdl, font, &tc, cache, "Show FPS", label_col,
+                        Rect::new(label_x, ry + 4, 200, 24));
+                    let on_str = if self.show_fps == Toggle::On { "ON" } else { "OFF" };
+                    let on_col = if self.show_fps == Toggle::On { Color::RGB(80, 220, 80) } else { Color::RGB(180, 80, 80) };
+                    render_text(sdl, font, &tc, cache, on_str, on_col,
+                        Rect::new(val_x, ry + 4, 80, 24));
+                }
+                3 => {
+                    render_text(sdl, font, &tc, cache, "Undo depth", label_col,
+                        Rect::new(label_x, ry + 4, 200, 24));
+                    let bar_x = val_x;
+                    let bar_y = ry + 24;
+                    let bar_w = val_w - 80;
+                    let bar_h = 16;
+                    let t = (self.undo_limit as f32 - Self::UNDO_MIN as f32)
+                            / (Self::UNDO_MAX as f32 - Self::UNDO_MIN as f32);
+                    let fill_w = (t * bar_w as f32) as i32;
+                    sdl.set_draw_color(Color::RGB(0x33, 0x33, 0x33));
+                    sdl.fill_rect(Rect::new(bar_x, bar_y, bar_w as u32, bar_h as u32)).ok();
+                    sdl.set_draw_color(if is_sel { Color::RGB(0x4a, 0x9e, 0xff) } else { Color::RGB(0x55, 0x55, 0x55) });
+                    sdl.fill_rect(Rect::new(bar_x, bar_y, fill_w as u32, bar_h as u32)).ok();
+                    let val_str = self.undo_limit.to_string();
+                    render_text(sdl, font, &tc, cache, &val_str, val_col,
+                        Rect::new(bar_x + bar_w + 4, bar_y - 4, 72, bar_h as u32 + 8));
+                }
+                4 => {
+                    render_text(sdl, font, &tc, cache, "Fullscreen", label_col,
+                        Rect::new(label_x, ry + 4, 200, 24));
+                    let on_str = if self.fullscreen == Toggle::On { "ON" } else { "OFF" };
+                    let on_col = if self.fullscreen == Toggle::On { Color::RGB(80, 220, 80) } else { Color::RGB(180, 80, 80) };
+                    render_text(sdl, font, &tc, cache, on_str, on_col,
+                        Rect::new(val_x, ry + 4, 80, 24));
+                    render_text(sdl, font, &tc, cache, "or press F", Color::RGB(90, 90, 90),
+                        Rect::new(val_x, ry + 28, 200, 18));
+                }
+                _ => {}
+            }
+        }
+
+        // Footer
+        sdl.set_draw_color(Color::RGB(0x33, 0x33, 0x33));
+        let footer_y = py + pr.height() as i32 - Self::FOOTER_H;
+        sdl.draw_line((px, footer_y), (px + pw, footer_y)).ok();
+        render_text(sdl, font, &tc, cache,
+            "\u{2191}\u{2193} navigate   \u{2190}\u{2192} adjust   Enter confirm   Esc close",
+            Color::RGB(90, 90, 90),
+            Rect::new(px + 16, footer_y + 8, (pw - 32) as u32, 20));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayAction { None, Close, ToggleFullscreen }
 
 // ── Text rendering helpers ────────────────────────────────────────────────────
 
@@ -780,7 +858,7 @@ pub fn render_text(
 }
 
 /// Render text horizontally and vertically centred within `dst` (for icon buttons).
-fn render_text_centered(
+pub fn render_text_centered(
     sdl: &mut SdlCanvas<Window>,
     font: &Font,
     tc: &sdl2::render::TextureCreator<sdl2::video::WindowContext>,
@@ -793,14 +871,14 @@ fn render_text_centered(
     let surface = cache.surface(font, text, color);
     let texture = match tc.create_texture_from_surface(surface) { Ok(t) => t, Err(_) => return };
     let q = texture.query();
-    let tw = q.width.min(dst.width())  as i32;
+    let tw = q.width.min(dst.width()) as i32;
     let th = q.height.min(dst.height()) as i32;
     let src  = Rect::new(0, 0, tw as u32, th as u32);
-    let dest = Rect::new(
-        dst.x + (dst.width()  as i32 - tw) / 2,
-        dst.y + (dst.height() as i32 - th) / 2,
-        tw as u32,
-        th as u32,
-    );
+    let dest = Rect::new(dst.x + (dst.width() as i32 - tw) / 2, dst.y + (dst.height() as i32 - th) / 2, tw as u32, th as u32);
     sdl.copy(&texture, src, dest).ok();
 }
+
+// ── UI trait ─────────────────────────────────────────────────────────────────
+
+/// Menu bar height — shared by all UI variants.
+pub const MENU_HEIGHT: i32 = 52;
