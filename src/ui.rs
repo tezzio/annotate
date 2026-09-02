@@ -142,6 +142,12 @@ impl MenuBar {
         Rect::new(canvas_w - panel_w, MENU_HEIGHT, panel_w as u32, panel_h as u32)
     }
 
+    /// Close button in the top-right of the open dropdown panel.
+    fn dropdown_close_rect(&self, canvas_w: i32) -> Rect {
+        let dr = self.dropdown_rect(canvas_w);
+        Rect::new(dr.x + dr.width() as i32 - 32, dr.y + 4, 28, 28)
+    }
+
     fn row_rect(&self, canvas_w: i32, idx: usize) -> Rect {
         let row_h   = 36i32;
         let panel_w = 480i32;
@@ -219,6 +225,15 @@ impl MenuBar {
             sdl.set_draw_color(Color::RGB(0x44, 0x44, 0x44));
             sdl.draw_rect(dr).ok();
 
+            // Close button (top-right of dropdown)
+            let cr = self.dropdown_close_rect(canvas_w);
+            sdl.set_draw_color(Color::RGB(60, 60, 60));
+            sdl.fill_rect(cr).ok();
+            sdl.set_draw_color(Color::RGB(0x55, 0x55, 0x55));
+            sdl.draw_rect(cr).ok();
+            render_text_centered(sdl, font, &tc, cache, "\u{2715}",
+                Color::RGB(200, 200, 200), cr);
+
             for i in 0..self.entry_count() {
                 let rr = self.row_rect(canvas_w, i);
                 let is_active = i == self.active_idx;
@@ -239,6 +254,11 @@ impl MenuBar {
     pub fn click(&mut self, mx: i32, my: i32, canvas_w: i32) -> MenuAction {
         if my >= MENU_HEIGHT {
             if self.open {
+                // Close button takes priority over row hits
+                if self.dropdown_close_rect(canvas_w).contains_point((mx, my)) {
+                    self.open = false;
+                    return MenuAction::None;
+                }
                 for i in 0..self.entry_count() {
                     if self.row_rect(canvas_w, i).contains_point((mx, my)) {
                         self.open = false;
@@ -276,7 +296,29 @@ impl MenuBar {
 // ── Device picker modal ───────────────────────────────────────────────────────
 
 #[derive(PartialEq)]
-pub enum PickerStage { Devices, Modes }
+pub enum PickerStage { Devices, Modes, Rtsp }
+
+/// What the header control (close X / back arrow) should do for a given
+/// stage.  See [`DevicePicker::click_dismiss`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerDismiss {
+    /// No header hit.
+    None,
+    /// Header was clicked on a sub-stage (e.g. Rtsp) — reset stage to
+    /// Devices, but leave the modal open.
+    Back,
+    /// Header was clicked on the top-level stage — close the modal.
+    Close,
+}
+
+/// RTSP stream URL entered via the picker UI.  Credentials belong in the
+/// URL itself (e.g. `rtsp://user:pass@host/path`) — that's the standard
+/// RTSP convention and what `ffmpeg -i` accepts directly, so there's no need
+/// to model them as separate fields.
+#[derive(Clone, Default)]
+pub struct RtspEntry {
+    pub url: String,
+}
 
 pub struct DevicePicker {
     pub devices:        Vec<DeviceInfo>,
@@ -284,18 +326,41 @@ pub struct DevicePicker {
     pub mode_cursor:   usize,
     pub stage:         PickerStage,
     pub scroll_offset: usize,
+    /// In-progress RTSP URL edit.  Only meaningful while `stage == Rtsp`.
+    pub rtsp:          RtspEntry,
 }
 
 impl DevicePicker {
     pub fn new(devices: Vec<DeviceInfo>) -> Self {
-        Self { devices, device_cursor: 0, mode_cursor: 0, stage: PickerStage::Devices, scroll_offset: 0 }
+        Self {
+            devices,
+            device_cursor: 0,
+            mode_cursor: 0,
+            stage: PickerStage::Devices,
+            scroll_offset: 0,
+            rtsp: RtspEntry::default(),
+        }
     }
 
-    pub fn entry_count(&self) -> usize { self.devices.len() + 1 }
+    /// Reset the picker to its initial Devices stage.  Used by both the
+    /// close button and the keyboard dismiss path so reopening the picker
+    /// doesn't land the user on a stale Modes or Rtsp screen.
+    pub fn dismiss(&mut self) {
+        self.stage = PickerStage::Devices;
+        self.device_cursor = 0;
+        self.mode_cursor = 0;
+        self.scroll_offset = 0;
+        self.rtsp = RtspEntry::default();
+    }
+
+    pub fn entry_count(&self) -> usize { self.devices.len() + 1 + 1 }  // +1 for "No input", +1 for "RTSP"
 
     pub fn label(&self, idx: usize) -> String {
+        let rtsp_idx = self.devices.len() + 1;
         if idx == 0 {
             "No input  (black screen)".to_string()
+        } else if idx == rtsp_idx {
+            "➕ RTSP Stream".to_string()
         } else {
             let dev = &self.devices[idx - 1];
             format!("{}  [{}]", dev.name, dev.path.display())
@@ -303,7 +368,9 @@ impl DevicePicker {
     }
 
     fn caps_label(&self, idx: usize) -> String {
+        let rtsp_idx = self.devices.len() + 1;
         if idx == 0 { String::new() }
+        else if idx == rtsp_idx { String::new() }
         else { self.devices[idx - 1].caps_summary.clone() }
     }
 
@@ -316,6 +383,7 @@ impl DevicePicker {
         let cursor = match self.stage {
             PickerStage::Devices => self.device_cursor,
             PickerStage::Modes   => self.mode_cursor,
+            PickerStage::Rtsp    => 0,
         };
         if cursor >= self.scroll_offset + max_visible {
             self.scroll_offset = cursor + 1 - max_visible;
@@ -343,6 +411,8 @@ impl DevicePicker {
                     }
                 }
             }
+            // RTSP has a single URL field; up/down are no-ops.
+            PickerStage::Rtsp => {}
         }
     }
 
@@ -357,6 +427,8 @@ impl DevicePicker {
                 let n = self.current_mode_count();
                 if self.mode_cursor + 1 < n { self.mode_cursor += 1; }
             }
+            // RTSP has a single URL field; up/down are no-ops.
+            PickerStage::Rtsp => {}
         }
     }
 
@@ -368,8 +440,15 @@ impl DevicePicker {
     pub fn enter(&mut self) -> Option<(usize, usize)> {
         match self.stage {
             PickerStage::Devices => {
+                let rtsp_idx = self.devices.len() + 1;
                 if self.device_cursor == 0 {
                     return Some((0, 0));
+                } else if self.device_cursor == rtsp_idx {
+                    // RTSP entry selected - switch to RTSP stage
+                    self.stage = PickerStage::Rtsp;
+                    self.rtsp = RtspEntry::default();
+                    self.scroll_offset = 0;
+                    return None;
                 }
                 let modes = &self.devices[self.device_cursor - 1].modes;
                 if modes.len() <= 1 {
@@ -385,6 +464,60 @@ impl DevicePicker {
                 let result = Some((self.device_cursor, self.mode_cursor));
                 self.stage = PickerStage::Devices;
                 result
+            }
+            PickerStage::Rtsp => {
+                // Return special marker (usize::MAX, 0) to indicate RTSP
+                // The main loop will read self.rtsp for the configuration
+                Some((usize::MAX, 0))
+            }
+        }
+    }
+
+    /// Get the RTSP configuration (only valid after RTSP stage is confirmed)
+    pub fn rtsp_config(&self) -> Option<RtspEntry> {
+        if self.stage == PickerStage::Rtsp {
+            Some(self.rtsp.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Top-right close button in the panel header.
+    pub fn close_rect(&self, canvas_w: i32, canvas_h: i32) -> Rect {
+        let panel_w     = 720i32;
+        let row_h       = 56i32;
+        let header_h    = 64i32;
+        let footer_h    = 36i32;
+        let avail_h     = canvas_h - 40;
+        let max_visible = ((avail_h - header_h - footer_h) / row_h).max(1) as usize;
+        let px          = (canvas_w - panel_w) / 2;
+        let visible = match self.stage {
+            PickerStage::Devices => self.entry_count().min(max_visible),
+            PickerStage::Modes   => self.current_mode_count().min(max_visible),
+            PickerStage::Rtsp    => 3.min(max_visible),
+        };
+        let panel_h = header_h + row_h * visible as i32 + footer_h;
+        let py      = (canvas_h - panel_h) / 2;
+        Rect::new(px + panel_w - 40, py + 8, 32, 32)
+    }
+
+    /// Result of a click on the header control.  The Devices/Modes stages
+    /// have a true close button (dismisses the modal entirely); the Rtsp
+    /// stage has a back button (returns to Devices, leaving the modal
+    /// open).  In both cases the picker stage is reset to Devices via
+    /// [`dismiss`] so reopening the modal lands on a clean screen.
+    pub fn click_dismiss(&mut self, mx: i32, my: i32, canvas_w: i32, canvas_h: i32) -> PickerDismiss {
+        if !self.close_rect(canvas_w, canvas_h).contains_point((mx, my)) {
+            return PickerDismiss::None;
+        }
+        match self.stage {
+            PickerStage::Rtsp => {
+                self.dismiss();
+                PickerDismiss::Back
+            }
+            _ => {
+                self.dismiss();
+                PickerDismiss::Close
             }
         }
     }
@@ -435,6 +568,11 @@ impl DevicePicker {
                 }
                 None
             }
+            PickerStage::Rtsp => {
+                // Single URL field — clicking it focuses it for typing; Enter
+                // commits (handled by the caller via `enter()`).
+                None
+            }
         }
     }
 
@@ -464,6 +602,15 @@ impl DevicePicker {
                 sdl.fill_rect(Rect::new(px, py, panel_w as u32, panel_h as u32)).ok();
                 sdl.set_draw_color(Color::RGB(0x44, 0x44, 0x44));
                 sdl.draw_rect(Rect::new(px, py, panel_w as u32, panel_h as u32)).ok();
+
+                // Close button (top-right of header)
+                let cr = self.close_rect(canvas_w, canvas_h);
+                sdl.set_draw_color(Color::RGB(60, 60, 60));
+                sdl.fill_rect(cr).ok();
+                sdl.set_draw_color(Color::RGB(0x55, 0x55, 0x55));
+                sdl.draw_rect(cr).ok();
+                render_text_centered(sdl, font, &tc, cache, "\u{2715}",
+                    Color::RGB(200, 200, 200), cr);
 
                 let title = if total > max_visible {
                     format!("Select capture device  ({}/{})", self.device_cursor + 1, total)
@@ -525,6 +672,15 @@ impl DevicePicker {
                 sdl.set_draw_color(Color::RGB(0x44, 0x44, 0x44));
                 sdl.draw_rect(Rect::new(px, py, panel_w as u32, panel_h as u32)).ok();
 
+                // Close button (top-right of header)
+                let cr = self.close_rect(canvas_w, canvas_h);
+                sdl.set_draw_color(Color::RGB(60, 60, 60));
+                sdl.fill_rect(cr).ok();
+                sdl.set_draw_color(Color::RGB(0x55, 0x55, 0x55));
+                sdl.draw_rect(cr).ok();
+                render_text_centered(sdl, font, &tc, cache, "\u{2715}",
+                    Color::RGB(200, 200, 200), cr);
+
                 let title = if total > max_visible {
                     format!("Select format \u{2014} {}  ({}/{})", dev.name, self.mode_cursor + 1, total)
                 } else {
@@ -563,6 +719,58 @@ impl DevicePicker {
                 }
                 render_text(sdl, font, &tc, cache,
                     "\u{2191}\u{2193} navigate   Enter to confirm   Esc to go back",
+                    Color::RGB(100, 100, 100),
+                    Rect::new(px + 16, py + panel_h - footer_h + 8, (panel_w - 32) as u32, 20));
+            }
+
+            PickerStage::Rtsp => {
+                let panel_h = header_h + row_h + footer_h;
+                let py      = (canvas_h - panel_h) / 2;
+
+                sdl.set_draw_color(Color::RGB(0x22, 0x22, 0x22));
+                sdl.fill_rect(Rect::new(px, py, panel_w as u32, panel_h as u32)).ok();
+                sdl.set_draw_color(Color::RGB(0x44, 0x44, 0x44));
+                sdl.draw_rect(Rect::new(px, py, panel_w as u32, panel_h as u32)).ok();
+
+                // Back button (top-right of header) — RTSP is reached by
+                // drilling down from the Devices list, so this returns the
+                // user there rather than closing the modal.
+                let cr = self.close_rect(canvas_w, canvas_h);
+                sdl.set_draw_color(Color::RGB(60, 60, 60));
+                sdl.fill_rect(cr).ok();
+                sdl.set_draw_color(Color::RGB(0x55, 0x55, 0x55));
+                sdl.draw_rect(cr).ok();
+                render_text_centered(sdl, font, &tc, cache, "\u{2190}",
+                    Color::RGB(200, 200, 200), cr);
+
+                render_text(sdl, font, &tc, cache,
+                    "RTSP Stream URL",
+                    Color::RGB(220, 220, 220),
+                    Rect::new(px + 16, py + 16, (panel_w - 32) as u32, 32));
+
+                // Single URL row
+                let ry = py + header_h;
+                let row_rect = Rect::new(px + 8, ry, (panel_w - 16) as u32, (row_h - 4) as u32);
+                sdl.set_draw_color(Color::RGB(0x2a, 0x4a, 0x7a));
+                sdl.fill_rect(row_rect).ok();
+                sdl.set_draw_color(Color::RGB(0x4a, 0x9e, 0xff));
+                sdl.draw_rect(row_rect).ok();
+
+                let url_value = if self.rtsp.url.is_empty() {
+                    "rtsp://user:pass@camera:554/Preview_01_main".to_string()
+                } else {
+                    format!("{}\u{2502}", self.rtsp.url)  // cursor bar
+                };
+                let value_col = if self.rtsp.url.is_empty() {
+                    Color::RGB(70, 100, 130)
+                } else {
+                    Color::RGB(140, 210, 255)
+                };
+                render_text(sdl, font, &tc, cache, &url_value, value_col,
+                    Rect::new(px + 20, ry + 4, (panel_w - 40) as u32, 22));
+
+                render_text(sdl, font, &tc, cache,
+                    "Reolink: /Preview_01_main  \u{b7}  /Preview_01_sub  \u{b7}  /ch01/0/main  \u{b7}  /fe-p  /fe-w",
                     Color::RGB(100, 100, 100),
                     Rect::new(px + 16, py + panel_h - footer_h + 8, (panel_w - 32) as u32, 20));
             }
@@ -683,9 +891,18 @@ impl OverlaySettings {
         }
     }
 
+    /// Top-right close button in the panel header.
+    pub fn close_rect(&self, canvas_w: i32, canvas_h: i32) -> Rect {
+        let pr = self.panel_rect(canvas_w, canvas_h);
+        Rect::new(pr.x + pr.width() as i32 - 40, pr.y + 8, 32, 32)
+    }
+
     pub fn click(&mut self, mx: i32, my: i32, canvas_w: i32, canvas_h: i32) -> OverlayAction {
         let pr = self.panel_rect(canvas_w, canvas_h);
         if !pr.contains_point((mx, my)) { return OverlayAction::Close; }
+        if self.close_rect(canvas_w, canvas_h).contains_point((mx, my)) {
+            return OverlayAction::Close;
+        }
 
         if my < pr.y + Self::HEADER_H || my >= pr.y + pr.height() as i32 - Self::FOOTER_H {
             return OverlayAction::None;
@@ -731,6 +948,15 @@ impl OverlaySettings {
             Rect::new(px + 16, py + 16, (pw - 32) as u32, 32));
         sdl.set_draw_color(Color::RGB(0x33, 0x33, 0x33));
         sdl.draw_line((px, py + Self::HEADER_H), (px + pw, py + Self::HEADER_H)).ok();
+
+        // Close button (top-right of header)
+        let cr = self.close_rect(canvas_w, canvas_h);
+        sdl.set_draw_color(Color::RGB(60, 60, 60));
+        sdl.fill_rect(cr).ok();
+        sdl.set_draw_color(Color::RGB(0x55, 0x55, 0x55));
+        sdl.draw_rect(cr).ok();
+        render_text_centered(sdl, font, &tc, cache, "\u{2715}",
+            Color::RGB(200, 200, 200), cr);
 
         // Rows
         for vi in 0..vis {

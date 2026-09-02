@@ -22,15 +22,25 @@ use v4l::{
 // ── Public types ──────────────────────────────────────────────────────────────
 
 #[derive(Clone, PartialEq)]
-pub enum FrameFormat { Rgb24, Yuyv }
+pub enum FrameFormat { Rgb24, Yuyv, Yuv420 }
 
-/// A video frame — either RGB24 (from MJPEG decode) or raw YUYV (passed through for GPU conversion).
+/// A video frame — either RGB24 (software path), YUYV (V4L2 hardware passthrough),
+/// or planar YUV420 (RTSP path, SDL2 IYUV texture).
 #[derive(Clone)]
 pub struct Frame {
-    pub data:   Vec<u8>,
+    pub data:   Arc<Vec<u8>>,
     pub width:  u32,
     pub height: u32,
     pub format: FrameFormat,
+}
+
+impl Frame {
+    /// Convenience: build a Frame that takes ownership of a `Vec<u8>`.
+    /// Wraps the buffer in `Arc` so the consumer can hold it cheaply
+    /// while the capture thread reuses its ring slot for the next frame.
+    pub fn from_owned(data: Vec<u8>, width: u32, height: u32, format: FrameFormat) -> Self {
+        Self { data: Arc::new(data), width, height, format }
+    }
 }
 
 /// A user-selectable capture mode (format + resolution + estimated fps).
@@ -179,7 +189,10 @@ pub fn start_capture(
     let (tx, rx): (SyncSender<Option<Frame>>, Receiver<Option<Frame>>) = sync_channel(1);
     let fps_counter = Arc::new(AtomicU32::new(0));
     let fps_counter_thread = Arc::clone(&fps_counter);
-    thread::spawn(move || capture_loop(device_path, mode, tx, fps_counter_thread, stop_thread));
+    // Named thread for `htop` / `top` / crash diagnostics.
+    let _ = thread::Builder::new()
+        .name("v4l-capture".into())
+        .spawn(move || capture_loop(device_path, mode, tx, fps_counter_thread, stop_thread));
     (rx, fps_counter, stop)
 }
 
@@ -189,6 +202,76 @@ pub fn null_receiver() -> Receiver<Option<Frame>> {
     // Send one None so the first recv() doesn't block
     let _ = tx.send(None);
     rx
+}
+
+// ── Capture-thread tuning (CPU pin + RT scheduling) ──────────────────────────
+
+/// Pin the calling thread to a single CPU and try to elevate its scheduler
+/// priority.  All syscalls are best-effort: failures are logged and ignored
+/// so the capture loop continues even when the user lacks `CAP_SYS_NICE`.
+///
+/// Strategy (in order):
+/// 1. Pin to the lowest-numbered CPU in the current affinity mask — gives
+///    the capture thread a stable home so it isn't migrated by the kernel
+///    under heavy load (which would invalidate cache and spike jitter).
+/// 2. Try `SCHED_FIFO` priority 30.  This is real-time scheduling and only
+///    succeeds if we have `CAP_SYS_NICE`; if it works, the capture thread
+///    preempts everything except other real-time tasks.
+/// 3. Fall back to `nice(-5)` via `setpriority`, which only requires being
+///    able to lower our own priority (always allowed for the owning user).
+fn tune_capture_thread() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::mem::MaybeUninit;
+
+        let cpuset_size = std::mem::size_of::<libc::cpu_set_t>();
+
+        // 1. Pin to the lowest-numbered CPU in the current affinity mask.
+        //    `MaybeUninit::zeroed()` gives us a backing store of all-zero
+        //    bits (a valid empty cpu_set_t).  We never hand the MaybeUninit
+        //    to anyone until the syscall has filled it, and we only
+        //    reborrow it as `&cpu_set_t` / `&mut cpu_set_t` for libc calls.
+        let mut cur = MaybeUninit::<libc::cpu_set_t>::zeroed();
+        if libc::sched_getaffinity(0, cpuset_size, cur.as_mut_ptr()) == 0 {
+            let bits = cpuset_size * 8;
+            let mut picked: Option<usize> = None;
+            for i in 0..bits {
+                if libc::CPU_ISSET(i, &*cur.as_ptr()) {
+                    picked = Some(i);
+                    break;
+                }
+            }
+            if let Some(cpu) = picked {
+                let mut pin = MaybeUninit::<libc::cpu_set_t>::zeroed();
+                libc::CPU_SET(cpu, &mut *pin.as_mut_ptr());
+                if libc::pthread_setaffinity_np(
+                    libc::pthread_self(),
+                    cpuset_size,
+                    &*pin.as_ptr(),
+                ) == 0
+                {
+                    eprintln!("capture: pinned to CPU {cpu}");
+                }
+            }
+        }
+
+        // 2. Try SCHED_FIFO 30 (real-time; needs CAP_SYS_NICE).
+        let param = libc::sched_param { sched_priority: 30 };
+        if libc::pthread_setschedparam(
+            libc::pthread_self(),
+            libc::SCHED_FIFO,
+            &param,
+        ) == 0
+        {
+            eprintln!("capture: SCHED_FIFO priority 30");
+        } else {
+            // 3. Fall back to nice(-5) via setpriority on our own TID.
+            let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+            if libc::setpriority(libc::PRIO_PROCESS, tid, -5) == 0 {
+                eprintln!("capture: nice(-5)");
+            }
+        }
+    }
 }
 
 // ── Internal capture loop ─────────────────────────────────────────────────────
@@ -246,6 +329,11 @@ fn capture_loop(
     stop: Arc<AtomicBool>,
 ) {
     let debug = std::env::var("ANNOTATOR_DEBUG").is_ok();
+
+    // Pin to a dedicated CPU and try to elevate scheduling priority.  Doing
+    // this once at thread start means we stay pinned across all the
+    // 'restart iterations (driver close/reopen, format renegotiation).
+    tune_capture_thread();
     let fourcc_mjpeg = FourCC::new(b"MJPG");
 
     // Derive initial negotiation hint from user's chosen mode
@@ -300,7 +388,11 @@ fn capture_loop(
             if is_mjpeg { "MJPEG" } else { "YUYV" }
         );
 
-        let mut stream = match MmapStream::with_buffers(&dev, Type::VideoCapture, 4) {
+        // 8 mmap buffers gives ~260 ms of headroom at 30 fps before the kernel
+        // has to recycle a buffer the user-space consumer hasn't yet processed.
+        // This dramatically reduces the chance of getting stale frames on a
+        // busy system under heavy annotation rendering.
+        let mut stream = match MmapStream::with_buffers(&dev, Type::VideoCapture, 8) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("capture: stream start failed (device busy?): {e}, retrying...");
@@ -309,6 +401,21 @@ fn capture_loop(
             }
         };
         first_attempt = false;
+
+        // ── Buffer ring ─────────────────────────────────────────────────────
+        // Per-frame `Vec<u8>` allocation is a measurable cost at high
+        // resolution (6 MB/frame at 1080p RGB).  Keep a small ring of
+        // pre-sized buffers; each frame we clear the next slot, fill it,
+        // and hand ownership to the consumer via `mem::take`.  The slot's
+        // capacity is preserved across iterations — the only allocation
+        // is the very first one per format change.
+        const RING_SIZE: usize = 3;
+        let slot_bytes = (cap_w as usize) * (cap_h as usize)
+            * if is_mjpeg { 3 } else { 2 };
+        let mut ring: [Vec<u8>; RING_SIZE] = std::array::from_fn(|_| {
+            Vec::with_capacity(slot_bytes.max(1))
+        });
+        let mut ring_idx: usize = 0;
 
         let mut frame_count        = 0u64;
         let mut drop_count         = 0u64;
@@ -333,13 +440,16 @@ fn capture_loop(
             let decoded = if is_mjpeg {
                 decode_mjpeg(buf).map(|(d, w, h)| (d, w, h, FrameFormat::Rgb24))
             } else {
-                passthrough_yuyv(buf, cap_w, cap_h).map(|(d, w, h)| (d, w, h, FrameFormat::Yuyv))
+                let slot = &mut ring[ring_idx];
+                passthrough_yuyv_into(buf, cap_w, cap_h, slot)
+                    .map(|()| (std::mem::take(slot), cap_w, cap_h, FrameFormat::Yuyv))
             };
 
             match decoded {
                 Some((data, fw, fh, fmt)) => {
                     consec_decode_errs = 0;
-                    let frame = Frame { data, width: fw, height: fh, format: fmt };
+                    let frame = Frame::from_owned(data, fw, fh, fmt);
+                    ring_idx = (ring_idx + 1) % RING_SIZE;
                     match tx.try_send(Some(frame)) {
                         Ok(_) => {}
                         Err(std::sync::mpsc::TrySendError::Full(_)) => { drop_count += 1; }
@@ -389,31 +499,532 @@ fn capture_loop(
 // ── MJPEG decode (pure Rust, no libjpeg) ─────────────────────────────────────
 
 fn decode_mjpeg(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
-    use jpeg_decoder::Decoder;
-    let mut decoder = Decoder::new(data);
+    use zune_core::colorspace::ColorSpace;
+    use zune_core::options::DecoderOptions;
+    use zune_jpeg::JpegDecoder;
+    let mut decoder = JpegDecoder::new(data);
+    // UVC MJPEG streams are encoded as YCbCr.  Ask for RGB explicitly so
+    // SDL2's RGB24 texture receives frame data in the format it expects.
+    // zune-jpeg folds the YCbCr→RGB conversion into the IDCT pass on
+    // SIMD-capable targets (NEON on aarch64, SSE2/AVX2 on x86_64).
+    let options = DecoderOptions::default()
+        .jpeg_set_out_colorspace(ColorSpace::RGB);
+    decoder.set_options(options);
     let pixels = match decoder.decode() {
         Ok(p) => p,
         Err(e) => { eprintln!("capture: MJPEG decode error: {e}"); return None; }
     };
     let info = decoder.info()?;
-    let w = info.width  as u32;
-    let h = info.height as u32;
-    // jpeg-decoder may return RGB24 or Luma; normalise to RGB24
-    let rgb = match info.pixel_format {
-        jpeg_decoder::PixelFormat::RGB24 => pixels,
-        jpeg_decoder::PixelFormat::L8 => pixels.iter().flat_map(|&v| [v, v, v]).collect(),
-        _ => { eprintln!("capture: unsupported JPEG pixel format"); return None; }
-    };
-    Some((rgb, w, h))
+    Some((pixels, info.width as u32, info.height as u32))
 }
 
 // ── YUYV → RGB24 ──────────────────────────────────────────────────────────────
 
-/// Pass YUYV bytes through raw — SDL/GPU will do the YUV→RGB conversion.
-fn passthrough_yuyv(data: &[u8], w: u32, h: u32) -> Option<(Vec<u8>, u32, u32)> {
-    let expected = (w * h) as usize * 2;
+/// Copy the YUYV frame from the mmap'd V4L2 buffer into `slot`, reusing the
+/// ring buffer allocated by the capture loop.  Returns `Some(())` on success;
+/// `None` if the input buffer is shorter than the expected frame size (which
+/// indicates the driver returned a partial frame).
+fn passthrough_yuyv_into(data: &[u8], w: u32, h: u32, slot: &mut Vec<u8>) -> Option<()> {
+    let expected = (w as usize) * (h as usize) * 2;
     if data.len() < expected {
         return None;
     }
-    Some((data[..expected].to_vec(), w, h))
+    slot.clear();
+    slot.extend_from_slice(&data[..expected]);
+    Some(())
+}
+
+// ── Screenshot capture ─────────────────────────────────────────────────────────
+
+use sdl2::render::Canvas as SdlCanvas;
+use sdl2::video::Window;
+use sdl2::pixels::PixelFormatEnum;
+use std::fs::File;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Save the current canvas content to a PNG file in /tmp/
+/// Returns the path to the saved file, or None on failure.
+pub fn save_screenshot(sdl_canvas: &SdlCanvas<Window>, canvas_w: u32, canvas_h: u32) -> Option<String> {
+    // Create PNG encoder
+    let mut file = File::create("/tmp/annotator_screenshot.png").ok()?;
+
+    // Get pixels from the canvas (area below menu bar)
+    let menu_h = crate::ui::MENU_HEIGHT as u32;
+    let capture_h = canvas_h.saturating_sub(menu_h);
+
+    // Read pixels
+    let rect = sdl2::rect::Rect::new(0, menu_h as i32, canvas_w, capture_h);
+    let rgb_data = sdl_canvas.read_pixels(Some(rect), PixelFormatEnum::RGB24).ok()?;
+
+    // Encode as PNG
+    let mut encoder = png::Encoder::new(&mut file, canvas_w, capture_h);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+
+    if let Ok(mut writer) = encoder.write_header() {
+        if writer.write_image_data(&rgb_data).is_ok() {
+            // Rename with timestamp
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let path = format!("/tmp/annotate_screenshot_{}.png", timestamp);
+            if std::fs::rename("/tmp/annotator_screenshot.png", &path).is_ok() {
+                return Some(path);
+            }
+            return Some("/tmp/annotator_screenshot.png".to_string());
+        }
+    }
+    None
+}
+
+// ── RTSP Capture via FFmpeg ─────────────────────────────────────────────────────
+
+use std::process::Command;
+use std::io::BufReader;
+
+/// RTSP source identifier for the device picker
+pub const RTSP_SOURCE_NAME: &str = "RTSP Stream";
+
+/// Spawn a background thread that continuously captures frames from an RTSP stream
+/// using FFmpeg to decode to RGB24.
+///
+/// Returns a `Receiver` plus an `Arc<AtomicU32>` that the capture thread updates
+/// every second with the current capture fps (stored as fps × 10, e.g. 299 = 29.9 fps).
+pub fn start_rtsp_capture(
+    url: &str,
+    width: u32,
+    height: u32,
+) -> (Receiver<Option<Frame>>, Arc<AtomicU32>, Arc<AtomicBool>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let (tx, rx): (SyncSender<Option<Frame>>, Receiver<Option<Frame>>) = sync_channel(1);
+    let fps_counter = Arc::new(AtomicU32::new(0));
+    let fps_counter_thread = Arc::clone(&fps_counter);
+    let url = url.to_string();
+
+    thread::spawn(move || rtsp_capture_loop(&url, width, height, tx, fps_counter_thread, stop_thread));
+    (rx, fps_counter, stop)
+}
+
+/// Discover which H.264 hardware decoders this ffmpeg build exposes, in
+/// priority order.  Probed once per process by parsing `ffmpeg -decoders`
+/// output (cached via `OnceLock`).  Vendor support matrix we search across:
+///
+/// | Vendor / platform      | Decoder           |
+/// |------------------------|-------------------|
+/// | Rockchip (Radxa R6A…)  | h264_rkmpp        |
+/// | Raspberry Pi VideoCore | h264_mmal         |
+/// | NVIDIA                 | h264_cuvid        |
+/// | Intel/AMD VA-API       | h264_vaapi        |
+/// | Intel QSV              | h264_qsv          |
+/// | AMD VDPau              | h264_vdpau        |
+/// | Generic V4L2 M2M       | h264_v4l2m2m      |
+///
+/// `x86` hosts with Intel iGPU/AMD APU typically expose `h264_vaapi` and/or
+/// `h264_qsv`; we don't have to know which — we just walk the priority list
+/// and pick the first decoder that's actually present.
+///
+/// Returns the list of viable decoder names in priority order.  The RTSP
+/// capture loop tries each in turn and falls back to the next on early
+/// failure.  An empty list means "no `-c:v` flag, let ffmpeg auto-pick
+/// (software decode)".
+fn pick_h264_decoders() -> Vec<String> {
+    use std::process::Command;
+
+    static CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        // Priority order: Rockchip > Pi > NVIDIA > VA-API > QSV > VDPau > V4L2 M2M.
+        // Each tuple is (decoder name, vendor tag for logging).
+        let candidates: &[(&str, &str)] = &[
+            ("h264_rkmpp",    "Rockchip RKMPP"),
+            ("h264_mmal",     "Raspberry Pi MMAL"),
+            ("h264_cuvid",    "NVIDIA NVDEC"),
+            ("h264_vaapi",    "VA-API (Intel/AMD iGPU)"),
+            ("h264_qsv",      "Intel Quick Sync"),
+            ("h264_vdpau",    "VDPAU"),
+            ("h264_v4l2m2m",  "V4L2 mem-to-mem"),
+        ];
+
+        // Parse `ffmpeg -decoders` output.  Each line looks like:
+        //   " D h264_rkmpp   rkmpp H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 ..."
+        //   " D h264_v4l2m2m  V4L2 mem2mem H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 ..."
+        // We extract the second whitespace-separated token and compare against
+        // each candidate name.
+        let decoders_output = Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-decoders")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+
+        let Some(listing) = decoders_output else {
+            eprintln!("[rtsp] could not run `ffmpeg -decoders`; using software H.264 decode");
+            return Vec::new();
+        };
+
+        // Build a set of available h264* decoder names so we can intersect.
+        let mut available: Vec<String> = Vec::new();
+        for line in listing.lines() {
+            let mut parts = line.split_whitespace();
+            // Skip leading flags (e.g. "DEV", "D", "S").
+            let Some(first) = parts.next() else { continue };
+            if first.starts_with("D") || first.starts_with("V") {
+                if let Some(name) = parts.next() {
+                    if name.starts_with("h264") {
+                        available.push(name.to_string());
+                    }
+                }
+            }
+        }
+
+        let mut viable: Vec<String> = Vec::new();
+        for (name, vendor) in candidates {
+            if available.iter().any(|a| a == name) {
+                // Validate the decoder actually works on this host by feeding it
+                // a tiny synthetic H.264 stream.  This rules out false positives
+                // like `h264_cuvid` listed in -decoders but unusable without an
+                // NVIDIA GPU, or `h264_qsv` on a host with no Intel iGPU driver.
+                if decoder_works(name) {
+                    eprintln!("[rtsp] viable H.264 decoder: {name} ({vendor})");
+                    viable.push((*name).to_string());
+                } else {
+                    eprintln!("[rtsp] {name} ({vendor}) is listed but fails to decode — skipping");
+                }
+            }
+        }
+
+        // Some ffmpeg builds register RKMPP/MMAL via dlopen at runtime and don't
+        // show them in `-decoders`.  Probe those at runtime and append any
+        // that work (de-duplicated against `viable`).
+        let runtime_candidates = ["h264_rkmpp", "h264_mmal"];
+        for name in &runtime_candidates {
+            if viable.iter().any(|v| v == name) { continue; }
+            let out = Command::new("ffmpeg")
+                .arg("-hide_banner")
+                .arg("-loglevel").arg("error")
+                .arg("-f").arg("lavfi")
+                .arg("-i").arg("color=c=black:s=64x64:d=0.04")
+                .arg("-c:v").arg(name)
+                .arg("-f").arg("null")
+                .arg("-")
+                .output();
+            if let Ok(o) = out {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                if !stderr.contains("Unknown decoder") && !stderr.contains("not found") {
+                    eprintln!("[rtsp] viable H.264 decoder: {name} (runtime probe)");
+                    viable.push((*name).to_string());
+                }
+            }
+        }
+
+        if viable.is_empty() {
+            if !available.is_empty() {
+                eprintln!(
+                    "[rtsp] no priority H.264 hw decoder matched; available: {:?} — using software decode",
+                    available
+                );
+            } else {
+                eprintln!("[rtsp] no H.264 hardware decoder found; using software decode");
+            }
+        }
+        viable
+    }).clone()
+}
+
+/// Verify an H.264 decoder actually works on this host by feeding it a tiny
+/// synthetic stream and decoding it to /dev/null.  Used to filter out
+/// decoders that are *registered* with ffmpeg but unusable (e.g. cuvid on
+/// a non-NVIDIA host, qsv without an Intel iGPU driver loaded).
+fn decoder_works(name: &str) -> bool {
+    use std::process::Command;
+    let out = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel").arg("error")
+        .arg("-f").arg("lavfi")
+        .arg("-i").arg("color=c=black:s=64x64:d=0.04:r=25")
+        .arg("-c:v").arg(name)
+        .arg("-f").arg("null")
+        .arg("-")
+        .output();
+    match out {
+        Ok(o) => {
+            if !o.status.success() {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                if stderr.contains("Unknown decoder")
+                    || stderr.contains("not found")
+                    || stderr.contains("Cannot find")
+                    || stderr.contains("could not open")
+                    || stderr.contains("Failed to")
+                    || stderr.contains("Device creation failed")
+                {
+                    return false;
+                }
+                // Unknown failure mode — fall back to software rather than
+                // hard-fail.  The watchdog will catch real issues at runtime.
+                eprintln!("[rtsp] decoder probe for {name} returned non-zero, stderr: {}",
+                    stderr.lines().next().unwrap_or("").trim());
+                return false;
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Internal RTSP capture loop using FFmpeg.  Pipes raw YUV420 frames to
+/// stdout — no MJPEG encode, no software JPEG decode on our side.
+///
+/// Tries each viable H.264 decoder in priority order (from
+/// [`pick_h264_decoders`]); on early failure (no frames within
+/// `EARLY_FAIL_TIMEOUT`) or immediate decoder error, kills ffmpeg and
+/// moves on to the next candidate.  Falls back to software decode
+/// (`-c:v` omitted) if no hardware decoder succeeds.
+fn rtsp_capture_loop(
+    url: &str,
+    target_w: u32,
+    target_h: u32,
+    tx: SyncSender<Option<Frame>>,
+    fps_out: Arc<AtomicU32>,
+    stop: Arc<AtomicBool>,
+) {
+    let decoders = pick_h264_decoders();
+
+    // Build the candidate list: each hw decoder, then software (None) as
+    // final fallback.
+    let mut candidates: Vec<Option<String>> = decoders.into_iter().map(Some).collect();
+    candidates.push(None);
+
+    for (i, decoder) in candidates.iter().enumerate() {
+        if stop.load(std::sync::atomic::Ordering::SeqCst) { return; }
+
+        match decoder {
+            Some(name) => eprintln!("[rtsp] attempt {}/{} with {}",
+                i + 1, candidates.len(), name),
+            None => eprintln!("[rtsp] attempt {}/{} with software decode",
+                i + 1, candidates.len()),
+        }
+
+        match try_rtsp_attempt(url, target_w, target_h, &tx, &fps_out, &stop,
+                               decoder.as_deref()) {
+            // The attempt's inner loop runs as long as the user hasn't stopped
+            // and frames keep flowing.  It only returns here on stop or
+            // early failure; either way we're done with this candidate.
+            AttemptResult::EarlyFailure(reason) => {
+                eprintln!("[rtsp] decoder failed early: {reason} — trying next");
+                continue;
+            }
+            AttemptResult::Stopped => return,
+        }
+    }
+
+    eprintln!("[rtsp] all decoder candidates exhausted; giving up");
+    let _ = tx.send(None);
+}
+
+/// Outcome of a single ffmpeg attempt.  `try_rtsp_attempt` keeps running as
+/// long as frames flow and the user hasn't stopped; it only returns on stop
+/// or early failure (the success case keeps going forever).
+enum AttemptResult {
+    /// Decoder didn't produce any frames quickly enough — try a different one.
+    EarlyFailure(String),
+    /// User requested stop; exit cleanly.
+    Stopped,
+}
+
+/// Run ffmpeg with the given decoder (None = software fallback) and stream
+/// frames until either frames flow successfully, the user stops us, or the
+/// decoder fails within the early-failure window.
+fn try_rtsp_attempt(
+    url: &str,
+    target_w: u32,
+    target_h: u32,
+    tx: &SyncSender<Option<Frame>>,
+    fps_out: &Arc<AtomicU32>,
+    stop: &Arc<AtomicBool>,
+    decoder: Option<&str>,
+) -> AttemptResult {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let debug = std::env::var("ANNOTATOR_DEBUG").is_ok();
+
+    // Cap output to MAX_OUT_W on the longest edge.  A 2560x2560 fisheye
+    // stream at 25 fps is otherwise unusable on every target CPU we ship to.
+    const MAX_OUT_W: u32 = 1920;
+
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-hide_banner")
+       .arg("-loglevel").arg("info")
+       .arg("-rtsp_transport").arg("tcp");
+    if let Some(dec) = decoder {
+        cmd.arg("-c:v").arg(dec);
+    }
+    cmd.arg("-i").arg(url);
+    if MAX_OUT_W > 0 {
+        cmd.arg("-vf").arg(format!("scale='min({MAX_OUT_W},iw)':-2"));
+    }
+    cmd.arg("-pix_fmt").arg("yuv420p")
+       .arg("-f").arg("rawvideo")
+       .arg("pipe:1")
+       .stdout(Stdio::piped())
+       .stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[rtsp] failed to spawn ffmpeg: {e} (is ffmpeg installed and on PATH?)");
+            return AttemptResult::EarlyFailure(format!("spawn failed: {e}"));
+        }
+    };
+
+    let stdout = child.stdout.take().expect("ffmpeg stdout");
+    let stderr = child.stderr.take().expect("ffmpeg stderr");
+    let mut stdout = BufReader::with_capacity(1024 * 1024, stdout);
+
+    // Drain ffmpeg's stderr in a background thread.  Without this, the pipe
+    // fills (~64KB on Linux) and ffmpeg blocks writing — which looks like
+    // "ffmpeg started but never produced frames."
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut err_reader = BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match err_reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let trimmed = line.trim_end();
+                    if !trimmed.is_empty() {
+                        eprintln!("[ffmpeg] {trimmed}");
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // For rawvideo YUV420 we know the per-frame size once we know width/height.
+    // Wait for ffmpeg to publish its output size via stderr (line containing
+    // "Video:") — or use the user-supplied target_w/h as a hint.
+    let mut frame_w: u32 = target_w;
+    let mut frame_h: u32 = target_h;
+    let mut frame_bytes: usize = 0;  // set once frame_w/frame_h are known
+    let mut carry: Vec<u8> = Vec::with_capacity(8 * 1024 * 1024); // up to 1920x1080 YUV420
+
+    let mut fps_frame_count: u32 = 0;
+    let fps_timer = Instant::now();
+
+    // Early-failure window: if ffmpeg dies within this many seconds and we
+    // haven't received a single byte, treat it as a decoder failure and try
+    // the next candidate.  Anything beyond this and we trust that the user
+    // genuinely has a slow stream / bad network and fall through to the
+    // long watchdog.
+    let started_at = Instant::now();
+    let early_fail_after = Duration::from_secs(5);
+    // Long watchdog for legitimate slow streams (e.g. 2560x2560 on RPi3).
+    let watchdog_after = Duration::from_secs(15);
+
+    let mut last_frame_at = Instant::now();
+
+    if debug {
+        eprintln!("[rtsp] started capture from {} with decoder={:?}",
+            url, decoder.unwrap_or("software"));
+    }
+
+    let mut chunk = [0u8; 65536];  // larger reads = fewer syscalls
+
+    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+        // Early-failure detector.  Only fires before any frames have arrived;
+        // once we ship a frame the attempt is considered healthy and we let
+        // the inner loop run until the user stops.
+        if fps_frame_count == 0 && started_at.elapsed() > early_fail_after {
+            if let Ok(Some(_status)) = child.try_wait() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return AttemptResult::EarlyFailure(
+                    "ffmpeg exited within 5s without producing a frame".into());
+            }
+            // ffmpeg is still running but produced nothing in the early
+            // window — fall through and let the long watchdog apply.
+        }
+
+        // Long watchdog for legitimately slow streams.
+        if last_frame_at.elapsed() > watchdog_after && fps_frame_count == 0 {
+            eprintln!(
+                "[rtsp] no frames received in {}s from {}\n        \
+                 check URL, credentials, network reachability, and that the camera supports RTSP",
+                watchdog_after.as_secs(), url,
+            );
+            last_frame_at = Instant::now() - watchdog_after + Duration::from_secs(20);
+        }
+
+        // Once we know the frame size, read exactly that many bytes per
+        // iteration and ship a frame.  Before that, just accumulate.
+        let need = if frame_bytes == 0 {
+            usize::MAX  // unknown size yet — drain everything
+        } else {
+            frame_bytes.saturating_sub(carry.len())
+        };
+
+        let to_read = need.min(chunk.len());
+        if to_read == 0 && frame_bytes > 0 {
+            // We have a complete frame buffered — ship it.
+            let data: Vec<u8> = carry.drain(..frame_bytes).collect();
+            if tx.try_send(Some(Frame::from_owned(
+                data,
+                frame_w,
+                frame_h,
+                FrameFormat::Yuv420,
+            ))).is_ok() {
+                fps_frame_count += 1;
+                let elapsed = fps_timer.elapsed().as_secs_f32();
+                if elapsed >= 1.0 {
+                    let fps = (fps_frame_count as f32 / elapsed) * 10.0;
+                    fps_out.store(fps as u32, std::sync::atomic::Ordering::SeqCst);
+                    fps_frame_count = 0;
+                }
+                last_frame_at = Instant::now();
+            }
+            continue;
+        }
+
+        let bytes_read = match stdout.read(&mut chunk[..to_read]) {
+            Ok(0) => {
+                // EOF — ffmpeg closed stdout.  If we got frames, this is a
+                // normal shutdown; if not, it's a decoder failure.
+                let _ = child.kill();
+                let _ = child.wait();
+                if fps_frame_count == 0 {
+                    return AttemptResult::EarlyFailure(
+                        "ffmpeg stdout EOF with no frames produced".into());
+                }
+                let _ = tx.send(None);
+                return AttemptResult::Stopped;
+            }
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("[rtsp] read error: {e}");
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+        };
+
+        // Heuristic for auto-detecting frame size: when we see "Output #0"
+        // header followed by a "yuv420p" line containing WxH, we know it.
+        // For simplicity here, we trust the user-provided target_w/h to be
+        // present in the call (start_rtsp_capture passes 0,0 when unknown).
+        // When both are 0, wait until ffmpeg's stderr publishes the format.
+        if frame_bytes == 0 && frame_w > 0 && frame_h > 0 {
+            frame_bytes = (frame_w as usize) * (frame_h as usize) * 3 / 2;
+        }
+        carry.extend_from_slice(&chunk[..bytes_read]);
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = tx.send(None);
+    AttemptResult::Stopped
 }

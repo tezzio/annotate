@@ -4,7 +4,7 @@
 
 use sdl2::{pixels::Color, rect::Rect, render::Canvas as SdlCanvas, ttf::Font, video::Window};
 
-use crate::{input::switch_tool, tools::{Tool, PALETTE}, AppState};
+use crate::{input::switch_tool, state::AppState, tools::{Tool, PALETTE}};
 use crate::ui::{render_text_centered, tool_fa_icon, MENU_HEIGHT};
 
 // ── Layout constants ─────────────────────────────────────────────────────────
@@ -27,6 +27,7 @@ pub struct RailLayout {
     pub brush_label:    Rect,
     pub brush_plus:     Rect,
     pub freeze:         Rect,
+    pub screenshot:    Rect,
     pub change_input:   Rect,
     pub scroll_up:      Rect,
     pub scroll_down:    Rect,
@@ -49,6 +50,7 @@ impl Default for RailLayout {
             brush_label:  z,
             brush_plus:   z,
             freeze:       z,
+            screenshot:   z,
             change_input: z,
             scroll_up:    z,
             scroll_down:  z,
@@ -90,7 +92,7 @@ impl V2Layout {
         let tools_h    = 10 * BTN_SIZE + 9 * BTN_GAP;                  // 10 tools
         let color_h    = BTN_SIZE;                                      // 1 color tile
         let brush_h    = BTN_SIZE + 2 + BTN_SIZE;                       // 3 buttons stacked: -, size, +
-        let actions_h  = BTN_SIZE + BTN_GAP + BTN_SIZE;                 // freeze, change input
+        let actions_h  = BTN_SIZE + BTN_GAP + BTN_SIZE + BTN_GAP + BTN_SIZE;  // freeze, screenshot, change input
         let content_h  = tools_h
                        + SECTION_PAD + color_h
                        + SECTION_PAD + brush_h
@@ -144,8 +146,10 @@ impl V2Layout {
         self.rail.brush_plus  = brush_plus;
         y += BTN_SIZE + SECTION_PAD;
 
-        // Action buttons (freeze, change input)
+        // Action buttons (freeze, screenshot, change input)
         self.rail.freeze = Rect::new((RAIL_WIDTH - BTN_SIZE) / 2, y, BTN_SIZE as u32, BTN_SIZE as u32);
+        y += BTN_SIZE + BTN_GAP;
+        self.rail.screenshot = Rect::new((RAIL_WIDTH - BTN_SIZE) / 2, y, BTN_SIZE as u32, BTN_SIZE as u32);
         y += BTN_SIZE + BTN_GAP;
         self.rail.change_input = Rect::new((RAIL_WIDTH - BTN_SIZE) / 2, y, BTN_SIZE as u32, BTN_SIZE as u32);
 
@@ -284,6 +288,14 @@ pub fn draw_v2_toolbar(
     let cam_icon = '\u{f03d}'.to_string();
     render_text_centered(sdl, icon_font, &tc, cache, &cam_icon, Color::RGB(100, 200, 100), layout.rail.change_input);
 
+    // Screenshot button
+    sdl.set_draw_color(Color::RGB(28, 28, 32));
+    sdl.fill_rect(layout.rail.screenshot).ok();
+    sdl.set_draw_color(Color::RGB(80, 120, 80));
+    sdl.draw_rect(layout.rail.screenshot).ok();
+    let ss_icon = '\u{f030}'.to_string();
+    render_text_centered(sdl, icon_font, &tc, cache, &ss_icon, Color::RGB(140, 200, 140), layout.rail.screenshot);
+
     // Scroll buttons (only visible if needed)
     if layout.rail.needs_scroll {
         // Up arrow
@@ -364,6 +376,9 @@ pub fn click_v2_toolbar(mx: i32, my: i32, layout: &mut V2Layout, state: &mut App
         state.tool_sizes[state.active_tool.index()] = state.brush_size;
     } else if layout.rail.freeze.contains_point((mx, my)) {
         state.freeze_frame = !state.freeze_frame;
+    } else if layout.rail.screenshot.contains_point((mx, my)) {
+        // Screenshot is handled in the main loop via a flag
+        state.screenshot_requested = true;
     } else if layout.rail.change_input.contains_point((mx, my)) {
         state.show_device_picker = true;
     }

@@ -1,38 +1,50 @@
+use sdl2::clipboard::ClipboardUtil;
 use sdl2::event::{Event, WindowEvent};
 use sdl2::keyboard::{Keycode, Mod};
 use sdl2::mouse::MouseButton;
 
 use crate::{
     canvas::Canvas,
-    scene::{DrawObject, PenStroke, ShapeObj, EraseObj, HighlightStroke},
+    scene::{DrawObject, PenStroke, ShapeObj, HighlightStroke},
+    state::{AppState, EraserDrag},
     tools::{Tool, PALETTE},
     ui::{PickerStage, MENU_HEIGHT},
-    AppState,
 };
 
 // ── Input event processor ─────────────────────────────────────────────────────
 
 /// Process a single SDL event.  Returns `false` when the application should quit.
+///
+/// `clipboard` is used to support Ctrl+V paste in the RTSP URL field and the
+/// text tool.  Pass `None` if the video subsystem isn't available (paste will
+/// silently no-op).
 pub fn process_event(
     event:     &Event,
     state:     &mut AppState,
     canvas:    &mut Canvas,
     v2_layout: &mut crate::ui::v2::V2Layout,
+    clipboard: Option<&ClipboardUtil>,
 ) -> bool {
     match event {
         // ── Quit ──────────────────────────────────────────────────────────────
         Event::Quit { .. } => return false,
 
         Event::KeyDown { keycode: Some(k), keymod, .. } => {
-            if !handle_keydown(*k, *keymod, state) {
+            if !handle_keydown(*k, *keymod, state, clipboard) {
                 return false;
             }
         }
 
-        // SDL text input — used when text tool is active
+        // SDL text input — used when text tool is active or RTSP picker is open
         Event::TextInput { text, .. } => {
             if state.active_tool == Tool::Text && state.text_input_active {
                 state.text_buffer.push_str(text);
+            } else if state.show_device_picker {
+                if let Some(picker) = &mut state.device_picker {
+                    if picker.stage == PickerStage::Rtsp {
+                        picker.rtsp.url.push_str(text);
+                    }
+                }
             }
         }
 
@@ -52,7 +64,7 @@ pub fn process_event(
 
         // ── Mouse button up ───────────────────────────────────────────────────
         Event::MouseButtonUp { mouse_btn: MouseButton::Left, x, y, .. } => {
-            handle_release(*x, *y, state);
+            handle_release(*x, *y, state, canvas);
         }
 
         Event::Window { win_event: WindowEvent::Resized(w, h), .. }
@@ -75,6 +87,18 @@ fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, v2_layo
 
     if state.show_device_picker {
         if let Some(picker) = &mut state.device_picker {
+            use crate::ui::PickerDismiss;
+            match picker.click_dismiss(mx, my, canvas.width as i32, canvas.height as i32) {
+                PickerDismiss::Close => {
+                    state.show_device_picker = false;
+                    return;
+                }
+                PickerDismiss::Back => {
+                    // Stage already reset to Devices by click_dismiss; leave modal open.
+                    return;
+                }
+                PickerDismiss::None => {}
+            }
             if let Some(result) = picker.click_enter(mx, my, canvas.width as i32, canvas.height as i32) {
                 state.picker_confirmed = Some(result);
                 state.show_device_picker = false;
@@ -129,11 +153,15 @@ fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, v2_layo
             }));
         }
         Tool::Eraser => {
+            // Eraser is NOT a drawable scene object.  On mouse-down we just
+            // snapshot the current scene for undo and start tracking the
+            // erase circles in `state.eraser_drag`.  On mouse-up the canvas
+            // gets the alpha-zeroed circles and then we bake the result.
             state.scene.push_undo();
-            state.active_stroke = Some(DrawObject::Erase(EraseObj {
+            state.eraser_drag = Some(EraserDrag {
                 points: vec![(mx, my)],
-                size:   state.brush_size,
-            }));
+                radius: state.brush_size,
+            });
         }
         Tool::Highlight => {
             state.scene.push_undo();
@@ -180,8 +208,8 @@ fn handle_move(mx: i32, my: i32, state: &mut AppState, _canvas: &Canvas) {
             }
         }
         Tool::Eraser => {
-            if let Some(DrawObject::Erase(e)) = state.active_stroke.as_mut() {
-                e.points.push((mx, my));
+            if let Some(drag) = state.eraser_drag.as_mut() {
+                drag.points.push((mx, my));
             }
         }
         Tool::Highlight => {
@@ -194,7 +222,7 @@ fn handle_move(mx: i32, my: i32, state: &mut AppState, _canvas: &Canvas) {
     }
 }
 
-fn handle_release(x1: i32, y1: i32, state: &mut AppState) {
+fn handle_release(x1: i32, y1: i32, state: &mut AppState, canvas: &mut Canvas) {
     if !state.mouse_down { return; }
     state.mouse_down = false;
     let (x0, y0) = state.drag_start;
@@ -204,10 +232,24 @@ fn handle_release(x1: i32, y1: i32, state: &mut AppState) {
         Tool::Rect   => { state.scene.add(DrawObject::Rect(s)); }
         Tool::Circle => { state.scene.add(DrawObject::Circle(s)); }
         Tool::Arrow  => { state.scene.add(DrawObject::Arrow(s)); }
-        // Pen/Eraser/Highlight: commit the active stroke into the scene
-        Tool::Pen | Tool::Eraser | Tool::Highlight => {
+        // Pen/Highlight: commit the active stroke into the scene
+        Tool::Pen | Tool::Highlight => {
             if let Some(stroke) = state.active_stroke.take() {
                 state.scene.add(stroke);
+            }
+        }
+        // Eraser: zero alpha on the committed canvas at each drag point,
+        // then bake that canvas into the scene's permanent background and
+        // clear the live objects.  From this point on the pre-erase scene
+        // is no longer selectable, but undo still restores it because the
+        // snapshot was pushed on mouse-down.
+        Tool::Eraser => {
+            if let Some(drag) = state.eraser_drag.take() {
+                if !drag.points.is_empty() {
+                    apply_erase_to_canvas(canvas, &drag.points, drag.radius);
+                    canvas.dirty = true;
+                    state.scene.bake_from_canvas(canvas);
+                }
             }
         }
         Tool::Select => {
@@ -223,12 +265,37 @@ fn handle_release(x1: i32, y1: i32, state: &mut AppState) {
     }
 }
 
+/// Zero alpha in `canvas` inside a disc of `radius` around every point in
+/// `points`.  Bounds-checked against the canvas size.
+fn apply_erase_to_canvas(canvas: &mut Canvas, points: &[(i32, i32)], radius: u32) {
+    let r = radius as i32;
+    if r <= 0 { return; }
+    let r2 = r * r;
+    let w = canvas.width as i32;
+    let h = canvas.height as i32;
+    for &(cx, cy) in points {
+        for dy in -r..=r {
+            let py = cy + dy;
+            if py < 0 || py >= h { continue; }
+            for dx in -r..=r {
+                let px = cx + dx;
+                if px < 0 || px >= w { continue; }
+                if dx * dx + dy * dy > r2 { continue; }
+                let idx = ((py as u32 * canvas.width + px as u32) * 4) as usize;
+                canvas.pixels[idx + 3] = 0;
+            }
+        }
+        canvas.dirty = true;
+    }
+}
+
 // ── Keyboard handler ──────────────────────────────────────────────────────────
 
 fn handle_keydown(
     k: Keycode,
     mods: Mod,
     state: &mut AppState,
+    clipboard: Option<&ClipboardUtil>,
 ) -> bool {
     // Settings overlay is open — defer all keys to the overlay handler in main.rs
     if state.show_settings_overlay {
@@ -250,6 +317,17 @@ fn handle_keydown(
             }
             Keycode::Backspace => {
                 state.text_buffer.pop();
+            }
+            Keycode::V if ctrl => {
+                if let Some(cb) = clipboard {
+                    if let Ok(text) = cb.clipboard_text() {
+                        // Strip newlines — single-line text tool.
+                        let cleaned: String = text.chars()
+                            .filter(|c| *c != '\n' && *c != '\r')
+                            .collect();
+                        state.text_buffer.push_str(&cleaned);
+                    }
+                }
             }
             _ => {}
         }
@@ -274,11 +352,37 @@ fn handle_keydown(
                     }
                 }
                 Keycode::Escape | Keycode::F2 => {
-                    if picker.stage == PickerStage::Modes {
-                        picker.stage = PickerStage::Devices;
-                        picker.mode_cursor = 0;
-                    } else {
+                    if picker.stage == PickerStage::Devices {
                         state.show_device_picker = false;
+                    } else {
+                        // Modes / Rtsp: go back to Devices without closing
+                        // the modal.  `dismiss()` resets cursors and the
+                        // RTSP URL buffer so the next open is clean.
+                        picker.dismiss();
+                    }
+                }
+                Keycode::Backspace => {
+                    if picker.stage == PickerStage::Rtsp {
+                        picker.rtsp.url.pop();
+                    }
+                }
+                Keycode::V if ctrl => {
+                    if picker.stage == PickerStage::Rtsp {
+                        if let Some(cb) = clipboard {
+                            match cb.clipboard_text() {
+                                Ok(text) => {
+                                    // Strip whitespace — RTSP URLs are
+                                    // single-line and surrounding newlines
+                                    // would break ffmpeg invocation.
+                                    let cleaned: String = text
+                                        .chars()
+                                        .filter(|c| !c.is_whitespace())
+                                        .collect();
+                                    picker.rtsp.url.push_str(&cleaned);
+                                }
+                                Err(e) => eprintln!("[input] clipboard read failed: {e}"),
+                            }
+                        }
                     }
                 }
                 _ => {}

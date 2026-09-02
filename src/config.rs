@@ -3,6 +3,10 @@ use std::{fs, path::PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Web portal users (admin + up to 4 additional)
+    #[serde(default)]
+    pub users: Vec<User>,
+
     /// Canvas / output width in pixels
     #[serde(default = "default_width")]
     pub width: u32,
@@ -31,6 +35,87 @@ pub struct Config {
     /// Maximum depth of the undo / redo history stacks
     #[serde(default = "default_undo_stack_limit")]
     pub undo_stack_limit: usize,
+
+    /// REST API settings (`[api]` section) — Crestron / remote control
+    #[serde(default)]
+    pub api: ApiConfig,
+
+    /// RTSP stream settings for Visionary NextGen AV over IP
+    #[serde(default)]
+    pub rtsp: RtspConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    pub username: String,
+    pub password_hash: String,
+    pub is_admin: bool,
+}
+
+/// REST API configuration (see docs/crestron-rest-api-plan.md).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiConfig {
+    /// Serve the API at all (kiosk deployments can turn it off)
+    #[serde(default = "default_api_enabled")]
+    pub enabled: bool,
+
+    /// Address to bind, e.g. "0.0.0.0" (LAN) or "127.0.0.1" (local only)
+    #[serde(default = "default_api_bind")]
+    pub bind: String,
+
+    /// TCP port for the plain-HTTP API
+    #[serde(default = "default_api_port")]
+    pub port: u16,
+
+    /// Optional shared token (checked via `X-Auth-Token` header or `token=`
+    /// query param).  `None` = no authentication.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// RTSP stream configuration for Visionary NextGen AV over IP sources.
+/// Credentials belong in the URL itself (`rtsp://user:pass@host/path`) —
+/// that's the standard RTSP convention and is what `ffmpeg -i` accepts
+/// directly, so there's no need to store them as separate fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RtspConfig {
+    /// Enable RTSP as a video source
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// RTSP stream URL (e.g. "rtsp://user:pass@192.168.1.100:554/stream1")
+    #[serde(default)]
+    pub url: Option<String>,
+
+    /// RTSP stream width (0 = auto detect)
+    #[serde(default)]
+    pub width: u32,
+
+    /// RTSP stream height (0 = auto detect)
+    #[serde(default)]
+    pub height: u32,
+}
+
+impl Default for RtspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: None,
+            width: 0,
+            height: 0,
+        }
+    }
+}
+
+impl RtspConfig {
+    /// Return the configured RTSP URL unchanged, if any.  Credentials (if
+    /// any) are expected to be embedded in the URL itself.
+    pub fn build_url(&self) -> Option<String> {
+        self.url.as_ref().and_then(|u| {
+            let trimmed = u.trim();
+            if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+        })
+    }
 }
 
 // ── serde defaults ────────────────────────────────────────────────────────────
@@ -41,6 +126,9 @@ fn default_fullscreen() -> bool { true }
 fn default_tool_color() -> String { "ffffff".to_string() }
 fn default_tool_size() -> u32 { 4 }
 fn default_undo_stack_limit() -> usize { 20 }
+fn default_api_enabled() -> bool { true }
+fn default_api_bind() -> String { "0.0.0.0".to_string() }
+fn default_api_port() -> u16 { 8080 }
 
 // ── Default impl ──────────────────────────────────────────────────────────────
 
@@ -54,24 +142,75 @@ impl Default for Config {
             tool_color: default_tool_color(),
             tool_size: default_tool_size(),
             undo_stack_limit: default_undo_stack_limit(),
+            api: ApiConfig::default(),
+            rtsp: RtspConfig::default(),
+            users: vec![
+                User {
+                    username: "admin".to_string(),
+                    password_hash: hash_password("admin"),
+                    is_admin: true,
+                }
+            ],
+        }
+    }
+}
+
+impl User {
+    pub fn new(username: &str, password: &str, is_admin: bool) -> Self {
+        Self {
+            username: username.to_string(),
+            password_hash: hash_password(password),
+            is_admin,
+        }
+    }
+
+    pub fn verify_password(&self, password: &str) -> bool {
+        verify_password(password, &self.password_hash)
+    }
+}
+
+pub fn hash_password(password: &str) -> String {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    hasher.update(b"annotator-salt"); // simple static salt
+    hex::encode(hasher.finalize())
+}
+
+fn verify_password(password: &str, hash: &str) -> bool {
+    hash_password(password) == hash
+}
+
+impl Config {
+    pub fn find_user(&self, username: &str) -> Option<&User> {
+        self.users.iter().find(|u| u.username == username)
+    }
+
+    pub fn verify_credentials(&self, username: &str, password: &str) -> Option<&User> {
+        self.find_user(username).filter(|u| u.verify_password(password))
+    }
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_api_enabled(),
+            bind:    default_api_bind(),
+            port:    default_api_port(),
+            token:   None,
         }
     }
 }
 
 // ── Loader ────────────────────────────────────────────────────────────────────
 
-/// Returns the path to `~/.config/annotator/config.toml`, creating the
-/// directory and writing defaults if it does not exist yet.
-pub fn config_path() -> PathBuf {
-    let base = dirs_home().join(".config").join("annotator");
-    fs::create_dir_all(&base).ok();
-    base.join("config.toml")
-}
+/// Path to the config file in /tmp
+const CONFIG_PATH: &str = "/tmp/config.ann";
 
-/// Load config from `~/.config/annotator/config.toml`.  If the file is absent
+/// Load config from `/tmp/config.ann`.  If the file is absent
 /// or unreadable, write a default file and return default values.
 pub fn load() -> Config {
-    let path = config_path();
+    let path = PathBuf::from(CONFIG_PATH);
 
     if path.exists() {
         match fs::read_to_string(&path) {
@@ -81,15 +220,23 @@ pub fn load() -> Config {
             },
             Err(e) => eprintln!("Warning: could not read config ({e}); using defaults"),
         }
-    } else {
-        // Write the bundled default config.toml next to the binary, or a
-        // minimal one if that file is missing.
-        let default_text = include_str!("../config.toml");
-        fs::write(&path, default_text).ok();
-        eprintln!("Info: wrote default config to {}", path.display());
     }
 
-    Config::default()
+    // Write default config on first run
+    let default_cfg = Config::default();
+    if let Err(e) = save(&default_cfg) {
+        eprintln!("Warning: could not write default config: {e}");
+    }
+    default_cfg
+}
+
+/// Save the current config to /tmp/config.ann
+pub fn save(cfg: &Config) -> Result<(), String> {
+    let path = PathBuf::from(CONFIG_PATH);
+    let s = toml::to_string_pretty(cfg).map_err(|e| format!("serialize config: {e}"))?;
+    fs::write(&path, s).map_err(|e| format!("write config: {e}"))?;
+    eprintln!("Info: saved config to {}", path.display());
+    Ok(())
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────

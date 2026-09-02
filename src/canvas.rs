@@ -23,14 +23,6 @@ impl Canvas {
         self.dirty = true;
     }
 
-    #[inline]
-    pub fn erase_pixel(&mut self, x: i32, y: i32) {
-        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 { return; }
-        let idx = ((y as u32 * self.width + x as u32) * 4) as usize;
-        self.pixels[idx + 3] = 0;
-        self.dirty = true;
-    }
-
     pub fn clear(&mut self) { self.pixels.fill(0); self.dirty = true; }
 
     pub fn upload_texture(&mut self, texture: &mut Texture) {
