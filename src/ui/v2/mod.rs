@@ -5,7 +5,16 @@
 use sdl2::{pixels::Color, rect::Rect, render::Canvas as SdlCanvas, ttf::Font, video::Window};
 
 use crate::{input::switch_tool, state::AppState, tools::{Tool, PALETTE}};
-use crate::ui::{render_text_centered, tool_fa_icon, MENU_HEIGHT};
+use crate::ui::{render_text_centered, TOOL_ICONS, MENU_HEIGHT};
+
+// Static FontAwesome codepoints (TODO 3 — eliminates per-frame
+// `.to_string()` allocations in the V2 toolbar).
+const FREEZE_ICON_PAUSE: &str = "\u{f04b}";
+const FREEZE_ICON_PLAY:  &str = "\u{f04c}";
+const CAMERA_ICON:       &str = "\u{f03d}";
+const SCREENSHOT_ICON:   &str = "\u{f030}";
+const CHEVRON_UP:        &str = "\u{f077}";
+const CHEVRON_DOWN:      &str = "\u{f078}";
 
 // ── Layout constants ─────────────────────────────────────────────────────────
 
@@ -191,7 +200,6 @@ pub fn draw_v2_toolbar(
     cache: &mut crate::ui::TextCache,
 ) {
     let canvas_h = sdl.output_size().expect("output_size").1 as i32;
-    let _ = sdl.output_size();  // (not used)
     let tc = sdl.texture_creator();
 
     // Rail background
@@ -200,7 +208,8 @@ pub fn draw_v2_toolbar(
     sdl.set_draw_color(Color::RGB(35, 35, 40));
     sdl.fill_rect(Rect::new(RAIL_WIDTH - 2, MENU_HEIGHT, 2, (canvas_h - MENU_HEIGHT) as u32)).ok();
 
-    // Tool buttons
+    // Tool buttons — indexed by `tool.index()` into the TOOL_ICONS const
+    // table to avoid per-frame `String` allocations from `tool_fa_icon`.
     for (tool, rect) in &layout.rail.tool_btns {
         let is_active = *tool == active_tool;
         let bg     = if is_active { Color::RGB(30, 60, 110) } else { Color::RGB(28, 28, 32) };
@@ -209,9 +218,8 @@ pub fn draw_v2_toolbar(
         sdl.fill_rect(*rect).ok();
         sdl.set_draw_color(border);
         sdl.draw_rect(*rect).ok();
-        let icon = tool_fa_icon(*tool).to_string();
         let icon_color = if is_active { Color::RGB(255, 255, 255) } else { Color::RGB(160, 160, 170) };
-        render_text_centered(sdl, icon_font, &tc, cache, &icon, icon_color, *rect);
+        render_text_centered(sdl, icon_font, &tc, cache, TOOL_ICONS[tool.index()], icon_color, *rect);
     }
 
     // Color tile
@@ -223,7 +231,7 @@ pub fn draw_v2_toolbar(
     sdl.set_draw_color(tile_border);
     sdl.draw_rect(ct).ok();
     // Chevron indicator
-    let chev = if layout.popout_open { "\u{f077}" } else { "\u{f078}" };
+    let chev = if layout.popout_open { CHEVRON_UP } else { CHEVRON_DOWN };
     render_text_centered(sdl, icon_font, &tc, cache, chev,
         Color::RGB(180, 180, 190),
         Rect::new(ct.x + ct.width() as i32 - 14, ct.y + ct.height() as i32 - 14, 12, 12));
@@ -274,27 +282,25 @@ pub fn draw_v2_toolbar(
     let fz_bg     = if freeze_frame { Color::RGB(60, 40, 0) } else { Color::RGB(28, 28, 32) };
     let fz_border = if freeze_frame { Color::RGB(255, 170, 0) } else { Color::RGB(55, 55, 60) };
     let fz_icon_col = if freeze_frame { Color::RGB(255, 204, 85) } else { Color::RGB(160, 160, 170) };
-    let fz_icon = if freeze_frame { '\u{f04b}' } else { '\u{f04c}' };
+    let fz_icon = if freeze_frame { FREEZE_ICON_PAUSE } else { FREEZE_ICON_PLAY };
     sdl.set_draw_color(fz_bg);
     sdl.fill_rect(layout.rail.freeze).ok();
     sdl.set_draw_color(fz_border);
     sdl.draw_rect(layout.rail.freeze).ok();
-    render_text_centered(sdl, icon_font, &tc, cache, &fz_icon.to_string(), fz_icon_col, layout.rail.freeze);
+    render_text_centered(sdl, icon_font, &tc, cache, fz_icon, fz_icon_col, layout.rail.freeze);
 
     sdl.set_draw_color(Color::RGB(28, 28, 32));
     sdl.fill_rect(layout.rail.change_input).ok();
     sdl.set_draw_color(Color::RGB(50, 100, 50));
     sdl.draw_rect(layout.rail.change_input).ok();
-    let cam_icon = '\u{f03d}'.to_string();
-    render_text_centered(sdl, icon_font, &tc, cache, &cam_icon, Color::RGB(100, 200, 100), layout.rail.change_input);
+    render_text_centered(sdl, icon_font, &tc, cache, CAMERA_ICON, Color::RGB(100, 200, 100), layout.rail.change_input);
 
     // Screenshot button
     sdl.set_draw_color(Color::RGB(28, 28, 32));
     sdl.fill_rect(layout.rail.screenshot).ok();
     sdl.set_draw_color(Color::RGB(80, 120, 80));
     sdl.draw_rect(layout.rail.screenshot).ok();
-    let ss_icon = '\u{f030}'.to_string();
-    render_text_centered(sdl, icon_font, &tc, cache, &ss_icon, Color::RGB(140, 200, 140), layout.rail.screenshot);
+    render_text_centered(sdl, icon_font, &tc, cache, SCREENSHOT_ICON, Color::RGB(140, 200, 140), layout.rail.screenshot);
 
     // Scroll buttons (only visible if needed)
     if layout.rail.needs_scroll {
@@ -304,7 +310,7 @@ pub fn draw_v2_toolbar(
         sdl.fill_rect(layout.rail.scroll_up).ok();
         sdl.set_draw_color(if up_active { Color::RGB(60, 60, 65) } else { Color::RGB(40, 40, 45) });
         sdl.draw_rect(layout.rail.scroll_up).ok();
-        render_text_centered(sdl, icon_font, &tc, cache, "\u{f077}",
+        render_text_centered(sdl, icon_font, &tc, cache, CHEVRON_UP,
             if up_active { Color::RGB(200, 200, 210) } else { Color::RGB(90, 90, 95) },
             layout.rail.scroll_up);
 
@@ -315,7 +321,7 @@ pub fn draw_v2_toolbar(
         sdl.fill_rect(layout.rail.scroll_down).ok();
         sdl.set_draw_color(if down_active { Color::RGB(60, 60, 65) } else { Color::RGB(40, 40, 45) });
         sdl.draw_rect(layout.rail.scroll_down).ok();
-        render_text_centered(sdl, icon_font, &tc, cache, "\u{f078}",
+        render_text_centered(sdl, icon_font, &tc, cache, CHEVRON_DOWN,
             if down_active { Color::RGB(200, 200, 210) } else { Color::RGB(90, 90, 95) },
             layout.rail.scroll_down);
     }
@@ -343,6 +349,7 @@ pub fn click_v2_toolbar(mx: i32, my: i32, layout: &mut V2Layout, state: &mut App
         for (i, sr) in layout.rail.color_popout.iter().enumerate() {
             if sr.contains_point((mx, my)) {
                 state.color = PALETTE[i];
+                state.mark_snapshot_dirty();
                 layout.popout_open = false;
                 return;
             }
@@ -371,15 +378,19 @@ pub fn click_v2_toolbar(mx: i32, my: i32, layout: &mut V2Layout, state: &mut App
     if layout.rail.brush_minus.contains_point((mx, my)) {
         state.brush_size = state.brush_size.saturating_sub(4).max(1);
         state.tool_sizes[state.active_tool.index()] = state.brush_size;
+        state.mark_snapshot_dirty();
     } else if layout.rail.brush_plus.contains_point((mx, my)) {
         state.brush_size = (state.brush_size + 4).min(200);
         state.tool_sizes[state.active_tool.index()] = state.brush_size;
+        state.mark_snapshot_dirty();
     } else if layout.rail.freeze.contains_point((mx, my)) {
         state.freeze_frame = !state.freeze_frame;
+        state.mark_snapshot_dirty();
     } else if layout.rail.screenshot.contains_point((mx, my)) {
         // Screenshot is handled in the main loop via a flag
         state.screenshot_requested = true;
     } else if layout.rail.change_input.contains_point((mx, my)) {
         state.show_device_picker = true;
+        state.mark_snapshot_dirty();
     }
 }

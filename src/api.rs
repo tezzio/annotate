@@ -143,14 +143,6 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &str, content_type:
     stream.flush()
 }
 
-fn write_json(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
-    write_response(stream, status, body, "application/json")
-}
-
-fn write_html(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
-    write_response(stream, status, body, "text/html; charset=utf-8")
-}
-
 // ── Request parsing ───────────────────────────────────────────────────────────
 
 #[derive(Debug)]

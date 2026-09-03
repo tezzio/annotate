@@ -107,17 +107,6 @@ impl Default for RtspConfig {
     }
 }
 
-impl RtspConfig {
-    /// Return the configured RTSP URL unchanged, if any.  Credentials (if
-    /// any) are expected to be embedded in the URL itself.
-    pub fn build_url(&self) -> Option<String> {
-        self.url.as_ref().and_then(|u| {
-            let trimmed = u.trim();
-            if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
-        })
-    }
-}
-
 // ── serde defaults ────────────────────────────────────────────────────────────
 
 fn default_width() -> u32 { 1920 }
@@ -156,14 +145,6 @@ impl Default for Config {
 }
 
 impl User {
-    pub fn new(username: &str, password: &str, is_admin: bool) -> Self {
-        Self {
-            username: username.to_string(),
-            password_hash: hash_password(password),
-            is_admin,
-        }
-    }
-
     pub fn verify_password(&self, password: &str) -> bool {
         verify_password(password, &self.password_hash)
     }
@@ -240,12 +221,6 @@ pub fn save(cfg: &Config) -> Result<(), String> {
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
-
-fn dirs_home() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
-}
 
 /// Parse a `rrggbb` hex string into `(r, g, b)` bytes, defaulting to white on error.
 pub fn parse_color(hex: &str) -> (u8, u8, u8) {

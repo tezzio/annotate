@@ -68,7 +68,7 @@ case "$ARCH" in
         ;;
     aarch64)
         DEBOOTSTRAP_ARCH=arm64; NEED_QEMU=1
-        EXTRA_PKGS="libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxss-dev libxrender-dev libxext-dev xinit xauth linux-image-arm64 initramfs-tools busybox-static xserver-xorg-core xserver-xorg-input-libinput xserver-xorg-input-evdev xserver-xorg-video-fbdev xserver-xorg-video-modesetting xkb-data curl libdrm-dev libgbm-dev libsdl2-dev libsdl2-ttf-dev libv4l-dev"
+        EXTRA_PKGS="libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxss-dev libxrender-dev libxext-dev xinit xauth linux-image-arm64 initramfs-tools busybox-static xserver-xorg-core xserver-xorg-input-libinput xserver-xorg-input-evdev xserver-xorg-video-fbdev xserver-xorg-video-vesa xkb-data curl libdrm-dev libgbm-dev libsdl2-dev libsdl2-ttf-dev libv4l-dev"
         ;;
     *) die "Unsupported arch: $ARCH (use x86_64 or aarch64)" ;;
 esac

@@ -15,7 +15,7 @@ use std::{
         mpsc::Receiver,
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use sdl2::{
@@ -40,6 +40,14 @@ use ui::{DevicePicker, OverlaySettings, OverlayAction, TextCache, Toggle, toolba
 
 const FONT_BYTES:      &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/DejaVuSans.ttf"));
 const ICON_FONT_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa-solid.otf"));
+
+// ── Per-thread scratch buffers ─────────────────────────────────────────────────
+// TODO 8 — `Vec<Point>` allocations inside the render loop (eraser preview,
+// Circle shape preview) used to allocate per frame.  We reuse a thread-local
+// buffer instead.
+std::thread_local! {
+    static PREVIEW_PTS: std::cell::RefCell<Vec<Point>> = std::cell::RefCell::new(Vec::with_capacity(512));
+}
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -136,13 +144,30 @@ fn main() {
     // that rasterizes `scene` (with `committed_canvas` as the input base)
     // into the back buffer.  The main thread reads `front_pixels()` and
     // uploads to `committed_tex`.
-    let mut pipeline = RenderPipeline::new(canvas_w, canvas_h);
+    let pipeline = RenderPipeline::new(canvas_w, canvas_h);
     let mut pipeline_seq: u64 = 0;
 
-    // ── Video texture ──────────────────────────────────────────────────────
-    let mut video_tex = texture_creator
-        .create_texture_streaming(PixelFormatEnum::RGB24, canvas_w, canvas_h)
-        .expect("video texture");
+    // ── Video texture (double-buffered) ────────────────────────────────────
+    // A single streaming texture produces a subtle horizontal tear line with
+    // USB HDMI capture cards because their frame delivery is jittery relative
+    // to the display vsync boundary: the GPU's fragment shader samples the
+    // texture while the CPU `update()` is still mid-way through the
+    // glTexSubImage2D copy, so scanout sees half-old / half-new pixel data at
+    // the line where the upload crossed the screen.  Fix: keep TWO textures
+    // and rotate.  Upload writes to the BACK buffer; the blit samples the
+    // FRONT buffer; the GPU command queue guarantees the in-flight blit
+    // completes before the next iteration's blit re-samples the rotated-in
+    // buffer — so the GPU is never sampling a texture being uploaded to.
+    let mk_video_tex = |fmt: PixelFormatEnum, w: u32, h: u32| -> sdl2::render::Texture {
+        texture_creator
+            .create_texture_streaming(fmt, w, h)
+            .expect("video texture")
+    };
+    let mut video_tex: [sdl2::render::Texture; 2] = [
+        mk_video_tex(PixelFormatEnum::RGB24, canvas_w, canvas_h),
+        mk_video_tex(PixelFormatEnum::RGB24, canvas_w, canvas_h),
+    ];
+    let mut video_tex_idx: usize = 0; // index of the FRONT (currently-displayed) buffer
     let mut video_tex_w = canvas_w;
     let mut video_tex_h = canvas_h;
     let mut video_tex_fmt = PixelFormatEnum::RGB24;
@@ -234,6 +259,7 @@ fn main() {
                         match *k {
                             sdl2::keyboard::Keycode::Escape => {
                                 state.show_settings_overlay = false;
+                                state.mark_snapshot_dirty();
                             }
                             sdl2::keyboard::Keycode::Up => {
                                 if let Some(s) = &mut state.settings {
@@ -261,6 +287,7 @@ fn main() {
                                     if action == OverlayAction::ToggleFullscreen {
                                         state.toggle_fullscreen = true;
                                         state.show_settings_overlay = false;
+                                        state.mark_snapshot_dirty();
                                     }
                                 }
                             }
@@ -273,10 +300,11 @@ fn main() {
                             let canvas_h_i = canvas_h as i32;
                             let action = s.click(*x as i32, *y as i32, canvas_w_i, canvas_h_i);
                             match action {
-                                OverlayAction::Close => { state.show_settings_overlay = false; }
+                                OverlayAction::Close => { state.show_settings_overlay = false; state.mark_snapshot_dirty(); }
                                 OverlayAction::ToggleFullscreen => {
                                     state.toggle_fullscreen = true;
                                     state.show_settings_overlay = false;
+                                    state.mark_snapshot_dirty();
                                 }
                                 OverlayAction::None => {}
                             }
@@ -305,9 +333,14 @@ fn main() {
             committed_tex.set_blend_mode(BlendMode::Blend);
             // Resize the pipeline's double buffer to match.
             pipeline.resize(canvas_w, canvas_h);
-            video_tex = texture_creator
-                .create_texture_streaming(video_tex_fmt, canvas_w, canvas_h)
-                .expect("video texture");
+            // Recreate BOTH video textures at the new size and reset the
+            // front-index; the render loop's dimension check will recreate
+            // them again at the frame's native size if those differ.
+            video_tex = [
+                mk_video_tex(video_tex_fmt, canvas_w, canvas_h),
+                mk_video_tex(video_tex_fmt, canvas_w, canvas_h),
+            ];
+            video_tex_idx = 0;
             video_tex_w = canvas_w;
             video_tex_h = canvas_h;
             committed_canvas.dirty = true;
@@ -320,15 +353,16 @@ fn main() {
         if let Some((mx, my)) = state.pending_menu_click.take() {
             let action = menu_bar.click(mx, my, canvas_w as i32);
             match action {
-                ui::MenuAction::Undo  => { state.scene.undo(); }
-                ui::MenuAction::Redo  => { state.scene.redo(); }
-                ui::MenuAction::Clear => { state.scene.clear(); }
-                ui::MenuAction::OpenSettings => { state.show_settings_overlay = true; }
+                ui::MenuAction::Undo  => { state.scene.undo(); state.mark_snapshot_dirty(); }
+                ui::MenuAction::Redo  => { state.scene.redo(); state.mark_snapshot_dirty(); }
+                ui::MenuAction::Clear => { state.scene.clear(); state.mark_snapshot_dirty(); }
+                ui::MenuAction::OpenSettings => { state.show_settings_overlay = true; state.mark_snapshot_dirty(); }
                 _ => {}
             }
             if let ui::MenuAction::SelectDevice(idx) = action {
                 menu_bar.active_idx = idx;
                 state.input_mode = 0;  // menu quick-switch always uses best mode
+                state.mark_snapshot_dirty();
                 if idx == 0 {
                     capture_stop.store(true, Ordering::Relaxed);
                     capture_rx = capture::null_receiver();
@@ -394,6 +428,7 @@ fn main() {
             }
             state.input_mode = if dev_idx == 0 { 0 } else { mode_idx };
             menu_bar.active_idx = dev_idx;
+            state.mark_snapshot_dirty();
         }
 
         // ── API commands (Crestron mutations; drained once per frame) ─────
@@ -408,6 +443,7 @@ fn main() {
                 }
                 state::ApiCommandKind::SetColor(r, g, b) => {
                     state.color = (r, g, b);
+                    state.mark_snapshot_dirty();
                     state::ApiResult::Ok(serde_json::json!({
                         "color": format!("{r:02x}{g:02x}{b:02x}"),
                     }))
@@ -415,6 +451,7 @@ fn main() {
                 state::ApiCommandKind::SetBrushSize(px) => {
                     state.brush_size = state::clamp_brush_size(px);
                     state.tool_sizes[state.active_tool.index()] = state.brush_size;
+                    state.mark_snapshot_dirty();
                     state::ApiResult::Ok(serde_json::json!({
                         "brush_size": state.brush_size,
                     }))
@@ -424,6 +461,7 @@ fn main() {
                     state.brush_size =
                         state::clamp_brush_size((cur + d).max(0) as u32);
                     state.tool_sizes[state.active_tool.index()] = state.brush_size;
+                    state.mark_snapshot_dirty();
                     state::ApiResult::Ok(serde_json::json!({
                         "brush_size": state.brush_size,
                     }))
@@ -458,6 +496,7 @@ fn main() {
                         }
                         menu_bar.active_idx = index;
                         state.input_mode = mode;
+                        state.mark_snapshot_dirty();
                         state::ApiResult::Ok(serde_json::json!({
                             "input": index,
                             "input_mode": mode,
@@ -488,6 +527,7 @@ fn main() {
                 win.set_fullscreen(FullscreenType::Desktop).ok();
                 state.is_fullscreen = true;
             }
+            state.mark_snapshot_dirty();
         }
 
         // ── Screenshot capture ─────────────────────────────────────────────
@@ -517,27 +557,37 @@ fn main() {
         sdl_canvas.set_draw_color(Color::RGB(0, 0, 0));
         sdl_canvas.clear();
 
-        // Video layer — upload to GPU only when a new frame arrived; always blit existing
+        // Video layer — double-buffered upload to eliminate capture-card tearing.
+        // See the declaration above for the rationale.  In brief: BACK gets the
+        // upload, FRONT gets the blit, rotate after the blit so the freshly-
+        // written buffer becomes next frame's front.  We only rotate on frames
+        // where `new_video_frame` is true, so when no capture frame arrives
+        // the GPU keeps blitting from the same front buffer (no spurious
+        // texture switches).
         if let Some(frame) = &last_video_frame {
             if frame.width > 0 && frame.height > 0 {
+                let desired_fmt = match frame.format {
+                    FrameFormat::Yuyv   => PixelFormatEnum::YUY2,
+                    FrameFormat::Yuv420 => PixelFormatEnum::IYUV,
+                    FrameFormat::Rgb24  => PixelFormatEnum::RGB24,
+                };
+                // Recreate BOTH textures if dimensions or format changed.
+                // Recreating only one is a tearing window (the in-flight blit
+                // could be sampling the one we just replaced), so we replace
+                // both atomically and reset the front-index.
+                if frame.width != video_tex_w || frame.height != video_tex_h || desired_fmt != video_tex_fmt {
+                    let t0 = texture_creator.create_texture_streaming(desired_fmt, frame.width, frame.height);
+                    let t1 = texture_creator.create_texture_streaming(desired_fmt, frame.width, frame.height);
+                    if let (Ok(t0), Ok(t1)) = (t0, t1) {
+                        video_tex = [t0, t1];
+                        video_tex_idx = 0;
+                        video_tex_w   = frame.width;
+                        video_tex_h   = frame.height;
+                        video_tex_fmt = desired_fmt;
+                    }
+                }
                 if new_video_frame {
                     dbg_upload_count += 1;
-                    let desired_fmt = match frame.format {
-                        FrameFormat::Yuyv   => PixelFormatEnum::YUY2,
-                        FrameFormat::Yuv420 => PixelFormatEnum::IYUV,
-                        FrameFormat::Rgb24  => PixelFormatEnum::RGB24,
-                    };
-                    // Recreate texture if frame dimensions or format changed
-                    if frame.width != video_tex_w || frame.height != video_tex_h || desired_fmt != video_tex_fmt {
-                        if let Ok(t) = texture_creator
-                            .create_texture_streaming(desired_fmt, frame.width, frame.height)
-                        {
-                            video_tex     = t;
-                            video_tex_w   = frame.width;
-                            video_tex_h   = frame.height;
-                            video_tex_fmt = desired_fmt;
-                        }
-                    }
                     // YUV420 is planar: full Y plane, then U, then V (each half-res).
                     // SDL2's IYUV texture expects width*height*3/2 bytes in a single
                     // contiguous buffer with this exact layout — which is what ffmpeg
@@ -547,11 +597,22 @@ fn main() {
                         FrameFormat::Yuv420 => (frame.width as usize) * (frame.height as usize) * 3 / 2,
                         FrameFormat::Rgb24  => (frame.width * 3) as usize,
                     };
-                    video_tex.update(None, &frame.data, pitch).ok();
+                    // Upload into the BACK buffer (the one not being sampled by
+                    // this frame's blit).
+                    let back_idx = video_tex_idx ^ 1;
+                    video_tex[back_idx].update(None, &frame.data, pitch).ok();
                 }
                 dbg_render_count += 1;
                 let dst = scale_rect(canvas_w, canvas_h, frame.width, frame.height);
-                sdl_canvas.copy(&video_tex, None, dst).ok();
+                // Blit the FRONT buffer — the GPU is currently sampling this
+                // texture and our upload targeted the OTHER one, so there is
+                // no write-during-read hazard.
+                sdl_canvas.copy(&video_tex[video_tex_idx], None, dst).ok();
+                // Rotate after the blit: the buffer we just wrote becomes the
+                // front for next frame.
+                if new_video_frame {
+                    video_tex_idx ^= 1;
+                }
             }
         }
 
@@ -589,20 +650,58 @@ fn main() {
         //      upload per frame.
         let overlay_src = Rect::new(0, MENU_HEIGHT, canvas_w, canvas_h.saturating_sub(toolbar_height(canvas_w as i32) as u32 + MENU_HEIGHT as u32));
 
-        // Submit a render job whenever scene or input is dirty.
-        if state.scene.dirty || committed_canvas.dirty {
-            // Copy the input canvas into the pipeline's back buffer so the
-            // worker can use it as the base layer, then submit the scene.
-            // The worker reads front_pixels (== previous render result)
-            // and writes the new render into back_pixels.
-            pipeline.submit_scene(&committed_canvas, &state.scene);
-            committed_canvas.dirty = false;
-            state.scene.dirty = false;
-        }
+        // Live eraser preview: while the eraser is being dragged, skip the
+        // background pipeline (the worker would re-rasterize the pre-wipe
+        // scene on top of our wipe and undo the visible erase) and instead
+        // upload `committed_canvas` to the GPU texture each frame.
+        //
+        // IMPORTANT: we upload ONLY the bounding box of pixels touched
+        // since the last upload, not the whole 8.3 MB.  TODO 5 in
+        // perf-todos.md flagged full-canvas uploads as the dominant
+        // per-frame CPU↔GPU traffic cost (~500 MB/s on a 1080p stream);
+        // on RPi3/R6A that's enough to drop a few fps by itself.  The
+        // partial-rect upload costs O(rect_area * 4) bytes — a few KB
+        // per drag point — which is why we accumulate a bbox in
+        // `state.eraser_dirty_*` rather than uploading per point.
+        //
+        // On release, `committed_canvas` retains the wipe, `erase_path`
+        // sets `scene.dirty`, and the pipeline takes over on the next
+        // frame — `submit_scene` copies the wiped canvas into the back
+        // buffer and the worker bakes the trimmed scene on top.
+        let erasing_now = state.eraser_drag.is_some();
+        if erasing_now {
+            let (min_x, min_y) = state.eraser_dirty_min;
+            let (max_x, max_y) = state.eraser_dirty_max;
+            if min_x < max_x && min_y < max_y {
+                let x = min_x;
+                let y = min_y;
+                let w = (max_x - min_x) as u32;
+                let h = (max_y - min_y) as u32;
+                let stride = canvas_w as usize * 4;
+                let offset = (y as usize) * stride + (x as usize) * 4;
+                let rect = Rect::new(x, y, w, h);
+                committed_tex.update(Some(rect), &committed_canvas.pixels[offset..], stride).ok();
+                // Reset the accumulator so the next frame starts fresh.
+                state.eraser_dirty_min = (i32::MAX, i32::MAX);
+                state.eraser_dirty_max = (i32::MIN, i32::MIN);
+                committed_canvas.dirty = false;
+            }
+        } else {
+            // Submit a render job whenever scene or input is dirty.
+            if state.scene.dirty || committed_canvas.dirty {
+                // Copy the input canvas into the pipeline's back buffer so the
+                // worker can use it as the base layer, then submit the scene.
+                // The worker reads front_pixels (== previous render result)
+                // and writes the new render into back_pixels.
+                pipeline.submit_scene(&committed_canvas, &state.scene);
+                committed_canvas.dirty = false;
+                state.scene.dirty = false;
+            }
 
-        // Drain any completed worker frames into the GPU texture.
-        if pipeline.poll(&mut pipeline_seq) {
-            pipeline.upload_to(&mut committed_tex);
+            // Drain any completed worker frames into the GPU texture.
+            if pipeline.poll(&mut pipeline_seq) {
+                pipeline.upload_to(&mut committed_tex);
+            }
         }
 
         sdl_canvas.copy(&committed_tex, overlay_src, overlay_src).ok();
@@ -616,12 +715,19 @@ fn main() {
         if let Some(prev_obj) = input::preview_object(&state) {
             draw_preview_sdl(&mut sdl_canvas, &prev_obj);
         }
-        // Selection bounding box — drawn on top of everything when the Select
-        // tool has a hit.  Figma/Canva style: a thin accent-colored rectangle
-        // with a 2-pixel margin around the object's bounds.
+        // Selection bounding boxes — drawn on top of everything when the Select
+        // tool has one or more hits.  Figma/Canva style: a thin accent-
+        // colored rectangle with a 4-pixel margin around each object's
+        // bounds.  Multi-select draws one box per selected object so the
+        // user sees every member, not just the union.  All drawn directly
+        // via SDL2 GPU primitives — no CPU canvas work, no extra upload.
         if state.active_tool == Tool::Select {
-            if let Some(idx) = state.scene.selected {
-                if let Some(obj) = state.scene.objects.get(idx) {
+            let accent = Color::RGB(0x4a, 0x9e, 0xff);
+            // Cache the indices to avoid borrowing `state.scene` while we
+            // also want to borrow `state.scene.objects()` in the loop.
+            let selected: Vec<usize> = state.scene.selected.clone();
+            for idx in selected {
+                if let Some(obj) = state.scene.objects().get(idx) {
                     let (bx, by, bw, bh) = obj.bounds();
                     let pad = 4i32;
                     let x = bx - pad;
@@ -630,13 +736,29 @@ fn main() {
                     let h = (bh + pad * 2).max(1) as u32;
                     let r = Rect::new(x, y, w, h);
                     // 2px border accent — draw two concentric rects for a
-                    // subtle inset effect
-                    sdl_canvas.set_draw_color(Color::RGB(0x4a, 0x9e, 0xff));
+                    // subtle inset effect.
+                    sdl_canvas.set_draw_color(accent);
                     sdl_canvas.draw_rect(r).ok();
                     let r2 = Rect::new(x + 2, y + 2, w.saturating_sub(4), h.saturating_sub(4));
-                    sdl_canvas.set_draw_color(Color::RGB(0x4a, 0x9e, 0xff));
+                    sdl_canvas.set_draw_color(accent);
                     sdl_canvas.draw_rect(r2).ok();
                 }
+            }
+            // Live marquee outline.  Drawn with a slightly different
+            // color (cyan-ish) so it reads as "selection in progress"
+            // versus the per-object accent.
+            if let Some((x0, y0, x1, y1)) = state.marquee {
+                let lx = x0.min(x1);
+                let rx = x0.max(x1);
+                let ty = y0.min(y1);
+                let by = y0.max(y1);
+                let r = Rect::new(lx, ty, (rx - lx).max(1) as u32, (by - ty).max(1) as u32);
+                sdl_canvas.set_draw_color(Color::RGBA(0x4a, 0x9e, 0xff, 90));
+                // Fill is a translucent rectangle so the user can see which
+                // objects will be picked up.  SDL2's BlendMode::Blend is on.
+                sdl_canvas.fill_rect(r).ok();
+                sdl_canvas.set_draw_color(Color::RGB(0x4a, 0x9e, 0xff));
+                sdl_canvas.draw_rect(r).ok();
             }
         }
         // Laser pointer trail — Tron-style solid fading line, never committed to scene
@@ -690,15 +812,20 @@ fn main() {
             let r = (drag.radius as i32).max(1).min(80);
             sdl_canvas.set_draw_color(Color::RGBA(220, 220, 220, 220));
             for &(cx, cy) in drag.points.iter().rev().take(6) {
-                let steps = 36;
-                let pts: Vec<Point> = (0..=steps).map(|i| {
-                    let a = 2.0 * std::f32::consts::PI * i as f32 / steps as f32;
-                    Point::new(
-                        cx + (r as f32 * a.cos()).round() as i32,
-                        cy + (r as f32 * a.sin()).round() as i32,
-                    )
-                }).collect();
-                sdl_canvas.draw_lines(pts.as_slice()).ok();
+                let steps = 36usize;
+                PREVIEW_PTS.with(|cell| {
+                    let mut pts = cell.borrow_mut();
+                    pts.clear();
+                    pts.reserve(steps + 1);
+                    for i in 0..=steps {
+                        let a = 2.0 * std::f32::consts::PI * i as f32 / steps as f32;
+                        pts.push(Point::new(
+                            cx + (r as f32 * a.cos()).round() as i32,
+                            cy + (r as f32 * a.sin()).round() as i32,
+                        ));
+                    }
+                    sdl_canvas.draw_lines(pts.as_slice()).ok();
+                });
             }
         }
 
@@ -754,8 +881,18 @@ fn main() {
         sdl_canvas.present();
 
         // ── Publish API snapshot (HTTP threads only ever read it) ─────────
-        if let Ok(mut snap) = api_snapshot.write() {
-            *snap = state.to_snapshot(menu_bar.active_idx, &menu_bar.devices, display_fps, capture_fps);
+        // TODO 4 — only rebuild the snapshot when something changed OR the
+        // FPS counters drift past a 500 ms ceiling.  The HTTP API polls
+        // < 1 Hz so a half-second staleness on `fps` / `capture_fps` is
+        // imperceptible; everything else is rebuilt instantly on change.
+        let snap_due = state.snapshot_dirty
+            || state.last_snapshot_publish.elapsed() >= Duration::from_millis(500);
+        if snap_due {
+            if let Ok(mut snap) = api_snapshot.write() {
+                *snap = state.to_snapshot(menu_bar.active_idx, &menu_bar.devices, display_fps, capture_fps);
+            }
+            state.snapshot_dirty = false;
+            state.last_snapshot_publish = Instant::now();
         }
 
         // No manual frame-cap here.  `present_vsync()` above already paces the
@@ -893,14 +1030,19 @@ fn draw_preview_sdl(sdl: &mut sdl2::render::Canvas<sdl2::video::Window>, obj: &D
             let perimeter = 2.0 * std::f32::consts::PI * base_rx.max(base_ry);
             let steps = (perimeter as usize).max(16).min(512);
             for dr in 0..t {
-                let pts: Vec<Point> = (0..=steps).map(|i| {
-                    let a = 2.0 * std::f32::consts::PI * i as f32 / steps as f32;
-                    Point::new(
-                        cx + ((base_rx + dr as f32) * a.cos()).round() as i32,
-                        cy + ((base_ry + dr as f32) * a.sin()).round() as i32,
-                    )
-                }).collect();
-                sdl.draw_lines(pts.as_slice()).ok();
+                PREVIEW_PTS.with(|cell| {
+                    let mut pts = cell.borrow_mut();
+                    pts.clear();
+                    pts.reserve(steps + 1);
+                    for i in 0..=steps {
+                        let a = 2.0 * std::f32::consts::PI * i as f32 / steps as f32;
+                        pts.push(Point::new(
+                            cx + ((base_rx + dr as f32) * a.cos()).round() as i32,
+                            cy + ((base_ry + dr as f32) * a.sin()).round() as i32,
+                        ));
+                    }
+                    sdl.draw_lines(pts.as_slice()).ok();
+                });
             }
         }
         DrawObject::Arrow(s) => {

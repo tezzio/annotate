@@ -157,6 +157,20 @@ pub struct AppState {
     /// the committed canvas and bake the result into the scene.
     pub eraser_drag:         Option<EraserDrag>,
 
+    /// Bounding box (inclusive min, exclusive max in canvas pixel space)
+    /// of the region of `committed_canvas` that was alpha-zeroed by the
+    /// live eraser preview since the last frame's texture upload.  The
+    /// render loop reads + resets this to drive a partial
+    /// `SDL_UpdateTexture(rect, …)` instead of a full 8.3 MB upload per
+    /// drag frame — a major win on bandwidth-limited systems (RPi3 / R6A)
+    /// where TODO 5 in `perf-todos.md` flagged full-canvas uploads as
+    /// the dominant CPU↔GPU traffic cost.
+    ///
+    /// Sentinel values (`i32::MAX / i32::MIN`) mean "no wipes since last
+    /// reset" and the upload is skipped.
+    pub eraser_dirty_min:    (i32, i32),
+    pub eraser_dirty_max:    (i32, i32),
+
     // Scene (object model)
     pub scene:               Scene,
 
@@ -173,6 +187,13 @@ pub struct AppState {
 
     // Set when a select-drag undo snapshot was pushed; cancelled if no movement
     pub pending_select_undo: bool,
+
+    /// Marquee selection in progress.  When the user clicks on empty
+    /// canvas (no hit) the input handler starts a marquee from the
+    /// press point; on mouse-up every object whose bounds overlap the
+    /// rect (start..cur) is added to the selection.  `None` outside of
+    /// a marquee drag.  Drawn live via direct GPU primitives in main.rs.
+    pub marquee:             Option<(i32, i32, i32, i32)>,  // (x0, y0, x1, y1)
 
     // Draw lock (set after undo/redo to absorb accidental mouse-down)
     pub draw_locked_until:   Option<Instant>,
@@ -194,6 +215,11 @@ pub struct AppState {
     pub is_fullscreen:       bool,
     pub window_size:         (u32, u32),
 
+    /// True while Shift is physically held.  Updated on KeyDown/KeyUp so
+    /// mouse-button events (which don't carry modifier state) can check
+    /// it for shift-click semantics (e.g. multi-select toggle).
+    pub shift_down:         bool,
+
     // Config ref
     pub cfg: config::Config,
 
@@ -201,6 +227,16 @@ pub struct AppState {
     pub show_settings_overlay: bool,
     pub settings:             Option<OverlaySettings>,
     pub settings_action:     Option<OverlayAction>,
+
+    /// Set whenever a field that contributes to [`StateSnapshot`] has been
+    /// mutated.  The main loop clears it after publishing a fresh snapshot
+    /// to the API threads; while it's false, [`AppState::to_snapshot`] is
+    /// not called.  See TODO 4 in perf-todos.md.
+    pub snapshot_dirty:       bool,
+
+    /// Wall-clock of the last published snapshot — used to throttle
+    /// periodic rebuilds of FPS-bearing fields (TODO 4).
+    pub last_snapshot_publish: Instant,
 }
 
 impl AppState {
@@ -232,7 +268,9 @@ impl AppState {
             toggle_fullscreen:   false,
             is_fullscreen:       is_full,
             window_size:         (cfg.width, cfg.height),
+            shift_down:          false,
             pending_select_undo: false,
+            marquee:             None,
             draw_locked_until:   None,
             freeze_frame:        false,
             screenshot_requested: false,
@@ -244,7 +282,19 @@ impl AppState {
             show_settings_overlay: false,
             settings:             None,
             settings_action:     None,
+            snapshot_dirty:       true,  // first frame always rebuilds
+            last_snapshot_publish: Instant::now() - std::time::Duration::from_secs(1),
+            eraser_dirty_min:    (i32::MAX, i32::MAX),
+            eraser_dirty_max:    (i32::MIN, i32::MIN),
         }
+    }
+
+    /// Mark [`Self::snapshot_dirty`] so the next render-loop iteration
+    /// rebuilds the API snapshot.  Call this from any mutator that
+    /// affects a field consumed by [`AppState::to_snapshot`].
+    #[inline]
+    pub fn mark_snapshot_dirty(&mut self) {
+        self.snapshot_dirty = true;
     }
 
     // ── REST API snapshot ─────────────────────────────────────────────────
@@ -307,8 +357,9 @@ impl AppState {
             undo_limit,
             can_undo:            !self.scene.undo_stack.is_empty(),
             can_redo:            !self.scene.redo_stack.is_empty(),
-            object_count:        self.scene.objects.len(),
-            selected:            self.scene.selected.is_some(),
+            object_count:        self.scene.objects().len(),
+            // Number of selected live objects (0 = nothing selected).
+            selected:            self.scene.selected.len(),
             drawing:             self.active_stroke.is_some(),
             text_input_active:   self.text_input_active,
             device_picker_open:  self.show_device_picker,
@@ -358,7 +409,9 @@ pub struct StateSnapshot {
     pub can_undo:           bool,
     pub can_redo:           bool,
     pub object_count:       usize,
-    pub selected:           bool,
+    /// Number of currently-selected live objects (0 = nothing selected).
+    /// Multi-select: any non-zero count is "something is selected".
+    pub selected:           usize,
     pub drawing:            bool,
     pub text_input_active:  bool,
     pub device_picker_open: bool,

@@ -166,7 +166,13 @@ impl RenderPipeline {
         buffers[idx].pixels.clone()
     }
 
+    /// Pipeline canvas width.  Reserved for callers that need to query
+    /// the dimensions without going through the Scene/Canvas handle.
+    #[allow(dead_code)]
     pub fn width(&self)  -> u32 { self.inner.width  }
+    /// Pipeline canvas height.  Reserved for callers that need to query
+    /// the dimensions without going through the Scene/Canvas handle.
+    #[allow(dead_code)]
     pub fn height(&self) -> u32 { self.inner.height }
 
     /// Synchronous render into the front buffer.  Used at startup and on
@@ -216,12 +222,6 @@ impl RenderPipeline {
 
         // Resume worker.
         *self.inner.shutdown.lock().unwrap() = false;
-        self.inner.cv.notify_all();
-    }
-
-    /// Shutdown the worker.  Idempotent.
-    pub fn shutdown(&self) {
-        *self.inner.shutdown.lock().unwrap() = true;
         self.inner.cv.notify_all();
     }
 

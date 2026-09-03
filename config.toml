@@ -27,3 +27,11 @@ tool_color = "ffffff"
 
 # Default brush / stroke size in pixels
 tool_size = 4
+
+# REST API for Crestron / remote control (see docs/crestron-rest-api-plan.md)
+# Plain HTTP, LAN-scoped; control endpoints also accept GET query strings.
+[api]
+enabled = true
+bind    = "0.0.0.0"
+port    = 8080
+# token = "shared-secret"   # optional shared auth token

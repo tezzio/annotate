@@ -30,8 +30,24 @@ pub fn process_event(
         Event::Quit { .. } => return false,
 
         Event::KeyDown { keycode: Some(k), keymod, .. } => {
+            // Track Shift / Ctrl modifier state for mouse events (which
+            // don't carry modifier flags).  Only update on the physical
+            // modifier keys themselves so the flag stays accurate across
+            // focus changes.
+            match *k {
+                Keycode::LShift | Keycode::RShift => state.shift_down = true,
+                _ => {}
+            }
             if !handle_keydown(*k, *keymod, state, clipboard) {
                 return false;
+            }
+            state.mark_snapshot_dirty();
+        }
+
+        Event::KeyUp { keycode: Some(k), .. } => {
+            match *k {
+                Keycode::LShift | Keycode::RShift => state.shift_down = false,
+                _ => {}
             }
         }
 
@@ -39,10 +55,12 @@ pub fn process_event(
         Event::TextInput { text, .. } => {
             if state.active_tool == Tool::Text && state.text_input_active {
                 state.text_buffer.push_str(text);
+                state.mark_snapshot_dirty();
             } else if state.show_device_picker {
                 if let Some(picker) = &mut state.device_picker {
                     if picker.stage == PickerStage::Rtsp {
                         picker.rtsp.url.push_str(text);
+                        state.mark_snapshot_dirty();
                     }
                 }
             }
@@ -55,6 +73,7 @@ pub fn process_event(
         // are normalized to the full desktop and break on multi-monitor setups.
         Event::MouseButtonDown { mouse_btn: MouseButton::Left, x, y, .. } => {
             handle_press(*x, *y, state, canvas, v2_layout);
+            state.mark_snapshot_dirty();
         }
 
         // ── Mouse motion ──────────────────────────────────────────────────────
@@ -62,14 +81,31 @@ pub fn process_event(
             handle_move(*x, *y, state, canvas);
         }
 
+        // ── Mouse wheel — scroll the device/mode picker when it's open ───────
+        // Without this, users who only see MJPEG modes in a 16-row window
+        // have no way to reach the YUYV modes below them (key-only scrolling
+        // is awkward once the list is taller than the panel).
+        Event::MouseWheel { y, .. } if state.show_device_picker => {
+            if let Some(picker) = &mut state.device_picker {
+                // SDL2 reports y > 0 for wheel-up (away from user); invert
+                // so positive `delta` scrolls DOWN — matching on-screen
+                // direction.  Each tick = 3 rows for a snappier feel.
+                let delta = -*y * 3;
+                picker.scroll_by(state.window_size.1 as i32, delta);
+                state.mark_snapshot_dirty();
+            }
+        }
+
         // ── Mouse button up ───────────────────────────────────────────────────
         Event::MouseButtonUp { mouse_btn: MouseButton::Left, x, y, .. } => {
             handle_release(*x, *y, state, canvas);
+            state.mark_snapshot_dirty();
         }
 
         Event::Window { win_event: WindowEvent::Resized(w, h), .. }
         | Event::Window { win_event: WindowEvent::SizeChanged(w, h), .. } => {
             state.window_size = (*w as u32, *h as u32);
+            state.mark_snapshot_dirty();
         }
 
         _ => {}
@@ -128,11 +164,39 @@ fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, v2_layo
     match state.active_tool {
         Tool::Select => {
             let hit = state.scene.hit_test(mx, my);
-            state.scene.selected = hit;
-            if hit.is_some() {
-                // Snapshot before potential move so it can be undone
-                state.scene.push_undo();
-                state.pending_select_undo = true;
+            let shift = state.shift_down;
+            if let Some(idx) = hit {
+                // Click on an object.
+                if shift {
+                    // Shift-click: toggle this object in/out of the
+                    // current selection.  No drag-move, no undo snapshot.
+                    state.scene.select_toggle(idx);
+                    state.pending_select_undo = false;
+                    state.marquee = None;
+                } else if state.scene.is_selected(idx) {
+                    // Plain-click on an already-selected object: keep the
+                    // selection as-is and let the drag-move path below
+                    // translate every selected object together.
+                    state.scene.push_undo();
+                    state.pending_select_undo = true;
+                    state.marquee = None;
+                } else {
+                    // Plain-click on an unselected object: replace the
+                    // selection with just this one, then start a drag.
+                    state.scene.select_one(idx);
+                    state.scene.push_undo();
+                    state.pending_select_undo = true;
+                    state.marquee = None;
+                }
+            } else {
+                // Click on empty canvas: start a marquee selection from
+                // this point.  Shift extends an existing selection (add
+                // without clearing); plain replaces it.
+                if !shift {
+                    state.scene.select_clear();
+                }
+                state.marquee = Some((mx, my, mx, my));
+                state.pending_select_undo = false;
             }
         }
         Tool::Text => {
@@ -181,7 +245,7 @@ fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, v2_layo
     }
 }
 
-fn handle_move(mx: i32, my: i32, state: &mut AppState, _canvas: &Canvas) {
+fn handle_move(mx: i32, my: i32, state: &mut AppState, canvas: &mut Canvas) {
     if state.show_device_picker { return; }
     if my < MENU_HEIGHT || mx < crate::ui::v2::RAIL_WIDTH { return; }
     // Laser pointer tracks hover — no mouse button required
@@ -195,9 +259,24 @@ fn handle_move(mx: i32, my: i32, state: &mut AppState, _canvas: &Canvas) {
     let (dx, dy) = (mx - prev.0, my - prev.1);
     match state.active_tool {
         Tool::Select => {
-            if let Some(idx) = state.scene.selected {
-                if let Some(obj) = state.scene.objects.get_mut(idx) {
-                    obj.translate(dx, dy);
+            // If a marquee is in progress, just update the rect and let
+            // the render loop draw the live outline.  Otherwise translate
+            // every selected object together.
+            if let Some((x0, y0, _, _)) = state.marquee {
+                state.marquee = Some((x0, y0, mx, my));
+            } else if !state.scene.selected.is_empty() {
+                let n = state.scene.objects().len();
+                // Snapshot indices up front so a translate that grows the
+                // objects vec (e.g. via make_mut) doesn't invalidate our
+                // iterators.  We also clamp to current length defensively.
+                let indices: Vec<usize> = state.scene.selected.iter()
+                    .copied().filter(|&i| i < n).collect();
+                if !indices.is_empty() {
+                    for i in indices {
+                        if let Some(obj) = state.scene.objects_mut().get_mut(i) {
+                            obj.translate(dx, dy);
+                        }
+                    }
                     state.scene.dirty = true;
                 }
             }
@@ -210,6 +289,51 @@ fn handle_move(mx: i32, my: i32, state: &mut AppState, _canvas: &Canvas) {
         Tool::Eraser => {
             if let Some(drag) = state.eraser_drag.as_mut() {
                 drag.points.push((mx, my));
+                // Live wipe: zero the alpha disc on `committed_canvas` right
+                // now so the user sees the erasure happen as the brush moves.
+                // The render loop uploads `committed_canvas` to the GPU
+                // texture each frame, gated by `committed_canvas.dirty`,
+                // but uses a partial-rect upload driven by the bbox in
+                // `state.eraser_dirty_*` — so each drag point only uploads
+                // a few KB of GPU texture data, not the full 8.3 MB
+                // (TODO 5 in perf-todos.md flagged full uploads as the
+                // main per-frame cost).  The scene-mutation + baked_bg
+                // update happens in `Scene::erase_path` on release.
+                let r = drag.radius as i32;
+                if r > 0 {
+                    let r2 = r * r;
+                    let w = canvas.width as i32;
+                    let h = canvas.height as i32;
+                    let xa = (mx - r).max(0);
+                    let xb = (mx + r).min(w - 1);
+                    let ya = (my - r).max(0);
+                    let yb = (my + r).min(h - 1);
+                    for y in ya..=yb {
+                        let dy = y - my;
+                        let row_base = (y as u32 * canvas.width) as usize * 4;
+                        for x in xa..=xb {
+                            let dx = x - mx;
+                            if dx * dx + dy * dy > r2 { continue; }
+                            let idx = row_base + x as usize * 4;
+                            canvas.pixels[idx + 3] = 0;
+                        }
+                    }
+                    canvas.dirty = true;
+                    // Expand the partial-upload bbox so the render loop
+                    // uploads exactly the wiped region (with a 1-pixel
+                    // pad so bilinear sampling doesn't blend the edge
+                    // with the pre-wipe texel above/below the rect).
+                    let pad = 1i32;
+                    let xa_p = (xa - pad).max(0);
+                    let ya_p = (ya - pad).max(0);
+                    let xb_p = (xb + pad + 1).min(w);
+                    let yb_p = (yb + pad + 1).min(h);
+                    let (min_x, min_y) = state.eraser_dirty_min;
+                    let (max_x, max_y) = state.eraser_dirty_max;
+                    state.eraser_dirty_min = (min_x.min(xa_p), min_y.min(ya_p));
+                    state.eraser_dirty_max = (max_x.max(xb_p), max_y.max(yb_p));
+                    state.mark_snapshot_dirty();
+                }
             }
         }
         Tool::Highlight => {
@@ -238,24 +362,35 @@ fn handle_release(x1: i32, y1: i32, state: &mut AppState, canvas: &mut Canvas) {
                 state.scene.add(stroke);
             }
         }
-        // Eraser: zero alpha on the committed canvas at each drag point,
-        // then bake that canvas into the scene's permanent background and
-        // clear the live objects.  From this point on the pre-erase scene
-        // is no longer selectable, but undo still restores it because the
-        // snapshot was pushed on mouse-down.
+        // Eraser (Photoshop-style layer-aware): the brush already wiped the
+        // visible pixels in `canvas` during handle_move (live preview), so
+        // `Scene::erase_path` just needs to commit that wipe into the
+        // scene's persistent state — trim live strokes that the brush
+        // crossed, re-bake the scene into a fresh baked_bg, and zero the
+        // remaining brush pixels on the bake so non-live pixels wipe
+        // through to transparency too.
         Tool::Eraser => {
             if let Some(drag) = state.eraser_drag.take() {
                 if !drag.points.is_empty() {
-                    apply_erase_to_canvas(canvas, &drag.points, drag.radius);
-                    canvas.dirty = true;
-                    state.scene.bake_from_canvas(canvas);
+                    state.scene.erase_path(&drag.points, drag.radius, canvas);
                 }
             }
         }
         Tool::Select => {
-            if state.pending_select_undo {
+            // If a marquee was in progress, commit it: add every object
+            // whose bounds overlap the rect to the selection.
+            if let Some((x0, y0, x1, y1)) = state.marquee.take() {
+                let added = state.scene.select_add_in_rect(x0, y0, x1, y1);
+                if !added.is_empty() {
+                    state.mark_snapshot_dirty();
+                }
                 state.pending_select_undo = false;
-                // If the object didn't actually move, discard the undo snapshot
+            } else if state.pending_select_undo {
+                state.pending_select_undo = false;
+                // If the object(s) didn't actually move, discard the undo
+                // snapshot.  Multi-select: pop one entry per object that
+                // got its own COW Arc — in practice it's one snapshot per
+                // press, so one pop.
                 if state.drag_start == state.drag_cur {
                     state.scene.undo_stack.pop_back();
                 }
@@ -265,29 +400,8 @@ fn handle_release(x1: i32, y1: i32, state: &mut AppState, canvas: &mut Canvas) {
     }
 }
 
-/// Zero alpha in `canvas` inside a disc of `radius` around every point in
-/// `points`.  Bounds-checked against the canvas size.
-fn apply_erase_to_canvas(canvas: &mut Canvas, points: &[(i32, i32)], radius: u32) {
-    let r = radius as i32;
-    if r <= 0 { return; }
-    let r2 = r * r;
-    let w = canvas.width as i32;
-    let h = canvas.height as i32;
-    for &(cx, cy) in points {
-        for dy in -r..=r {
-            let py = cy + dy;
-            if py < 0 || py >= h { continue; }
-            for dx in -r..=r {
-                let px = cx + dx;
-                if px < 0 || px >= w { continue; }
-                if dx * dx + dy * dy > r2 { continue; }
-                let idx = ((py as u32 * canvas.width + px as u32) * 4) as usize;
-                canvas.pixels[idx + 3] = 0;
-            }
-        }
-        canvas.dirty = true;
-    }
-}
+// `apply_erase_to_canvas` was deleted — `Scene::erase_path` now does the
+// pixel-zero on baked_bg internally as part of the layer-aware flow.
 
 // ── Keyboard handler ──────────────────────────────────────────────────────────
 
@@ -329,6 +443,21 @@ fn handle_keydown(
                     }
                 }
             }
+            // ── Select-all shortcut for multi-select ────────────────────────
+            Keycode::A if ctrl => {
+                if state.active_tool == Tool::Select {
+                    // Select every live object.  No undo snapshot — this is
+                    // a pure selection change, no scene mutation.
+                    let n = state.scene.objects().len();
+                    let mut sel: Vec<usize> = (0..n).collect();
+                    state.scene.selected.clear();
+                    state.scene.selected.append(&mut sel);
+                    state.mark_snapshot_dirty();
+                }
+                // Outside Select, Ctrl+A is intentionally unbound (the
+                // existing `Keycode::A` (without Ctrl) below still switches
+                // to the Arrow tool).
+            }
             _ => {}
         }
         return true;
@@ -343,6 +472,37 @@ fn handle_keydown(
                 }
                 Keycode::Down => {
                     picker.move_down();
+                    picker.scroll_to_cursor(state.window_size.1 as i32);
+                }
+                Keycode::PageUp => {
+                    // Page Up = wheel-up * a page: a comfortable jump without
+                    // pulling the cursor off the list.  8 rows = roughly half
+                    // a typical 1080p panel.
+                    picker.scroll_by(state.window_size.1 as i32, -8);
+                }
+                Keycode::PageDown => {
+                    picker.scroll_by(state.window_size.1 as i32, 8);
+                }
+                Keycode::Home => {
+                    // Jump to first row (matches browser/OS list convention).
+                    match picker.stage {
+                        PickerStage::Devices => picker.device_cursor = 0,
+                        PickerStage::Modes   => picker.mode_cursor   = 0,
+                        _ => {}
+                    }
+                    picker.scroll_to_cursor(state.window_size.1 as i32);
+                }
+                Keycode::End => {
+                    // Jump to last row.
+                    match picker.stage {
+                        PickerStage::Devices => {
+                            picker.device_cursor = picker.entry_count().saturating_sub(1);
+                        }
+                        PickerStage::Modes => {
+                            picker.mode_cursor = picker.current_mode_count().saturating_sub(1);
+                        }
+                        _ => {}
+                    }
                     picker.scroll_to_cursor(state.window_size.1 as i32);
                 }
                 Keycode::Return | Keycode::KpEnter => {
@@ -437,9 +597,22 @@ fn handle_keydown(
         // ── Clear / Delete selected ───────────────────────────────────────────
         Keycode::Delete | Keycode::Backspace => {
             if state.active_tool == Tool::Select {
-                if let Some(idx) = state.scene.selected.take() {
+                if !state.scene.selected.is_empty() {
                     state.scene.push_undo();
-                    state.scene.objects.remove(idx);
+                    // Sort indices high-to-low so removal doesn't shift
+                    // the indices we still want to delete.  `swap_remove`
+                    // also avoids the O(n) shift of `remove`; the post-
+                    // deletion ordering doesn't matter because we clear
+                    // the selection anyway.
+                    let mut indices = state.scene.selected.clone();
+                    indices.sort_unstable_by(|a, b| b.cmp(a));
+                    state.scene.selected.clear();
+                    for idx in indices {
+                        if idx < state.scene.objects().len() {
+                            state.scene.objects_mut().swap_remove(idx);
+                        }
+                    }
+                    state.scene.dirty = true;
                 }
             } else {
                 state.scene.clear();
@@ -465,11 +638,13 @@ pub fn switch_tool(state: &mut AppState, tool: Tool) {
     state.tool_sizes[state.active_tool.index()] = state.brush_size;
     state.active_tool = tool;
     state.brush_size  = state.tool_sizes[tool.index()];
+    state.mark_snapshot_dirty();
 }
 
 fn commit_text(state: &mut AppState) {
     if !state.text_buffer.is_empty() { state.pending_text_commit = true; }
     state.text_input_active = false;
+    state.mark_snapshot_dirty();
 }
 
 /// Returns a live preview `DrawObject` for the current shape drag, if any.

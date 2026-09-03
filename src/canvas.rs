@@ -1,5 +1,3 @@
-use sdl2::render::Texture;
-
 // ── Canvas ────────────────────────────────────────────────────────────────────
 
 /// RGBA annotation layer.
@@ -24,10 +22,4 @@ impl Canvas {
     }
 
     pub fn clear(&mut self) { self.pixels.fill(0); self.dirty = true; }
-
-    pub fn upload_texture(&mut self, texture: &mut Texture) {
-        if !self.dirty { return; }
-        texture.update(None, &self.pixels, (self.width * 4) as usize).expect("texture update");
-        self.dirty = false;
-    }
 }

@@ -60,7 +60,9 @@ if [ "$ARCH" = "aarch64" ]; then
     require_cmd aarch64-linux-gnu-gcc
     export CC_aarch64_unknown_linux_gnu="aarch64-linux-gnu-gcc"
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="aarch64-linux-gnu-gcc"
-    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-L$SYSROOT/usr/lib/$MULTIARCH -L$SYSROOT/lib/$MULTIARCH"
+    # Pass --sysroot to the linker so /lib/... paths resolve inside our sysroot.
+    # Cargo passes link-args after the libraries, which is fine for --sysroot.
+    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-L$SYSROOT/usr/lib/$MULTIARCH -L$SYSROOT/lib/$MULTIARCH -C link-args=--sysroot=$SYSROOT"
 fi
 
 cargo build --release --target "$TARGET" -j "$JOBS"

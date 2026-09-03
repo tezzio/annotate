@@ -583,7 +583,8 @@ pub fn save_screenshot(sdl_canvas: &SdlCanvas<Window>, canvas_w: u32, canvas_h: 
 use std::process::Command;
 use std::io::BufReader;
 
-/// RTSP source identifier for the device picker
+/// RTSP source identifier for the device picker.
+#[allow(dead_code)]
 pub const RTSP_SOURCE_NAME: &str = "RTSP Stream";
 
 /// Spawn a background thread that continuously captures frames from an RTSP stream
@@ -908,9 +909,11 @@ fn try_rtsp_attempt(
 
     // For rawvideo YUV420 we know the per-frame size once we know width/height.
     // Wait for ffmpeg to publish its output size via stderr (line containing
-    // "Video:") — or use the user-supplied target_w/h as a hint.
-    let mut frame_w: u32 = target_w;
-    let mut frame_h: u32 = target_h;
+    // "Video:") — or use the user-supplied target_w/h as a hint.  Today we
+    // trust the caller-supplied target_w/h; the auto-detect path is
+    // documented in the comment above but not implemented.
+    let frame_w: u32 = target_w;
+    let frame_h: u32 = target_h;
     let mut frame_bytes: usize = 0;  // set once frame_w/frame_h are known
     let mut carry: Vec<u8> = Vec::with_capacity(8 * 1024 * 1024); // up to 1920x1080 YUV420
 

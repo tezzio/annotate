@@ -3,15 +3,12 @@
 use sdl2::{
     pixels::Color,
     rect::Rect,
-    render::Canvas as SdlCanvas,
+    render::{Canvas as SdlCanvas, Texture, TextureCreator},
     ttf::Font,
-    video::Window,
+    video::{Window, WindowContext},
 };
 
-use crate::{
-    capture::DeviceInfo,
-    tools::Tool,
-};
+use crate::capture::DeviceInfo;
 
 /// Toolbar height — slightly shorter on narrow viewports to give the canvas more room.
 /// 1280 px → 80 px
@@ -27,16 +24,41 @@ pub fn toolbar_height(w: i32) -> i32 {
 
 pub mod v2;
 
-// ── Text surface cache ────────────────────────────────────────────────────────
+// ── Text cache (surface + GPU texture) ───────────────────────────────────────
 
-/// Pre-rasterized surface cache. Avoids calling SDL2_TTF on every render frame
-/// for text that hasn't changed (tool icons, labels, static UI strings).
+/// Per-(font, text, color) cache of the rendered glyph surface and its GPU
+/// `Texture`.
+///
+/// **TODO 1** in `docs/perf-todos.md`: previously only the surface was
+/// cached; `tc.create_texture_from_surface()` was called every frame for
+/// every label, recreating and destroying an `SDL_Texture` ~24× per frame.
+/// That costs ~0.5–1.5 ms per call on RPi3's software-shader GLES2
+/// fallback.  We now cache the GPU texture too — first call pays the
+/// create cost; subsequent calls are a HashMap lookup.
+///
+/// # Lifetime story
+///
+/// SDL2's `Texture<'r>` borrows from the `TextureCreator` it was made from,
+/// which is owned by the `Canvas<Window>` (and hence by the render loop's
+/// stack).  We extend the lifetime to `'static` via `unsafe { mem::transmute }`.
+/// This is the standard sdl2-rs pattern and is sound because:
+///   1. SDL owns the underlying `SDL_Texture`; we don't free it.
+///   2. `SDL_DestroyTexture` is called only when the `Texture` is dropped —
+///      and we drop it only when the `TextCache` is dropped (program exit),
+///      at which point the renderer is being torn down anyway.
+///   3. The `TextureCreator` (which holds the renderer) outlives `TextCache`.
 pub struct TextCache {
-    map: std::collections::HashMap<u64, sdl2::surface::Surface<'static>>,
+    surfaces: std::collections::HashMap<u64, sdl2::surface::Surface<'static>>,
+    textures: std::collections::HashMap<u64, Texture<'static>>,
 }
 
 impl TextCache {
-    pub fn new() -> Self { Self { map: std::collections::HashMap::new() } }
+    pub fn new() -> Self {
+        Self {
+            surfaces: std::collections::HashMap::new(),
+            textures: std::collections::HashMap::new(),
+        }
+    }
 
     fn key(font: &Font, text: &str, color: Color) -> u64 {
         use std::hash::{Hash, Hasher};
@@ -48,37 +70,72 @@ impl TextCache {
         h.finish()
     }
 
-    /// Return a reference to a pre-rasterized surface, rendering it on first
-    /// access.  The returned reference is valid until the cache is mutated.
-    pub fn surface<'a>(&'a mut self, font: &Font, text: &str, color: Color)
+    /// Render the surface if not cached yet, returning a reference to it.
+    /// Used as the source for [`Self::texture`] on a cache miss.
+    fn surface<'a>(&'a mut self, font: &Font, text: &str, color: Color)
         -> &'a sdl2::surface::Surface<'static>
     {
         let k = Self::key(font, text, color);
-        self.map.entry(k).or_insert_with(|| {
+        self.surfaces.entry(k).or_insert_with(|| {
             font.render(text).blended(color).unwrap_or_else(|_| {
                 sdl2::surface::Surface::new(1, 1, sdl2::pixels::PixelFormatEnum::RGBA8888).unwrap()
             })
         })
     }
+
+    /// Return a reference to the cached GPU `Texture` for
+    /// `(font, text, color)`, creating it on first access.
+    ///
+    /// Pass the canvas's `TextureCreator`.  The returned `Texture` borrows
+    /// for `'static` (see struct-level docs); the renderer must outlive
+    /// the `TextCache`.
+    pub fn texture<'a>(
+        &'a mut self,
+        tc: &'a TextureCreator<WindowContext>,
+        font: &Font,
+        text: &str,
+        color: Color,
+    ) -> Option<&'a Texture<'static>> {
+        let k = Self::key(font, text, color);
+        if !self.textures.contains_key(&k) {
+            // Re-render the surface if missing too.  The surface cache is
+            // separate from the texture cache because a future caller
+            // might want raw CPU pixels (e.g. screenshot overlays); we
+            // keep it warm.
+            let surface = self.surface(font, text, color);
+            match tc.create_texture_from_surface(surface) {
+                Ok(t) => {
+                    // SAFETY: see struct-level docs.  SDL owns the
+                    // `SDL_Texture`; the renderer (held by `tc`) outlives
+                    // this cache; we drop `t` exactly once at program exit.
+                    let t: Texture<'static> = unsafe { std::mem::transmute(t) };
+                    self.textures.insert(k, t);
+                }
+                Err(_) => return None,
+            }
+        }
+        self.textures.get(&k)
+    }
 }
 
 // ── FontAwesome 6 Solid codepoints ───────────────────────────────────────────
 
-/// Return the FontAwesome 6 Solid unicode character for each tool.
-pub fn tool_fa_icon(tool: Tool) -> char {
-    match tool {
-        Tool::Pen       => '\u{f304}', // pen
-        Tool::Line      => '\u{f547}', // ruler-horizontal
-        Tool::Rect      => '\u{f0c8}', // square
-        Tool::Circle    => '\u{f111}', // circle
-        Tool::Arrow     => '\u{f061}', // arrow-right
-        Tool::Text      => '\u{f031}', // font
-        Tool::Select    => '\u{f245}', // mouse-pointer
-        Tool::Eraser    => '\u{f12d}', // eraser
-        Tool::Highlight => '\u{f5c1}', // highlighter
-        Tool::Laser     => '\u{f140}', // bullseye
-    }
-}
+/// Stable &str codepoints for tool icons, indexed by [`Tool::index`].
+/// Used to avoid per-frame `String` allocations in the V2 toolbar loop
+/// (TODO 3 in perf-todos.md).  Replaces the older `tool_fa_icon` helper
+/// which returned a `char` and required `.to_string()` per call.
+pub const TOOL_ICONS: [&str; 10] = [
+    "\u{f304}", // Pen
+    "\u{f547}", // Line
+    "\u{f0c8}", // Rect
+    "\u{f111}", // Circle
+    "\u{f061}", // Arrow
+    "\u{f031}", // Text
+    "\u{f245}", // Select
+    "\u{f12d}", // Eraser
+    "\u{f5c1}", // Highlight
+    "\u{f140}", // Laser
+];
 
 // ── Menu bar ─────────────────────────────────────────────────────────────────
 
@@ -432,7 +489,48 @@ impl DevicePicker {
         }
     }
 
-    fn current_mode_count(&self) -> usize {
+    /// Scroll the list by `delta` rows (positive = down).  Only moves the
+    /// scroll offset; the cursor follows if it falls off-screen so the
+    /// highlight stays visible.  Used for mouse-wheel and Page Up/Down.
+    pub fn scroll_by(&mut self, canvas_h: i32, delta: i32) {
+        let row_h    = 56i32;
+        let header_h = 64i32;
+        let footer_h = 36i32;
+        let avail_h  = canvas_h - 40;
+        let max_visible = ((avail_h - header_h - footer_h) / row_h).max(1) as i32;
+
+        let (cursor_ref, total) = match self.stage {
+            PickerStage::Devices => {
+                let t = self.entry_count() as i32;
+                (&mut self.device_cursor, t)
+            }
+            PickerStage::Modes => {
+                let t = self.current_mode_count() as i32;
+                (&mut self.mode_cursor, t)
+            }
+            // RTSP is a single field — wheel has no list to scroll.
+            PickerStage::Rtsp => return,
+        };
+
+        if total <= 0 { return; }
+
+        // Move the cursor first by the wheel delta; that naturally also
+        // advances the scroll window when the cursor hits the edge, which
+        // is what users expect from a scroll wheel on a highlighted list.
+        let new_cursor = (*cursor_ref as i32 + delta).clamp(0, total - 1);
+        *cursor_ref = new_cursor as usize;
+
+        // Snap scroll_offset so the cursor is always on screen.
+        let max_v = max_visible.min(total) as usize;
+        if *cursor_ref >= self.scroll_offset + max_v {
+            self.scroll_offset = *cursor_ref + 1 - max_v;
+        }
+        if *cursor_ref < self.scroll_offset {
+            self.scroll_offset = *cursor_ref;
+        }
+    }
+
+    pub fn current_mode_count(&self) -> usize {
         if self.device_cursor == 0 { 0 }
         else { self.devices[self.device_cursor - 1].modes.len() }
     }
@@ -796,6 +894,10 @@ pub struct OverlaySettings {
     pub show_fps:     Toggle,
     pub fullscreen:   Toggle,
     pub undo_limit:   usize,
+    /// Renderer name (e.g. "hardware (accelerated)" / "software (fallback)").
+    /// Populated at startup for diagnostics; not currently rendered in
+    /// the settings panel but kept so operators can `grep` it from logs.
+    #[allow(dead_code)]
     pub renderer_info: String,
     pub scroll_offset: usize,
 }
@@ -1066,42 +1168,46 @@ pub enum OverlayAction { None, Close, ToggleFullscreen }
 pub fn render_text(
     sdl: &mut SdlCanvas<Window>,
     font: &Font,
-    tc: &sdl2::render::TextureCreator<sdl2::video::WindowContext>,
+    tc: &TextureCreator<WindowContext>,
     cache: &mut TextCache,
     text: &str,
     color: Color,
     dst: Rect,
 ) {
     if text.is_empty() { return; }
-    let surface = cache.surface(font, text, color);
-    let texture = match tc.create_texture_from_surface(surface) { Ok(t) => t, Err(_) => return };
+    let texture = match cache.texture(tc, font, text, color) {
+        Some(t) => t,
+        None => return,
+    };
     let q = texture.query();
     let tw = q.width.min(dst.width()) as i32;
     let th = q.height.min(dst.height()) as i32;
     let src  = Rect::new(0, 0, tw as u32, th as u32);
     let dest = Rect::new(dst.x + 4, dst.y + (dst.height() as i32 - th) / 2, tw as u32, th as u32);
-    sdl.copy(&texture, src, dest).ok();
+    sdl.copy(texture, src, dest).ok();
 }
 
 /// Render text horizontally and vertically centred within `dst` (for icon buttons).
 pub fn render_text_centered(
     sdl: &mut SdlCanvas<Window>,
     font: &Font,
-    tc: &sdl2::render::TextureCreator<sdl2::video::WindowContext>,
+    tc: &TextureCreator<WindowContext>,
     cache: &mut TextCache,
     text: &str,
     color: Color,
     dst: Rect,
 ) {
     if text.is_empty() { return; }
-    let surface = cache.surface(font, text, color);
-    let texture = match tc.create_texture_from_surface(surface) { Ok(t) => t, Err(_) => return };
+    let texture = match cache.texture(tc, font, text, color) {
+        Some(t) => t,
+        None => return,
+    };
     let q = texture.query();
     let tw = q.width.min(dst.width()) as i32;
     let th = q.height.min(dst.height()) as i32;
     let src  = Rect::new(0, 0, tw as u32, th as u32);
     let dest = Rect::new(dst.x + (dst.width() as i32 - tw) / 2, dst.y + (dst.height() as i32 - th) / 2, tw as u32, th as u32);
-    sdl.copy(&texture, src, dest).ok();
+    sdl.copy(texture, src, dest).ok();
 }
 
 // ── UI trait ─────────────────────────────────────────────────────────────────
