@@ -254,6 +254,8 @@ impl MenuBar {
         has_undo: bool,
         has_redo: bool,
         show_fps: bool,
+        show_time: bool,
+        clock: &str,
         capture_fps: f32,
         display_fps: f32,
         cache: &mut TextCache,
@@ -293,6 +295,21 @@ impl MenuBar {
                 &fps_label,
                 Color::RGB(90, 180, 90),
                 self.fps_rect(canvas_w),
+            );
+        }
+
+        // Wall clock — centred in the top bar.
+        if show_time {
+            let label = clock.to_string();
+            let w = 120;
+            render_text(
+                sdl,
+                font,
+                &tc,
+                cache,
+                &label,
+                Color::RGB(200, 200, 200),
+                Rect::new((canvas_w - w) / 2, 0, w as u32, MENU_HEIGHT as u32),
             );
         }
 
@@ -1042,6 +1059,8 @@ pub struct OverlaySettings {
     pub laser_fade: f32,
     pub laser_on: Toggle,
     pub show_fps: Toggle,
+    pub show_time: Toggle,
+    pub hide_toolbar: Toggle,
     pub fullscreen: Toggle,
     pub undo_limit: usize,
     /// Renderer name (e.g. "hardware (accelerated)" / "software (fallback)").
@@ -1061,7 +1080,7 @@ impl OverlaySettings {
     const SLIDER_MAX: f32 = 3.0;
     const UNDO_MIN: usize = 5;
     const UNDO_MAX: usize = 100;
-    const COUNT: usize = 5;
+    const COUNT: usize = 7;
 
     fn visible_rows(&self, canvas_h: i32) -> usize {
         let avail_h = canvas_h - 40;
@@ -1134,6 +1153,14 @@ impl OverlaySettings {
                 true
             }
             3 => {
+                self.show_time.next();
+                true
+            }
+            4 => {
+                self.hide_toolbar.next();
+                true
+            }
+            5 => {
                 let step = 5;
                 if right {
                     self.undo_limit = self.undo_limit.saturating_add(step).min(Self::UNDO_MAX);
@@ -1142,7 +1169,7 @@ impl OverlaySettings {
                 }
                 true
             }
-            4 => {
+            6 => {
                 self.fullscreen.next();
                 true
             }
@@ -1152,7 +1179,7 @@ impl OverlaySettings {
 
     pub fn enter(&mut self) -> OverlayAction {
         match self.cursor {
-            4 => OverlayAction::ToggleFullscreen,
+            6 => OverlayAction::ToggleFullscreen,
             _ => OverlayAction::None,
         }
     }
@@ -1392,6 +1419,66 @@ impl OverlaySettings {
                         font,
                         &tc,
                         cache,
+                        "Show time",
+                        label_col,
+                        Rect::new(label_x, ry + 4, 200, 24),
+                    );
+                    let on_str = if self.show_time == Toggle::On {
+                        "ON"
+                    } else {
+                        "OFF"
+                    };
+                    let on_col = if self.show_time == Toggle::On {
+                        Color::RGB(80, 220, 80)
+                    } else {
+                        Color::RGB(180, 80, 80)
+                    };
+                    render_text(
+                        sdl,
+                        font,
+                        &tc,
+                        cache,
+                        on_str,
+                        on_col,
+                        Rect::new(val_x, ry + 4, 80, 24),
+                    );
+                }
+                4 => {
+                    render_text(
+                        sdl,
+                        font,
+                        &tc,
+                        cache,
+                        "Hide toolbar",
+                        label_col,
+                        Rect::new(label_x, ry + 4, 200, 24),
+                    );
+                    let on_str = if self.hide_toolbar == Toggle::On {
+                        "ON"
+                    } else {
+                        "OFF"
+                    };
+                    let on_col = if self.hide_toolbar == Toggle::On {
+                        Color::RGB(80, 220, 80)
+                    } else {
+                        Color::RGB(180, 80, 80)
+                    };
+                    render_text(
+                        sdl,
+                        font,
+                        &tc,
+                        cache,
+                        on_str,
+                        on_col,
+                        Rect::new(val_x, ry + 4, 80, 24),
+                    );
+                }
+                5 => {
+                    render_text(
+                        sdl,
+                        font,
+                        &tc,
+                        cache,
                         "Undo depth",
                         label_col,
                         Rect::new(label_x, ry + 4, 200, 24),
@@ -1424,7 +1511,7 @@ impl OverlaySettings {
                         Rect::new(bar_x + bar_w + 4, bar_y - 4, 72, bar_h as u32 + 8),
                     );
                 }
-                4 => {
+                6 => {
                     render_text(
                         sdl,
                         font,

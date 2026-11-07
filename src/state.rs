@@ -337,17 +337,20 @@ impl AppState {
             });
         }
 
-        let (laser_on, laser_fade, show_fps, undo_limit) = match &self.settings {
-            Some(s) => (
-                s.laser_on.as_bool(),
-                // Round to the slider's 0.1 step and store as f64 — f32 1.2
-                // would serialize as 1.2000000476837158 on the wire.
-                ((s.laser_fade as f64) * 10.0).round() / 10.0,
-                s.show_fps.as_bool(),
-                s.undo_limit,
-            ),
-            None => (true, 1.2, false, self.scene.undo_limit),
-        };
+        let (laser_on, laser_fade, show_fps, show_time, hide_toolbar, undo_limit) =
+            match &self.settings {
+                Some(s) => (
+                    s.laser_on.as_bool(),
+                    // Round to the slider's 0.1 step and store as f64 — f32 1.2
+                    // would serialize as 1.2000000476837158 on the wire.
+                    ((s.laser_fade as f64) * 10.0).round() / 10.0,
+                    s.show_fps.as_bool(),
+                    s.show_time.as_bool(),
+                    s.hide_toolbar.as_bool(),
+                    s.undo_limit,
+                ),
+                None => (true, 1.2, false, false, false, self.scene.undo_limit),
+            };
 
         StateSnapshot {
             api_version: "1",
@@ -367,6 +370,8 @@ impl AppState {
             laser_on,
             laser_fade,
             show_fps,
+            show_time,
+            hide_toolbar,
             undo_limit,
             can_undo: !self.scene.undo_stack.is_empty(),
             can_redo: !self.scene.redo_stack.is_empty(),
@@ -418,6 +423,8 @@ pub struct StateSnapshot {
     /// Seconds; f64 (not f32) so serde_json emits clean decimals like 1.2.
     pub laser_fade: f64,
     pub show_fps: bool,
+    pub show_time: bool,
+    pub hide_toolbar: bool,
     pub undo_limit: usize,
     pub can_undo: bool,
     pub can_redo: bool,

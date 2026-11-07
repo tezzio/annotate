@@ -16,6 +16,12 @@ windowed   = false
 # Undo / redo history depth
 undo_stack_limit = 20
 
+# Show the wall-clock time in the middle of the top bar (HH:MM).
+show_time = false
+
+# Hide the tool rail on the left-hand side entirely.
+hide_toolbar = false
+
 # Default capture device.  Leave commented to show the picker on every launch.
 # device_path = "/dev/video0"
 

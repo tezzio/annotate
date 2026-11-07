@@ -51,6 +51,9 @@ std::thread_local! {
 
 fn main() {
     let cfg = config::load();
+    // Captured before `cfg` is moved into the state.
+    let cfg_show_time = cfg.show_time;
+    let cfg_hide_toolbar = cfg.hide_toolbar;
 
     // ── SDL2 init ──────────────────────────────────────────────────────────
     let sdl_context = sdl2::init().expect("SDL2 init");
@@ -157,6 +160,10 @@ fn main() {
     let pipeline = RenderPipeline::new(canvas_w, canvas_h);
     let mut pipeline_seq: u64 = 0;
 
+    // Top-bar clock.  Recomputed at most once a second.
+    let mut clock_label = String::new();
+    let mut clock_updated = Instant::now();
+
     // ── Video texture (double-buffered) ────────────────────────────────────
     // A single streaming texture produces a subtle horizontal tear line with
     // USB HDMI capture cards because their frame delivery is jittery relative
@@ -198,6 +205,8 @@ fn main() {
         laser_fade: 1.2,
         laser_on: Toggle::On,
         show_fps: Toggle::On,
+        show_time: Toggle::from_bool(cfg_show_time),
+        hide_toolbar: Toggle::from_bool(cfg_hide_toolbar),
         fullscreen: Toggle::from_bool(state.is_fullscreen),
         undo_limit,
         renderer_info,
@@ -303,6 +312,7 @@ fn main() {
                     } => match *k {
                         sdl2::keyboard::Keycode::Escape => {
                             state.show_settings_overlay = false;
+                            save_settings(&mut state);
                             state.mark_snapshot_dirty();
                         }
                         sdl2::keyboard::Keycode::Up => {
@@ -331,6 +341,7 @@ fn main() {
                                 if action == OverlayAction::ToggleFullscreen {
                                     state.toggle_fullscreen = true;
                                     state.show_settings_overlay = false;
+                                    save_settings(&mut state);
                                     state.mark_snapshot_dirty();
                                 }
                             }
@@ -345,11 +356,13 @@ fn main() {
                             match action {
                                 OverlayAction::Close => {
                                     state.show_settings_overlay = false;
+                                    save_settings(&mut state);
                                     state.mark_snapshot_dirty();
                                 }
                                 OverlayAction::ToggleFullscreen => {
                                     state.toggle_fullscreen = true;
                                     state.show_settings_overlay = false;
+                                    save_settings(&mut state);
                                     state.mark_snapshot_dirty();
                                 }
                                 OverlayAction::None => {}
@@ -935,18 +948,25 @@ fn main() {
             );
         }
 
-        // Tool rail (V2)
-        ui::v2::draw_v2_toolbar(
-            &mut sdl_canvas,
-            &font,
-            &icon_font,
-            &v2_layout,
-            state.active_tool,
-            state.color,
-            state.brush_size,
-            state.freeze_frame,
-            &mut text_cache,
-        );
+        // Tool rail (V2) — hidden when the setting is on.
+        let hide_toolbar = state
+            .settings
+            .as_ref()
+            .map(|s| s.hide_toolbar == Toggle::On)
+            .unwrap_or(false);
+        if !hide_toolbar {
+            ui::v2::draw_v2_toolbar(
+                &mut sdl_canvas,
+                &font,
+                &icon_font,
+                &v2_layout,
+                state.active_tool,
+                state.color,
+                state.brush_size,
+                state.freeze_frame,
+                &mut text_cache,
+            );
+        }
 
         // Device picker on top
         if state.show_device_picker
@@ -981,6 +1001,20 @@ fn main() {
             .as_ref()
             .map(|s| s.show_fps == Toggle::On)
             .unwrap_or(true);
+        let show_time = state
+            .settings
+            .as_ref()
+            .map(|s| s.show_time == Toggle::On)
+            .unwrap_or(false);
+        // The clock is only recomputed once a second; between ticks the
+        // previous label is reused.
+        if show_time {
+            let now = Instant::now();
+            if now.duration_since(clock_updated) >= Duration::from_secs(1) {
+                clock_label = format_clock(now);
+                clock_updated = now;
+            }
+        }
         menu_bar.draw(
             &mut sdl_canvas,
             &font,
@@ -988,6 +1022,8 @@ fn main() {
             !state.scene.undo_stack.is_empty(),
             !state.scene.redo_stack.is_empty(),
             show_fps,
+            show_time,
+            &clock_label,
             capture_fps,
             display_fps,
             &mut text_cache,
@@ -1031,6 +1067,36 @@ fn main() {
 /// `overlay_src` is the screen rect that the annotation overlay covers
 /// (i.e. below the menu bar, above the toolbar); the active stroke is
 /// clipped to this rect because that's where the user is drawing.
+/// Write the settings panel's values back to the config file so that
+/// they survive a restart.
+fn save_settings(state: &mut state::AppState) {
+    let Some(s) = &state.settings else {
+        return;
+    };
+    state.cfg.show_time = s.show_time == Toggle::On;
+    state.cfg.hide_toolbar = s.hide_toolbar == Toggle::On;
+    state.cfg.laser_on = s.laser_on == Toggle::On;
+    state.cfg.show_fps = s.show_fps == Toggle::On;
+    state.cfg.undo_stack_limit = s.undo_limit;
+    if let Err(e) = config::save(&state.cfg) {
+        eprintln!("[annotator] could not save settings: {e}");
+    }
+}
+
+/// Format the current local time as HH:MM for the top-bar clock.
+///
+/// The system clock is read through libc rather than a date-time crate:
+/// the application needs one label once a second, and adding a
+/// dependency for that would be more than the feature is worth.
+fn format_clock(_since_start: Instant) -> String {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    if now == -1 || unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
+        return String::new();
+    }
+    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+}
+
 fn draw_active_stroke(
     sdl: &mut sdl2::render::Canvas<sdl2::video::Window>,
     active: &DrawObject,

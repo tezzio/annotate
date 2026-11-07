@@ -39,6 +39,22 @@ pub struct Config {
     #[serde(default = "default_undo_stack_limit")]
     pub undo_stack_limit: usize,
 
+    /// Show the wall-clock time in the middle of the top bar.
+    #[serde(default)]
+    pub show_time: bool,
+
+    /// Hide the toolbar / side rail entirely.
+    #[serde(default)]
+    pub hide_toolbar: bool,
+
+    /// Leave a trail behind the laser pointer.
+    #[serde(default = "default_laser_on")]
+    pub laser_on: bool,
+
+    /// Show the frame-rate counter in the top bar.
+    #[serde(default)]
+    pub show_fps: bool,
+
     /// REST API settings (`[api]` section) — Crestron / remote control
     #[serde(default)]
     pub api: ApiConfig,
@@ -92,6 +108,9 @@ fn default_tool_size() -> u32 {
 fn default_undo_stack_limit() -> usize {
     20
 }
+fn default_laser_on() -> bool {
+    true
+}
 fn default_api_enabled() -> bool {
     true
 }
@@ -114,6 +133,10 @@ impl Default for Config {
             tool_color: default_tool_color(),
             tool_size: default_tool_size(),
             undo_stack_limit: default_undo_stack_limit(),
+            show_time: false,
+            hide_toolbar: false,
+            laser_on: default_laser_on(),
+            show_fps: false,
             api: ApiConfig::default(),
 
             users: vec![User {
@@ -144,15 +167,6 @@ fn verify_password(password: &str, hash: &str) -> bool {
 }
 
 impl Config {
-    pub fn find_user(&self, username: &str) -> Option<&User> {
-        self.users.iter().find(|u| u.username == username)
-    }
-
-    pub fn verify_credentials(&self, username: &str, password: &str) -> Option<&User> {
-        self.find_user(username)
-            .filter(|u| u.verify_password(password))
-    }
-
     /// Whether the configuration holds more users than the portal allows.
     /// Only the first [`MAX_USERS`] are used; the rest are ignored so that
     /// a hand-edited file cannot quietly widen the account list.
@@ -256,7 +270,9 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.users.len(), 1);
         assert!(cfg.users[0].is_admin);
-        assert!(cfg.verify_credentials("admin", "admin").is_some());
+        let admin = &cfg.active_users()[0];
+        assert_eq!(admin.username, "admin");
+        assert!(admin.verify_password("admin"));
     }
 
     #[test]
