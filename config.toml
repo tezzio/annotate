@@ -28,6 +28,21 @@ tool_color = "ffffff"
 # Default brush / stroke size in pixels
 tool_size = 4
 
+# Web portal users — one administrator plus up to four more.
+#
+# The password_hash is a salted SHA-256 of the password.  To set a
+# password, generate the hash for it:
+#
+#   printf 'newpassword' | sha256sum
+#
+# ...and copy that digest into password_hash below.  The default
+# administrator is admin / admin.
+#
+# [[users]]
+# username = "admin"
+# password_hash = "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918"
+# is_admin = true
+
 # REST API for Crestron / remote control (see docs/crestron-rest-api-plan.md)
 # Plain HTTP, LAN-scoped; control endpoints also accept GET query strings.
 [api]

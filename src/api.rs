@@ -333,7 +333,15 @@ fn route(
             let p = params(req);
             let username = p.get("username").cloned().unwrap_or_default();
             let password = p.get("password").cloned().unwrap_or_default();
-            if let Some(user) = cfg.verify_credentials(&username, &password) {
+            // Only the users within the cap are honoured, so an
+            // over-long list in the config file cannot widen the
+            // account set.
+            let user = cfg
+                .active_users()
+                .iter()
+                .find(|u| u.username == username && u.verify_password(&password))
+                .cloned();
+            if let Some(user) = user {
                 let token = generate_token();
                 sessions
                     .write()

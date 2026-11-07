@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
+/// The web portal allows one administrator plus four additional users.
+pub const MAX_USERS: usize = 5;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Web portal users (admin + up to 4 additional)
@@ -149,6 +152,18 @@ impl Config {
         self.find_user(username)
             .filter(|u| u.verify_password(password))
     }
+
+    /// Whether the configuration holds more users than the portal allows.
+    /// Only the first [`MAX_USERS`] are used; the rest are ignored so that
+    /// a hand-edited file cannot quietly widen the account list.
+    pub fn users_exceed_limit(&self) -> bool {
+        self.users.len() > MAX_USERS
+    }
+
+    /// The users that are actually honoured, capped at [`MAX_USERS`].
+    pub fn active_users(&self) -> &[User] {
+        &self.users[..self.users.len().min(MAX_USERS)]
+    }
 }
 
 impl Default for ApiConfig {
@@ -175,7 +190,15 @@ pub fn load() -> Config {
     if path.exists() {
         match fs::read_to_string(&path) {
             Ok(s) => match toml::from_str::<Config>(&s) {
-                Ok(cfg) => return cfg,
+                Ok(cfg) => {
+                    if cfg.users_exceed_limit() {
+                        eprintln!(
+                            "Warning: config lists {} users; only the first {MAX_USERS} are used",
+                            cfg.users.len()
+                        );
+                    }
+                    return cfg;
+                }
                 Err(e) => eprintln!("Warning: could not parse config ({e}); using defaults"),
             },
             Err(e) => eprintln!("Warning: could not read config ({e}); using defaults"),
@@ -214,4 +237,51 @@ pub fn parse_color(hex: &str) -> (u8, u8, u8) {
         );
     }
     (255, 255, 255)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(name: &str) -> User {
+        User {
+            username: name.to_string(),
+            password_hash: hash_password(name),
+            is_admin: false,
+        }
+    }
+
+    #[test]
+    fn default_config_has_one_admin() {
+        let cfg = Config::default();
+        assert_eq!(cfg.users.len(), 1);
+        assert!(cfg.users[0].is_admin);
+        assert!(cfg.verify_credentials("admin", "admin").is_some());
+    }
+
+    #[test]
+    fn active_users_are_capped_at_five() {
+        let mut cfg = Config::default();
+        assert!(!cfg.users_exceed_limit());
+        for i in 0..7 {
+            cfg.users.push(user(&format!("u{i}")));
+        }
+        assert!(cfg.users_exceed_limit());
+        assert_eq!(cfg.active_users().len(), MAX_USERS);
+    }
+
+    #[test]
+    fn credentials_outside_the_cap_are_ignored() {
+        let mut cfg = Config::default();
+        // Six extra users push the last one past the cap.
+        for i in 0..6 {
+            cfg.users.push(user(&format!("u{i}")));
+        }
+        let beyond = &cfg.users[MAX_USERS];
+        assert!(
+            cfg.active_users()
+                .iter()
+                .all(|u| u.username != beyond.username)
+        );
+    }
 }
