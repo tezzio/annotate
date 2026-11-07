@@ -375,7 +375,7 @@ fn handle_move(mx: i32, my: i32, state: &mut AppState, canvas: &mut Canvas) {
                 // but uses a partial-rect upload driven by the bbox in
                 // `state.eraser_dirty_*` — so each drag point only uploads
                 // a few KB of GPU texture data, not the full 8.3 MB
-                // (TODO 5 in perf-todos.md flagged full uploads as the
+                // (full uploads were flagged as the
                 // main per-frame cost).  The scene-mutation + baked_bg
                 // update happens in `Scene::erase_path` on release.
                 let r = drag.radius as i32;

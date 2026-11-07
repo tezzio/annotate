@@ -29,7 +29,7 @@ pub mod v2;
 /// Per-(font, text, color) cache of the rendered glyph surface and its GPU
 /// `Texture`.
 ///
-/// **TODO 1** in `docs/perf-todos.md`: previously only the surface was
+/// Previously only the surface was
 /// cached; `tc.create_texture_from_surface()` was called every frame for
 /// every label, recreating and destroying an `SDL_Texture` ~24× per frame.
 /// That costs ~0.5–1.5 ms per call on RPi3's software-shader GLES2
@@ -125,7 +125,7 @@ impl TextCache {
 
 /// Stable &str codepoints for tool icons, indexed by [`Tool::index`].
 /// Used to avoid per-frame `String` allocations in the V2 toolbar loop
-/// (TODO 3 in perf-todos.md).  Replaces the older `tool_fa_icon` helper
+/// Replaces the older `tool_fa_icon` helper
 /// which returned a `char` and required `.to_string()` per call.
 pub const TOOL_ICONS: [&str; 10] = [
     "\u{f304}", // Pen

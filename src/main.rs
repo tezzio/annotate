@@ -32,7 +32,7 @@ use ui::{
 
 // ── Application state ─────────────────────────────────────────────────────────
 // `AppState` lives in `state.rs` — one definition shared by the UI, the
-// render loop, and the REST API (docs/crestron-rest-api-plan.md, Appendix B).
+// render loop, and the REST API (ROADMAP.md).
 
 // ── Embedded fonts ────────────────────────────────────────────────────────────
 
@@ -40,7 +40,7 @@ const FONT_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/DejaVuSans.t
 const ICON_FONT_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa-solid.otf"));
 
 // ── Per-thread scratch buffers ─────────────────────────────────────────────────
-// TODO 8 — `Vec<Point>` allocations inside the render loop (eraser preview,
+// `Vec<Point>` allocations inside the render loop (eraser preview,
 // Circle shape preview) used to allocate per frame.  We reuse a thread-local
 // buffer instead.
 std::thread_local! {
@@ -141,9 +141,9 @@ fn main() {
     // `committed_canvas` is the input sink: the eraser and text-blit
     // handlers write into it directly.  `committed_tex` is the GPU
     // texture the renderer blits; its pixels are populated by the
-    // background rasterizer in `RenderPipeline` (TODO 9/10/11).
+    // background rasterizer in `RenderPipeline`.
     //
-    // The active stroke (TODO 5) no longer uses a separate CPU canvas —
+    // The active stroke no longer uses a separate CPU canvas —
     // it's drawn directly via SDL2 GPU primitives (see `draw_active_stroke`)
     // on top of `committed_tex`, avoiding an 8.3 MB GPU upload per frame
     // while drawing.
@@ -715,14 +715,14 @@ fn main() {
 
         // ── Annotation overlay ─────────────────────────────────────────
         // Two layers:
-        //   1. Committed scene — rasterized off-thread by `pipeline` (TODO
-        //      9 + 11).  When the scene becomes dirty OR the input has
-        //      written to `committed_canvas` (eraser/text-blit), we submit
-        //      a render job; the worker (TODO 11) rasterizes in the
-        //      background; the main thread (TODO 10) re-uploads the front
-        //      buffer to the GPU texture when the worker signals completion.
+        //   1. Committed scene — rasterized off-thread by `pipeline`.  When
+        //      the scene becomes dirty OR the input has written to
+        //      `committed_canvas` (eraser/text-blit), we submit a render
+        //      job; the worker rasterizes in the background; the main
+        //      thread re-uploads the front buffer to the GPU texture when
+        //      the worker signals completion.
         //   2. Active stroke — drawn directly via SDL2 GPU primitives on
-        //      top of `committed_tex` (TODO 5).  No CPU canvas, no 8.3 MB
+        //      top of `committed_tex`.  No CPU canvas, no 8.3 MB
         //      upload per frame.
         let overlay_src = Rect::new(
             0,
@@ -737,8 +737,8 @@ fn main() {
         // upload `committed_canvas` to the GPU texture each frame.
         //
         // IMPORTANT: we upload ONLY the bounding box of pixels touched
-        // since the last upload, not the whole 8.3 MB.  TODO 5 in
-        // perf-todos.md flagged full-canvas uploads as the dominant
+        // since the last upload, not the whole 8.3 MB.  Full-canvas
+        // uploads were flagged as the dominant
         // per-frame CPU↔GPU traffic cost (~500 MB/s on a 1080p stream);
         // on RPi3/R6A that's enough to drop a few fps by itself.  The
         // partial-rect upload costs O(rect_area * 4) bytes — a few KB
@@ -808,7 +808,7 @@ fn main() {
             .copy(&committed_tex, overlay_src, overlay_src)
             .ok();
 
-        // Layer 2: active stroke — direct GPU primitives (TODO 5).
+        // Layer 2: active stroke — direct GPU primitives.
         if let Some(ref active) = state.active_stroke {
             draw_active_stroke(&mut sdl_canvas, active, overlay_src);
         }
@@ -1032,7 +1032,7 @@ fn main() {
         sdl_canvas.present();
 
         // ── Publish API snapshot (HTTP threads only ever read it) ─────────
-        // TODO 4 — only rebuild the snapshot when something changed OR the
+        // Only rebuild the snapshot when something changed OR the
         // FPS counters drift past a 500 ms ceiling.  The HTTP API polls
         // < 1 Hz so a half-second staleness on `fps` / `capture_fps` is
         // imperceptible; everything else is rebuilt instantly on change.
@@ -1060,7 +1060,7 @@ fn main() {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// TODO 5 — render the active stroke (pen / highlight) directly via
+/// Render the active stroke (pen / highlight) directly via
 /// SDL2 GPU draw calls on top of `committed_tex`, instead of clearing +
 /// rasterizing an 8.3 MB CPU canvas and re-uploading it each frame.
 ///

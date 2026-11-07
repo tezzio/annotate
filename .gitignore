@@ -1,10 +1,6 @@
 # Build output
 /target
 
-# Private project tracking — not published
-/docs/
-/todos.txt
-
 # Local agent memory
 /memories
 

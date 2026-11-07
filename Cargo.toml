@@ -12,8 +12,8 @@ v4l          = "0.14"
 zune-jpeg    = { version = "0.4", default-features = false, features = ["x86", "neon", "std"] }
 zune-core    = { version = "0.4", default-features = false, features = ["std"] }
 libc         = "0.2"
-# Work-stealing thread pool for parallel scene rasterization (TODO 9) and
-# background commit (TODO 11).  Default features pull in std; no extra
+# Work-stealing thread pool for parallel scene rasterization and the
+# background rasterizer thread.  Default features pull in std; no extra
 # features required for our use case.
 rayon        = "1.10"
 serde        = { version = "1", features = ["derive"] }

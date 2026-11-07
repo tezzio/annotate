@@ -1,15 +1,15 @@
 //! Background-rasterized, double-buffered committed-canvas pipeline.
 //!
-//! Implements TODOs 10 and 11:
-//! * **TODO 10** — keeps two CPU `Canvas` buffers (`front` / `back`) and
-//!   swaps them atomically when the worker finishes rasterization, hiding
-//!   the GPU upload bus transfer behind CPU rasterization of the next frame.
-//! * **TODO 11** — moves committed-scene rasterization off the render
-//!   thread onto a single background worker.  The worker re-renders whenever
-//!   a new scene snapshot arrives; the main thread always blits the latest
-//!   `front` canvas without blocking on rasterization.
+//! Keeps two CPU `Canvas` buffers (`front` / `back`) and swaps them
+//! atomically when the worker finishes rasterization, hiding the GPU upload
+//! bus transfer behind CPU rasterization of the next frame.
 //!
-//! The active stroke (TODO 5) is *not* handled here — it stays on the
+//! Committed-scene rasterization runs off the render thread on a single
+//! background worker.  The worker re-renders whenever a new scene snapshot
+//! arrives; the main thread always blits the latest `front` canvas without
+//! blocking on rasterization.
+//!
+//! The active stroke is *not* handled here — it stays on the
 //! render thread because it changes every frame and there is no benefit
 //! to backgrounding it.
 //!
@@ -155,7 +155,7 @@ impl RenderPipeline {
         // Move the *cloned* scene into the slot.  We take ownership via
         // `Scene::clone()` — this is cheap relative to the 8.3 MB
         // baked_bg copy that the pipeline would otherwise pay on every
-        // commit if we shared via Arc.  See perf-todos.md TODO-arc-snapshot.
+        // commit if we shared via Arc.  See ROADMAP.md.
         {
             let mut slot = self.inner.pending.lock().unwrap();
             *slot = Some((*scene).clone());

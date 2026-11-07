@@ -67,7 +67,7 @@ pub struct User {
     pub is_admin: bool,
 }
 
-/// REST API configuration (see docs/crestron-rest-api-plan.md).
+/// REST API configuration (see ROADMAP.md).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
     /// Serve the API at all (kiosk deployments can turn it off)

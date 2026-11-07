@@ -49,7 +49,7 @@ tool_size = 4
 # password_hash = "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918"
 # is_admin = true
 
-# REST API for Crestron / remote control (see docs/crestron-rest-api-plan.md)
+# REST API for Crestron / remote control (see ROADMAP.md)
 # Plain HTTP, LAN-scoped; control endpoints also accept GET query strings.
 [api]
 enabled = true

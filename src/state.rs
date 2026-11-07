@@ -1,5 +1,5 @@
 //! Application state — single definition shared by the UI, the render loop,
-//! and the REST API (see docs/crestron-rest-api-plan.md, Appendix B).
+//! and the REST API (see ROADMAP.md).
 //!
 //! `AppState` is owned exclusively by the single-threaded SDL2 main loop.
 //! The API thread never touches it; instead the main loop publishes an
@@ -173,8 +173,8 @@ pub struct AppState {
     /// render loop reads + resets this to drive a partial
     /// `SDL_UpdateTexture(rect, …)` instead of a full 8.3 MB upload per
     /// drag frame — a major win on bandwidth-limited systems (RPi3 / R6A)
-    /// where TODO 5 in `perf-todos.md` flagged full-canvas uploads as
-    /// the dominant CPU↔GPU traffic cost.
+    /// where full-canvas uploads were flagged as the dominant CPU↔GPU
+    /// traffic cost.
     ///
     /// Sentinel values (`i32::MAX / i32::MIN`) mean "no wipes since last
     /// reset" and the upload is skipped.
@@ -241,11 +241,11 @@ pub struct AppState {
     /// Set whenever a field that contributes to [`StateSnapshot`] has been
     /// mutated.  The main loop clears it after publishing a fresh snapshot
     /// to the API threads; while it's false, [`AppState::to_snapshot`] is
-    /// not called.  See TODO 4 in perf-todos.md.
+    /// not called.  See ROADMAP.md.
     pub snapshot_dirty: bool,
 
     /// Wall-clock of the last published snapshot — used to throttle
-    /// periodic rebuilds of FPS-bearing fields (TODO 4).
+    /// periodic rebuilds of FPS-bearing fields.
     pub last_snapshot_publish: Instant,
 }
 

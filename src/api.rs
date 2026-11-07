@@ -1,6 +1,6 @@
 //! Minimal HTTP/1.1 REST API server — Crestron Pro3 integration.
 //!
-//! See docs/crestron-rest-api-plan.md.  Design constraints:
+//! See ROADMAP.md.  Design constraints:
 //! - std only: `TcpListener` + one short-lived thread per connection, no async.
 //! - Plain HTTP, `Connection: close` — one transaction per connection.
 //! - GET/POST only, 8 KiB request cap, 2 s socket timeouts.

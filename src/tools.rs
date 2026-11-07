@@ -106,7 +106,6 @@ pub fn draw_circle_fill(
 /// Draw a thick line from `(x0, y0)` to `(x1, y1)`.
 /// `thickness` is the full width of the line in pixels (radius = thickness/2).
 ///
-/// # TODO 7
 /// Previous implementation did a Bresenham walk and stamped a filled disc
 /// at every pixel — quadratic in segment length (a 200-pixel line wrote
 /// ~200 × π·r² ≈ 8000 `put_pixel` calls per commit, and a 50-stroke

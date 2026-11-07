@@ -11,7 +11,7 @@ use crate::{
     tools::{PALETTE, Tool},
 };
 
-// Static FontAwesome codepoints (TODO 3 — eliminates per-frame
+// Static FontAwesome codepoints (eliminates per-frame
 // `.to_string()` allocations in the V2 toolbar).
 const FREEZE_ICON_PAUSE: &str = "\u{f04b}";
 const FREEZE_ICON_PLAY: &str = "\u{f04c}";
