@@ -3,10 +3,9 @@ use std::sync::Arc;
 
 use crate::canvas::Canvas;
 use crate::tools::{
-    draw_circle_fill, draw_line, draw_rect_outline, draw_ellipse_outline,
-    draw_arrow, draw_highlight,
-    slice_circle_fill, slice_line, slice_rect_outline, slice_ellipse_outline,
-    slice_arrow, slice_highlight, SliceTarget,
+    SliceTarget, draw_arrow, draw_circle_fill, draw_ellipse_outline, draw_highlight, draw_line,
+    draw_rect_outline, slice_arrow, slice_circle_fill, slice_ellipse_outline, slice_highlight,
+    slice_line, slice_rect_outline,
 };
 use rayon::prelude::*;
 
@@ -15,16 +14,18 @@ use rayon::prelude::*;
 #[derive(Clone, Debug)]
 pub struct PenStroke {
     pub points: Vec<(i32, i32)>,
-    pub color:  (u8, u8, u8),
-    pub size:   u32,
+    pub color: (u8, u8, u8),
+    pub size: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct ShapeObj {
-    pub x0: i32, pub y0: i32,
-    pub x1: i32, pub y1: i32,
+    pub x0: i32,
+    pub y0: i32,
+    pub x1: i32,
+    pub y1: i32,
     pub color: (u8, u8, u8),
-    pub size:  u32,
+    pub size: u32,
 }
 
 /// Text annotation.  Currently dead because text rendering goes through
@@ -34,17 +35,17 @@ pub struct ShapeObj {
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct TextObj {
-    pub text:  String,
-    pub x:     i32,
-    pub y:     i32,
+    pub text: String,
+    pub x: i32,
+    pub y: i32,
     pub color: (u8, u8, u8),
 }
 
 #[derive(Clone, Debug)]
 pub struct HighlightStroke {
     pub points: Vec<(i32, i32)>,
-    pub color:  (u8, u8, u8),
-    pub size:   u32,
+    pub color: (u8, u8, u8),
+    pub size: u32,
 }
 
 /// Live (still-editable) drawing object.  Note that the eraser is *not*
@@ -72,7 +73,9 @@ impl DrawObject {
             DrawObject::Pen(s) => {
                 let (r, g, b) = s.color;
                 let rad = (s.size as i32 / 2).max(1);
-                if s.points.is_empty() { return; }
+                if s.points.is_empty() {
+                    return;
+                }
                 draw_circle_fill(canvas, s.points[0].0, s.points[0].1, rad, r, g, b, 255);
                 for i in 1..s.points.len() {
                     let (x0, y0) = s.points[i - 1];
@@ -121,7 +124,9 @@ impl DrawObject {
             DrawObject::Pen(st) => {
                 let (r, g, b) = st.color;
                 let rad = (st.size as i32 / 2).max(1);
-                if st.points.is_empty() { return; }
+                if st.points.is_empty() {
+                    return;
+                }
                 slice_circle_fill(s, st.points[0].0, st.points[0].1, rad, r, g, b, 255);
                 for i in 1..st.points.len() {
                     let (x0, y0) = st.points[i - 1];
@@ -164,7 +169,10 @@ impl DrawObject {
         match self {
             DrawObject::Pen(s) => points_bounds(&s.points, s.size as i32),
             DrawObject::Highlight(h) => points_bounds(&h.points, h.size as i32 * 2),
-            DrawObject::Line(s) | DrawObject::Rect(s) | DrawObject::Circle(s) | DrawObject::Arrow(s) => {
+            DrawObject::Line(s)
+            | DrawObject::Rect(s)
+            | DrawObject::Circle(s)
+            | DrawObject::Arrow(s) => {
                 let pad = s.size as i32;
                 let (lx, rx) = (s.x0.min(s.x1) - pad, s.x0.max(s.x1) + pad);
                 let (ty, by) = (s.y0.min(s.y1) - pad, s.y0.max(s.y1) + pad);
@@ -184,12 +192,31 @@ impl DrawObject {
     /// Translate (move) by (dx, dy).
     pub fn translate(&mut self, dx: i32, dy: i32) {
         match self {
-            DrawObject::Pen(s) => { for p in &mut s.points { p.0 += dx; p.1 += dy; } }
-            DrawObject::Highlight(h) => { for p in &mut h.points { p.0 += dx; p.1 += dy; } }
-            DrawObject::Line(s) | DrawObject::Rect(s) | DrawObject::Circle(s) | DrawObject::Arrow(s) => {
-                s.x0 += dx; s.y0 += dy; s.x1 += dx; s.y1 += dy;
+            DrawObject::Pen(s) => {
+                for p in &mut s.points {
+                    p.0 += dx;
+                    p.1 += dy;
+                }
             }
-            DrawObject::Text(t) => { t.x += dx; t.y += dy; }
+            DrawObject::Highlight(h) => {
+                for p in &mut h.points {
+                    p.0 += dx;
+                    p.1 += dy;
+                }
+            }
+            DrawObject::Line(s)
+            | DrawObject::Rect(s)
+            | DrawObject::Circle(s)
+            | DrawObject::Arrow(s) => {
+                s.x0 += dx;
+                s.y0 += dy;
+                s.x1 += dx;
+                s.y1 += dy;
+            }
+            DrawObject::Text(t) => {
+                t.x += dx;
+                t.y += dy;
+            }
         }
     }
 
@@ -207,9 +234,7 @@ impl DrawObject {
             let nx = cx.max(bx - pad);
             let ny = cy.max(by - pad);
             // Path point is inside (expanded) bounds.
-            if cx >= bx - pad && cx <= bx + bw + pad
-                && cy >= by - pad && cy <= by + bh + pad
-            {
+            if cx >= bx - pad && cx <= bx + bw + pad && cy >= by - pad && cy <= by + bh + pad {
                 return true;
             }
             // Segment from a previous path point to this one — covers fast
@@ -248,8 +273,8 @@ impl DrawObject {
                         if cur.len() >= 2 {
                             out.push(DrawObject::Pen(PenStroke {
                                 points: std::mem::take(&mut cur),
-                                color:  s.color,
-                                size:   s.size,
+                                color: s.color,
+                                size: s.size,
                             }));
                         } else {
                             cur.clear();
@@ -262,8 +287,8 @@ impl DrawObject {
                 if cur.len() >= 2 {
                     out.push(DrawObject::Pen(PenStroke {
                         points: cur,
-                        color:  s.color,
-                        size:   s.size,
+                        color: s.color,
+                        size: s.size,
                     }));
                 }
                 erase_outcome(out)
@@ -277,8 +302,8 @@ impl DrawObject {
                         if cur.len() >= 2 {
                             out.push(DrawObject::Highlight(HighlightStroke {
                                 points: std::mem::take(&mut cur),
-                                color:  h.color,
-                                size:   h.size,
+                                color: h.color,
+                                size: h.size,
                             }));
                         } else {
                             cur.clear();
@@ -290,8 +315,8 @@ impl DrawObject {
                 if cur.len() >= 2 {
                     out.push(DrawObject::Highlight(HighlightStroke {
                         points: cur,
-                        color:  h.color,
-                        size:   h.size,
+                        color: h.color,
+                        size: h.size,
                     }));
                 }
                 erase_outcome(out)
@@ -301,18 +326,26 @@ impl DrawObject {
                 // trims it.  Compute the closest point on the segment to
                 // any eraser disc; if within r, chop at that point.
                 if let Some(t) = segment_eraser_t(s.x0, s.y0, s.x1, s.y1, eraser_path, r) {
-                    if t < 0.02 { EraseResult::Removed }
-                    else if t > 0.98 { EraseResult::Removed }
-                    else {
+                    if t < 0.02 {
+                        EraseResult::Removed
+                    } else if t > 0.98 {
+                        EraseResult::Removed
+                    } else {
                         // Split: keep the (0..t) sub-segment.
                         let nx = s.x0 + ((s.x1 - s.x0) as f32 * t).round() as i32;
                         let ny = s.y0 + ((s.y1 - s.y0) as f32 * t).round() as i32;
                         EraseResult::Replaced(vec![DrawObject::Line(ShapeObj {
-                            x0: s.x0, y0: s.y0, x1: nx, y1: ny,
-                            color: s.color, size: s.size,
+                            x0: s.x0,
+                            y0: s.y0,
+                            x1: nx,
+                            y1: ny,
+                            color: s.color,
+                            size: s.size,
                         })])
                     }
-                } else { EraseResult::Unchanged }
+                } else {
+                    EraseResult::Unchanged
+                }
             }
             // Rect/Circle/Arrow: anything but a single, very precise corner
             // wipe is going to visibly damage the shape.  Match GIMP's
@@ -343,8 +376,8 @@ pub enum EraseResult {
 }
 
 fn erase_outcome(out: Vec<DrawObject>) -> EraseResult {
-        match out.len() {
-            0 => EraseResult::Removed,
+    match out.len() {
+        0 => EraseResult::Removed,
         _ => EraseResult::Replaced(out),
     }
 }
@@ -355,13 +388,17 @@ fn point_in_eraser(p: (i32, i32), path: &[(i32, i32)], r: i32) -> bool {
     for &(cx, cy) in path {
         let dx = p.0 - cx;
         let dy = p.1 - cy;
-        if dx * dx + dy * dy <= r2 { return true; }
+        if dx * dx + dy * dy <= r2 {
+            return true;
+        }
     }
     // Cover the case where consecutive path points are far apart (fast
     // drag): also check the segment between path points.
     if path.len() >= 2 {
         for w in path.windows(2) {
-            if point_near_segment(p, w[0], w[1], r) { return true; }
+            if point_near_segment(p, w[0], w[1], r) {
+                return true;
+            }
         }
     }
     false
@@ -392,40 +429,67 @@ fn point_near_segment(p: (i32, i32), a: (i32, i32), b: (i32, i32), r: i32) -> bo
 
 /// True if a segment intersects an axis-aligned rect.
 fn segment_intersects_rect(
-    x0: i32, y0: i32, x1: i32, y1: i32,
-    rl: i32, rt: i32, rr: i32, rb: i32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    rl: i32,
+    rt: i32,
+    rr: i32,
+    rb: i32,
 ) -> bool {
     // Cohen–Sutherland outcodes
     fn outcode(x: i32, y: i32, rl: i32, rt: i32, rr: i32, rb: i32) -> i32 {
         let mut c = 0;
-        if x <  rl { c |= 1; }
-        if x >  rr { c |= 2; }
-        if y <  rt { c |= 4; }
-        if y >  rb { c |= 8; }
+        if x < rl {
+            c |= 1;
+        }
+        if x > rr {
+            c |= 2;
+        }
+        if y < rt {
+            c |= 4;
+        }
+        if y > rb {
+            c |= 8;
+        }
         c
     }
-    let mut x0 = x0; let mut y0 = y0; let mut x1 = x1; let mut y1 = y1;
+    let mut x0 = x0;
+    let mut y0 = y0;
+    let mut x1 = x1;
+    let mut y1 = y1;
     let mut c0 = outcode(x0, y0, rl, rt, rr, rb);
     let mut c1 = outcode(x1, y1, rl, rt, rr, rb);
     loop {
-        if (c0 | c1) == 0 { return true; }
-        if (c0 & c1) != 0 { return false; }
+        if (c0 | c1) == 0 {
+            return true;
+        }
+        if (c0 & c1) != 0 {
+            return false;
+        }
         let c = if c0 != 0 { c0 } else { c1 };
         let (mx, my);
         if c & 1 != 0 {
-            mx = rl; my = y0 + (y1 - y0) * (rl - x0) / (x1 - x0).max(1);
+            mx = rl;
+            my = y0 + (y1 - y0) * (rl - x0) / (x1 - x0).max(1);
         } else if c & 2 != 0 {
-            mx = rr; my = y0 + (y1 - y0) * (rr - x0) / (x1 - x0).max(1);
+            mx = rr;
+            my = y0 + (y1 - y0) * (rr - x0) / (x1 - x0).max(1);
         } else if c & 4 != 0 {
-            my = rt; mx = x0 + (x1 - x0) * (rt - y0) / (y1 - y0).max(1);
+            my = rt;
+            mx = x0 + (x1 - x0) * (rt - y0) / (y1 - y0).max(1);
         } else {
-            my = rb; mx = x0 + (x1 - x0) * (rb - y0) / (y1 - y0).max(1);
+            my = rb;
+            mx = x0 + (x1 - x0) * (rb - y0) / (y1 - y0).max(1);
         }
         if c == c0 {
-            x0 = mx; y0 = my;
+            x0 = mx;
+            y0 = my;
             c0 = outcode(x0, y0, rl, rt, rr, rb);
         } else {
-            x1 = mx; y1 = my;
+            x1 = mx;
+            y1 = my;
             c1 = outcode(x1, y1, rl, rt, rr, rb);
         }
     }
@@ -435,14 +499,20 @@ fn segment_intersects_rect(
 /// at which the eraser disc first touches it, if any.  Returned t is the
 /// earliest erase point along the segment direction.
 fn segment_eraser_t(
-    x0: i32, y0: i32, x1: i32, y1: i32,
-    path: &[(i32, i32)], r: i32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    path: &[(i32, i32)],
+    r: i32,
 ) -> Option<f32> {
     let mut best_t: Option<f32> = None;
     let dx = (x1 - x0) as f32;
     let dy = (y1 - y0) as f32;
     let len2 = dx * dx + dy * dy;
-    if len2 < 1.0 { return None; }
+    if len2 < 1.0 {
+        return None;
+    }
     for _w in path.windows(2) {
         // Iterate samples along the segment and find the first one that
         // is within r of any eraser disc centre.
@@ -451,7 +521,9 @@ fn segment_eraser_t(
             let t = i as f32 / steps as f32;
             let sx = x0 as f32 + dx * t;
             let sy = y0 as f32 + dy * t;
-            if best_t.is_some_and(|bt| t >= bt) { continue; }
+            if best_t.is_some_and(|bt| t >= bt) {
+                continue;
+            }
             if point_in_eraser((sx.round() as i32, sy.round() as i32), path, r) {
                 best_t = Some(t);
             }
@@ -468,7 +540,9 @@ fn shape_touched(s: &ShapeObj, path: &[(i32, i32)], r: i32) -> bool {
     let (ty, by) = (s.y0.min(s.y1), s.y0.max(s.y1));
     let corners = [(lx, ty), (rx, ty), (rx, by), (lx, by)];
     for &c in &corners {
-        if point_in_eraser(c, path, r) { return true; }
+        if point_in_eraser(c, path, r) {
+            return true;
+        }
     }
     // Mid-edges.
     for &(cx, cy) in &[
@@ -477,14 +551,23 @@ fn shape_touched(s: &ShapeObj, path: &[(i32, i32)], r: i32) -> bool {
         ((lx + rx) / 2, by),
         (lx, (ty + by) / 2),
     ] {
-        if point_in_eraser((cx, cy), path, r) { return true; }
+        if point_in_eraser((cx, cy), path, r) {
+            return true;
+        }
     }
     // And the segment between consecutive eraser path points — fast drags.
     if path.len() >= 2 {
         for w in path.windows(2) {
-            if segment_intersects_rect(w[0].0, w[0].1, w[1].0, w[1].1,
-                                       lx - r, ty - r, rx + r, by + r)
-            {
+            if segment_intersects_rect(
+                w[0].0,
+                w[0].1,
+                w[1].0,
+                w[1].1,
+                lx - r,
+                ty - r,
+                rx + r,
+                by + r,
+            ) {
                 return true;
             }
         }
@@ -493,10 +576,17 @@ fn shape_touched(s: &ShapeObj, path: &[(i32, i32)], r: i32) -> bool {
 }
 
 fn points_bounds(pts: &[(i32, i32)], pad: i32) -> (i32, i32, i32, i32) {
-    if pts.is_empty() { return (0, 0, 0, 0); }
+    if pts.is_empty() {
+        return (0, 0, 0, 0);
+    }
     let (mut lx, mut ty) = pts[0];
     let (mut rx, mut by) = pts[0];
-    for &(x, y) in pts { lx = lx.min(x); ty = ty.min(y); rx = rx.max(x); by = by.max(y); }
+    for &(x, y) in pts {
+        lx = lx.min(x);
+        ty = ty.min(y);
+        rx = rx.max(x);
+        by = by.max(y);
+    }
     (lx - pad, ty - pad, rx - lx + pad * 2, by - ty + pad * 2)
 }
 
@@ -511,7 +601,7 @@ fn points_bounds(pts: &[(i32, i32)], pad: i32) -> (i32, i32, i32, i32) {
 /// instead of a deep copy.
 #[derive(Clone)]
 pub struct SceneInner {
-    pub objects:  Vec<DrawObject>,
+    pub objects: Vec<DrawObject>,
     /// Wrapped in `Arc` so the (potentially 8.3 MB) pixel buffer is
     /// reference-counted; only `bake_from_canvas` actually owns the pixels.
     pub baked_bg: Option<Arc<BakedLayer>>,
@@ -527,7 +617,7 @@ pub(crate) type Snapshot = Arc<SceneInner>;
 /// is cleared — so they can't be selected/moved anymore, but undo still works.
 #[derive(Clone)]
 pub struct BakedLayer {
-    pub(crate) width:  u32,
+    pub(crate) width: u32,
     pub(crate) height: u32,
     /// RGBA bytes; length = `width * height * 4`.
     pub(crate) pixels: Vec<u8>,
@@ -538,17 +628,17 @@ pub struct Scene {
     /// mutation semantics so undo/redo/clear are O(1) in the common case
     /// (no other `Arc` holds a reference) and O(payload) only when the
     /// payload is shared with the undo or redo stack.
-    pub(crate) inner:     Arc<SceneInner>,
-    pub     undo_stack: VecDeque<Snapshot>,
-    pub     redo_stack: VecDeque<Snapshot>,
-    pub     undo_limit: usize,
+    pub(crate) inner: Arc<SceneInner>,
+    pub undo_stack: VecDeque<Snapshot>,
+    pub redo_stack: VecDeque<Snapshot>,
+    pub undo_limit: usize,
     /// Index of the selected object, if any.
     /// Indices of all currently-selected live objects.  Always sorted and
     /// de-duplicated.  An empty vec means "nothing selected".  The Select
     /// tool can hold multiple indices simultaneously — see input.rs.
-    pub     selected:   Vec<usize>,
+    pub selected: Vec<usize>,
     /// Set whenever the scene is modified; cleared by render_to().
-    pub     dirty:      bool,
+    pub dirty: bool,
 }
 
 // `Scene: Clone` is now an `Arc::clone` plus two `VecDeque::clone`s (the
@@ -561,12 +651,12 @@ pub struct Scene {
 impl Clone for Scene {
     fn clone(&self) -> Self {
         Self {
-            inner:      Arc::clone(&self.inner),
+            inner: Arc::clone(&self.inner),
             undo_stack: self.undo_stack.clone(),
             redo_stack: self.redo_stack.clone(),
             undo_limit: self.undo_limit,
-            selected:   self.selected.clone(),
-            dirty:      self.dirty,
+            selected: self.selected.clone(),
+            dirty: self.dirty,
         }
     }
 }
@@ -574,15 +664,15 @@ impl Clone for Scene {
 impl Scene {
     pub fn new(undo_limit: usize) -> Self {
         Self {
-            inner:      Arc::new(SceneInner {
-                objects:  Vec::new(),
+            inner: Arc::new(SceneInner {
+                objects: Vec::new(),
                 baked_bg: None,
             }),
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
             undo_limit,
-            selected:   Vec::new(),
-            dirty:      true,
+            selected: Vec::new(),
+            dirty: true,
         }
     }
 
@@ -601,12 +691,16 @@ impl Scene {
         &mut Arc::make_mut(&mut self.inner).baked_bg
     }
 
-    pub fn objects(&self) -> &[DrawObject] { &self.inner.objects }
+    pub fn objects(&self) -> &[DrawObject] {
+        &self.inner.objects
+    }
     /// Read-only access to the baked background.  Reserved for future
     /// callers (e.g. screenshot utilities that want to export just the
     /// background layer).
     #[allow(dead_code)]
-    pub fn baked_bg(&self) -> Option<&BakedLayer> { self.inner.baked_bg.as_deref() }
+    pub fn baked_bg(&self) -> Option<&BakedLayer> {
+        self.inner.baked_bg.as_deref()
+    }
 
     fn snapshot(&self) -> Snapshot {
         Arc::clone(&self.inner)
@@ -614,7 +708,9 @@ impl Scene {
 
     pub fn push_undo(&mut self) {
         self.undo_stack.push_back(self.snapshot());
-        if self.undo_stack.len() > self.undo_limit { self.undo_stack.pop_front(); }
+        if self.undo_stack.len() > self.undo_limit {
+            self.undo_stack.pop_front();
+        }
         self.redo_stack.clear();
         self.dirty = true;
     }
@@ -624,18 +720,18 @@ impl Scene {
             self.redo_stack.push_back(self.snapshot());
             // `prev` is itself an `Arc<SceneInner>` — assign directly.  No
             // pixel copy, no object clone.
-            self.inner    = prev;
+            self.inner = prev;
             self.selected = Vec::new();
-            self.dirty    = true;
+            self.dirty = true;
         }
     }
 
     pub fn redo(&mut self) {
         if let Some(next) = self.redo_stack.pop_back() {
             self.undo_stack.push_back(self.snapshot());
-            self.inner    = next;
+            self.inner = next;
             self.selected = Vec::new();
-            self.dirty    = true;
+            self.dirty = true;
         }
     }
 
@@ -644,12 +740,12 @@ impl Scene {
         // Drop the live inner; subsequent mutations will rebuild via
         // Arc::make_mut.  For the common case (no other Arc shares this
         // inner) this is just a write — the old payload is freed.
-        self.inner    = Arc::new(SceneInner {
-            objects:  Vec::new(),
+        self.inner = Arc::new(SceneInner {
+            objects: Vec::new(),
             baked_bg: None,
         });
         self.selected = Vec::new();
-        self.dirty    = true;
+        self.dirty = true;
     }
 
     pub fn add(&mut self, obj: DrawObject) {
@@ -668,9 +764,16 @@ impl Scene {
     /// path is split at the eraser-disc boundary, keeping the surviving
     /// sub-strokes as separate objects so they remain selectable / movable.
     /// Returns `true` if anything was actually erased.
-    pub fn erase_path(&mut self, eraser_path: &[(i32, i32)], radius: u32, canvas: &mut Canvas) -> bool {
+    pub fn erase_path(
+        &mut self,
+        eraser_path: &[(i32, i32)],
+        radius: u32,
+        canvas: &mut Canvas,
+    ) -> bool {
         let r = radius as i32;
-        if r <= 0 || eraser_path.is_empty() { return false; }
+        if r <= 0 || eraser_path.is_empty() {
+            return false;
+        }
         self.push_undo();
 
         // 1. Walk the live objects list; replace in place with the (zero or
@@ -688,7 +791,9 @@ impl Scene {
                 }
                 match obj.apply_eraser(eraser_path, r) {
                     EraseResult::Unchanged => new_objects.push(obj),
-                    EraseResult::Removed   => { touched_live = true; }
+                    EraseResult::Removed => {
+                        touched_live = true;
+                    }
                     EraseResult::Replaced(repls) => {
                         touched_live = true;
                         new_objects.extend(repls);
@@ -734,7 +839,9 @@ impl Scene {
                         let dy = y - py_;
                         for x in xa..=xb {
                             let dx = x - px_;
-                            if dx * dx + dy * dy > r2 { continue; }
+                            if dx * dx + dy * dy > r2 {
+                                continue;
+                            }
                             let idx = ((y as u32 * bg.width + x as u32) * 4) as usize;
                             bg.pixels[idx + 3] = 0;
                         }
@@ -778,7 +885,7 @@ impl Scene {
     #[allow(dead_code)]
     pub fn bake_from_canvas(&mut self, canvas: &Canvas) {
         let bg = Arc::new(BakedLayer {
-            width:  canvas.width,
+            width: canvas.width,
             height: canvas.height,
             pixels: canvas.pixels.clone(),
         });
@@ -790,14 +897,16 @@ impl Scene {
         inner.baked_bg = Some(bg);
         inner.objects.clear();
         self.selected = Vec::new();
-        self.dirty    = true;
+        self.dirty = true;
     }
 
     /// Render the visible scene into `canvas` (clear first).  Composition
     /// order: `baked_bg` (direct pixel copy) → live `objects`.  No-op if the
     /// scene isn't dirty.
     pub fn render_to(&mut self, canvas: &mut Canvas) {
-        if !self.dirty { return; }
+        if !self.dirty {
+            return;
+        }
         canvas.clear();
         let baked_to_drop = if let Some(bg) = &self.inner.baked_bg {
             if bg.width == canvas.width && bg.height == canvas.height {
@@ -833,7 +942,9 @@ impl Scene {
     ///   are `&mut` operations on `Canvas` / `Scene` and we want callers to
     ///   decide when to commit the work (e.g. after a worker thread joins).
     pub fn render_to_par(&self, canvas: &mut Canvas) -> bool {
-        if !self.dirty { return false; }
+        if !self.dirty {
+            return false;
+        }
 
         // 1. Clear + baked_bg copy are cheap (~8.3 MB memset + 8.3 MB memcpy)
         //    and don't benefit from parallelization — do them inline on the
@@ -850,11 +961,11 @@ impl Scene {
         //    roughly-equal chunks; each rayon worker walks every object and
         //    bounds-checks against its own row range, so non-overlapping
         //    objects touch only their owning chunk.
-        let width     = canvas.width;
-        let height    = canvas.height;
-        let stride    = (width as usize) * 4;
+        let width = canvas.width;
+        let height = canvas.height;
+        let stride = (width as usize) * 4;
         let rows_total = (canvas.pixels.len() / stride) as u32;
-        let n_workers  = rayon::current_num_threads().max(1) as u32;
+        let n_workers = rayon::current_num_threads().max(1) as u32;
         let chunk_rows = (rows_total / n_workers).max(64);
 
         // `par_chunks_mut` gives each worker an exclusive `&mut [u8]` slice,
@@ -869,14 +980,14 @@ impl Scene {
             .enumerate()
             .for_each(|(chunk_idx, chunk)| {
                 let y_start = (chunk_idx as u32 * chunk_rows_u) as u32;
-                let rows    = (chunk.len() / stride_u) as u32;
+                let rows = (chunk.len() / stride_u) as u32;
                 // SAFETY: `chunk` is an exclusive `&mut [u8]` whose length
                 // is `rows * stride_u`.  We never read outside this range
                 // and `put_pixel` bounds-checks against `height`.
                 let slice = SliceTarget {
                     pixels: chunk.as_mut_ptr(),
                     stride: stride_u,
-                    width:  w,
+                    width: w,
                     height: h,
                     y_start,
                     rows,
@@ -918,7 +1029,9 @@ impl Scene {
     /// for selection state, but `select_toggle` will *remove* it).
     #[allow(dead_code)]
     pub fn select_add(&mut self, idx: usize) {
-        if idx >= self.inner.objects.len() { return; }
+        if idx >= self.inner.objects.len() {
+            return;
+        }
         if !self.selected.contains(&idx) {
             self.selected.push(idx);
             self.selected.sort_unstable();
@@ -928,10 +1041,17 @@ impl Scene {
     /// Toggle an index: add if absent, remove if present.  The selection
     /// stays sorted after a removal.
     pub fn select_toggle(&mut self, idx: usize) {
-        if idx >= self.inner.objects.len() { return; }
+        if idx >= self.inner.objects.len() {
+            return;
+        }
         match self.selected.iter().position(|&i| i == idx) {
-            Some(pos) => { self.selected.swap_remove(pos); }
-            None      => { self.selected.push(idx); self.selected.sort_unstable(); }
+            Some(pos) => {
+                self.selected.swap_remove(pos);
+            }
+            None => {
+                self.selected.push(idx);
+                self.selected.sort_unstable();
+            }
         }
     }
 
@@ -947,7 +1067,9 @@ impl Scene {
         let mut added = Vec::new();
         for (i, obj) in self.inner.objects.iter().enumerate() {
             let (bx, by_, bw, bh) = obj.bounds();
-            if bx + bw < lx || bx > rx || by_ + bh < ty || by_ > by { continue; }
+            if bx + bw < lx || bx > rx || by_ + bh < ty || by_ > by {
+                continue;
+            }
             if !self.selected.contains(&i) {
                 self.selected.push(i);
                 added.push(i);

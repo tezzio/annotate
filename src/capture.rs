@@ -1,13 +1,13 @@
-use std::{{
+use std::{
     path::PathBuf,
-    sync::{{
-        atomic::{AtomicBool, AtomicU32, Ordering},
-        mpsc::{sync_channel, Receiver, SyncSender},
+    sync::{
         Arc,
-    }},
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        mpsc::{Receiver, SyncSender, sync_channel},
+    },
     thread,
     time::Duration,
-}};
+};
 
 use v4l::{
     buffer::Type,
@@ -16,20 +16,24 @@ use v4l::{
     framesize::FrameSizeEnum,
     io::traits::CaptureStream,
     prelude::*,
-    video::{capture::Parameters, Capture},
+    video::{Capture, capture::Parameters},
 };
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
 #[derive(Clone, PartialEq)]
-pub enum FrameFormat { Rgb24, Yuyv, Yuv420 }
+pub enum FrameFormat {
+    Rgb24,
+    Yuyv,
+    Yuv420,
+}
 
 /// A video frame — either RGB24 (software path), YUYV (V4L2 hardware passthrough),
 /// or planar YUV420 (RTSP path, SDL2 IYUV texture).
 #[derive(Clone)]
 pub struct Frame {
-    pub data:   Arc<Vec<u8>>,
-    pub width:  u32,
+    pub data: Arc<Vec<u8>>,
+    pub width: u32,
     pub height: u32,
     pub format: FrameFormat,
 }
@@ -39,7 +43,12 @@ impl Frame {
     /// Wraps the buffer in `Arc` so the consumer can hold it cheaply
     /// while the capture thread reuses its ring slot for the next frame.
     pub fn from_owned(data: Vec<u8>, width: u32, height: u32, format: FrameFormat) -> Self {
-        Self { data: Arc::new(data), width, height, format }
+        Self {
+            data: Arc::new(data),
+            width,
+            height,
+            format,
+        }
     }
 }
 
@@ -47,28 +56,36 @@ impl Frame {
 #[derive(Clone, Debug)]
 pub struct CapMode {
     pub is_mjpeg: bool,
-    pub width:    u32,
-    pub height:   u32,
-    pub fps:      u32,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
 }
 
 impl CapMode {
     pub fn label(&self) -> String {
-        format!("{} {}×{} @{}fps",
+        format!(
+            "{} {}×{} @{}fps",
             if self.is_mjpeg { "MJPEG" } else { "YUYV" },
-            self.width, self.height, self.fps)
+            self.width,
+            self.height,
+            self.fps
+        )
     }
     fn fourcc(&self) -> FourCC {
-        if self.is_mjpeg { FourCC::new(b"MJPG") } else { FourCC::new(b"YUYV") }
+        if self.is_mjpeg {
+            FourCC::new(b"MJPG")
+        } else {
+            FourCC::new(b"YUYV")
+        }
     }
 }
 
 /// Describes a detected V4L2 device.
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
-    pub path:         PathBuf,
-    pub name:         String,
-    pub modes:        Vec<CapMode>,
+    pub path: PathBuf,
+    pub name: String,
+    pub modes: Vec<CapMode>,
     /// Pre-formatted one-liner derived from modes.
     pub caps_summary: String,
 }
@@ -88,9 +105,20 @@ pub fn enumerate_devices() -> Vec<DeviceInfo> {
                 let card = caps.card.trim_end_matches('\0').trim().to_string();
                 if !card.is_empty() {
                     let modes = query_device_modes(&path);
-                    if modes.is_empty() { continue; }  // no usable formats — hide this device
-                    let caps_summary = modes.iter().map(|m: &CapMode| m.label()).collect::<Vec<_>>().join("  ·  ");
-                    devices.push(DeviceInfo { path: path.clone(), name: card, modes, caps_summary });
+                    if modes.is_empty() {
+                        continue;
+                    } // no usable formats — hide this device
+                    let caps_summary = modes
+                        .iter()
+                        .map(|m: &CapMode| m.label())
+                        .collect::<Vec<_>>()
+                        .join("  ·  ");
+                    devices.push(DeviceInfo {
+                        path: path.clone(),
+                        name: card,
+                        modes,
+                        caps_summary,
+                    });
                 }
             }
         }
@@ -100,43 +128,60 @@ pub fn enumerate_devices() -> Vec<DeviceInfo> {
 
 /// Query all usable capture modes for a device without starting a stream.
 pub fn query_device_modes(path: &PathBuf) -> Vec<CapMode> {
-    let Ok(dev) = Device::with_path(path) else { return vec![]; };
-    let Ok(formats) = dev.enum_formats() else { return vec![]; };
+    let Ok(dev) = Device::with_path(path) else {
+        return vec![];
+    };
+    let Ok(formats) = dev.enum_formats() else {
+        return vec![];
+    };
 
     let fourcc_mjpeg = FourCC::new(b"MJPG");
-    let fourcc_yuyv  = FourCC::new(b"YUYV");
+    let fourcc_yuyv = FourCC::new(b"YUYV");
     let mut modes: Vec<CapMode> = Vec::new();
 
     for &(target_fourcc, is_mjpeg) in &[(fourcc_mjpeg, true), (fourcc_yuyv, false)] {
-        if !formats.iter().any(|f| f.fourcc == target_fourcc) { continue; }
+        if !formats.iter().any(|f| f.fourcc == target_fourcc) {
+            continue;
+        }
         let sizes = dev.enum_framesizes(target_fourcc).unwrap_or_default();
         for fs in &sizes {
             let candidates: Vec<(u32, u32)> = match &fs.size {
                 FrameSizeEnum::Discrete(d) => vec![(d.width, d.height)],
-                FrameSizeEnum::Stepwise(s) => {
-                    [(s.max_width, s.max_height), (1920, 1080), (1280, 720), (640, 480)]
-                        .iter()
-                        .filter(|&&(w, h)| w >= s.min_width && w <= s.max_width
-                                        && h >= s.min_height && h <= s.max_height)
-                        .copied().collect()
-                }
+                FrameSizeEnum::Stepwise(s) => [
+                    (s.max_width, s.max_height),
+                    (1920, 1080),
+                    (1280, 720),
+                    (640, 480),
+                ]
+                .iter()
+                .filter(|&&(w, h)| {
+                    w >= s.min_width && w <= s.max_width && h >= s.min_height && h <= s.max_height
+                })
+                .copied()
+                .collect(),
             };
             const ALLOWED_HEIGHTS: &[u32] = &[480, 720, 800, 1080];
             for (w, h) in candidates {
-                if !ALLOWED_HEIGHTS.contains(&h) { continue; }
+                if !ALLOWED_HEIGHTS.contains(&h) {
+                    continue;
+                }
                 // Collect every distinct fps the driver reports for this resolution
                 let fps_list: Vec<u32> = match dev.enum_frameintervals(target_fourcc, w, h) {
                     Ok(ivals) if !ivals.is_empty() => {
                         let mut fps_set = std::collections::BTreeSet::new();
                         for fi in &ivals {
                             let fp = match &fi.interval {
-                                FrameIntervalEnum::Discrete(frac) if frac.numerator > 0 =>
-                                    frac.denominator / frac.numerator,
-                                FrameIntervalEnum::Stepwise(s) if s.min.numerator > 0 =>
-                                    s.min.denominator / s.min.numerator,
+                                FrameIntervalEnum::Discrete(frac) if frac.numerator > 0 => {
+                                    frac.denominator / frac.numerator
+                                }
+                                FrameIntervalEnum::Stepwise(s) if s.min.numerator > 0 => {
+                                    s.min.denominator / s.min.numerator
+                                }
                                 _ => 0,
                             };
-                            if fp > 0 { fps_set.insert(fp); }
+                            if fp > 0 {
+                                fps_set.insert(fp);
+                            }
                         }
                         if fps_set.is_empty() {
                             vec![estimate_fps(is_mjpeg, w, h)]
@@ -147,20 +192,30 @@ pub fn query_device_modes(path: &PathBuf) -> Vec<CapMode> {
                     _ => vec![estimate_fps(is_mjpeg, w, h)],
                 };
                 for fps in fps_list {
-                    if !is_mjpeg && fps < 5 { continue; }
-                    modes.push(CapMode { is_mjpeg, width: w, height: h, fps });
+                    if !is_mjpeg && fps < 5 {
+                        continue;
+                    }
+                    modes.push(CapMode {
+                        is_mjpeg,
+                        width: w,
+                        height: h,
+                        fps,
+                    });
                 }
             }
         }
     }
 
     modes.sort_by(|a, b| {
-        b.is_mjpeg.cmp(&a.is_mjpeg)
+        b.is_mjpeg
+            .cmp(&a.is_mjpeg)
             .then((b.width * b.height).cmp(&(a.width * a.height)))
             .then(b.fps.cmp(&a.fps))
     });
     // Dedup only exact duplicates (same format + res + fps); keep different fps as separate modes
-    modes.dedup_by(|a, b| a.is_mjpeg == b.is_mjpeg && a.width == b.width && a.height == b.height && a.fps == b.fps);
+    modes.dedup_by(|a, b| {
+        a.is_mjpeg == b.is_mjpeg && a.width == b.width && a.height == b.height && a.fps == b.fps
+    });
     modes
 }
 
@@ -168,7 +223,9 @@ pub fn query_device_modes(path: &PathBuf) -> Vec<CapMode> {
 /// MJPEG is compressed so USB bandwidth is rarely a bottleneck — allow up to 60fps.
 /// YUYV is raw (2 bytes/pixel) — estimate based on USB 2.0 practical bandwidth (~42 MB/s).
 fn estimate_fps(is_mjpeg: bool, w: u32, h: u32) -> u32 {
-    if is_mjpeg { return 60; }
+    if is_mjpeg {
+        return 60;
+    }
     let bytes_per_frame = (w * h * 2) as u64;
     let usb2_bandwidth: u64 = 42_000_000; // ~42 MB/s practical USB 2.0 isochronous
     ((usb2_bandwidth / bytes_per_frame) as u32).clamp(1, 60)
@@ -244,11 +301,8 @@ fn tune_capture_thread() {
             if let Some(cpu) = picked {
                 let mut pin = MaybeUninit::<libc::cpu_set_t>::zeroed();
                 libc::CPU_SET(cpu, &mut *pin.as_mut_ptr());
-                if libc::pthread_setaffinity_np(
-                    libc::pthread_self(),
-                    cpuset_size,
-                    &*pin.as_ptr(),
-                ) == 0
+                if libc::pthread_setaffinity_np(libc::pthread_self(), cpuset_size, &*pin.as_ptr())
+                    == 0
                 {
                     eprintln!("capture: pinned to CPU {cpu}");
                 }
@@ -257,12 +311,7 @@ fn tune_capture_thread() {
 
         // 2. Try SCHED_FIFO 30 (real-time; needs CAP_SYS_NICE).
         let param = libc::sched_param { sched_priority: 30 };
-        if libc::pthread_setschedparam(
-            libc::pthread_self(),
-            libc::SCHED_FIFO,
-            &param,
-        ) == 0
-        {
+        if libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) == 0 {
             eprintln!("capture: SCHED_FIFO priority 30");
         } else {
             // 3. Fall back to nice(-5) via setpriority on our own TID.
@@ -276,33 +325,46 @@ fn tune_capture_thread() {
 
 // ── Internal capture loop ─────────────────────────────────────────────────────
 
-fn negotiate_format(dev: &Device, prefer_yuyv: bool, target_w: u32, target_h: u32, forced: Option<(FourCC, u32, u32)>) -> Option<v4l::Format> {
+fn negotiate_format(
+    dev: &Device,
+    prefer_yuyv: bool,
+    target_w: u32,
+    target_h: u32,
+    forced: Option<(FourCC, u32, u32)>,
+) -> Option<v4l::Format> {
     let fourcc_mjpeg = FourCC::new(b"MJPG");
-    let fourcc_yuyv  = FourCC::new(b"YUYV");
+    let fourcc_yuyv = FourCC::new(b"YUYV");
 
     // Build candidate list: forced entry first (if any), then the waterfall
     let waterfall: &[(FourCC, u32, u32)] = if prefer_yuyv {
         &[(fourcc_yuyv, 640, 480)]
     } else {
         &[
-            (fourcc_yuyv,  640,  480),
+            (fourcc_yuyv, 640, 480),
             (fourcc_mjpeg, target_w, target_h),
             (fourcc_mjpeg, 1280, 720),
-            (fourcc_mjpeg, 640,  480),
+            (fourcc_mjpeg, 640, 480),
         ]
     };
 
-    let forced_slice: [(FourCC, u32, u32); 1] = forced.map(|f| [f]).unwrap_or([(FourCC::new(b"MJPG"), 0, 0)]);
-    let iter: Box<dyn Iterator<Item=&(FourCC, u32, u32)>> = if forced.is_some() {
+    let forced_slice: [(FourCC, u32, u32); 1] =
+        forced
+            .map(|f| [f])
+            .unwrap_or([(FourCC::new(b"MJPG"), 0, 0)]);
+    let iter: Box<dyn Iterator<Item = &(FourCC, u32, u32)>> = if forced.is_some() {
         Box::new(forced_slice.iter().chain(waterfall.iter()))
     } else {
         Box::new(waterfall.iter())
     };
 
     for &(cc, w, h) in iter {
-        if w == 0 { continue; }  // skip placeholder
-        let Ok(mut fmt) = dev.format() else { continue; };
-        fmt.width  = w;
+        if w == 0 {
+            continue;
+        } // skip placeholder
+        let Ok(mut fmt) = dev.format() else {
+            continue;
+        };
+        fmt.width = w;
         fmt.height = h;
         fmt.fourcc = cc;
         if dev.set_format(&fmt).is_ok() {
@@ -338,7 +400,7 @@ fn capture_loop(
 
     // Derive initial negotiation hint from user's chosen mode
     let forced_mode = user_mode.as_ref().map(|m| (m.fourcc(), m.width, m.height));
-    let target_width  = user_mode.as_ref().map(|m| m.width).unwrap_or(1920);
+    let target_width = user_mode.as_ref().map(|m| m.width).unwrap_or(1920);
     let target_height = user_mode.as_ref().map(|m| m.height).unwrap_or(1080);
     let mut prefer_yuyv = user_mode.as_ref().map(|m| !m.is_mjpeg).unwrap_or(false);
     let mut first_attempt = true;
@@ -347,7 +409,9 @@ fn capture_loop(
         // Re-open the device on each attempt.  If the previous capture thread is still
         // releasing its V4L2 streaming session, VIDIOC_S_FMT or VIDIOC_STREAMON will
         // return EBUSY — check the stop flag then retry with a short sleep.
-        if stop.load(Ordering::Relaxed) { return; }
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
 
         let dev = match Device::with_path(&path) {
             Ok(d) => d,
@@ -358,8 +422,13 @@ fn capture_loop(
             }
         };
 
-        let fmt = match negotiate_format(&dev, prefer_yuyv, target_width, target_height,
-                                         if first_attempt { forced_mode } else { None }) {
+        let fmt = match negotiate_format(
+            &dev,
+            prefer_yuyv,
+            target_width,
+            target_height,
+            if first_attempt { forced_mode } else { None },
+        ) {
             Some(f) => f,
             None => {
                 eprintln!("capture: negotiate_format failed (device busy?), retrying...");
@@ -369,22 +438,32 @@ fn capture_loop(
         };
 
         // Request the user's chosen fps from the driver, up to 60 (best-effort; driver may adjust)
-        let target_fps = user_mode.as_ref().map(|m| m.fps).unwrap_or(60).min(60).max(1);
+        let target_fps = user_mode
+            .as_ref()
+            .map(|m| m.fps)
+            .unwrap_or(60)
+            .min(60)
+            .max(1);
         let params = Parameters::with_fps(target_fps);
         if let Err(e) = dev.set_params(&params) {
             eprintln!("capture: could not set {target_fps}fps: {e}");
         } else if let Ok(p) = dev.params() {
             let i = p.interval;
-            eprintln!("capture: frame interval set to {}/{}", i.numerator, i.denominator);
+            eprintln!(
+                "capture: frame interval set to {}/{}",
+                i.numerator, i.denominator
+            );
         }
 
         let is_mjpeg = fmt.fourcc == fourcc_mjpeg;
-        let cap_w    = fmt.width;
-        let cap_h    = fmt.height;
+        let cap_w = fmt.width;
+        let cap_h = fmt.height;
 
         eprintln!(
             "capture: {} {}x{} ({})",
-            path.display(), cap_w, cap_h,
+            path.display(),
+            cap_w,
+            cap_h,
             if is_mjpeg { "MJPEG" } else { "YUYV" }
         );
 
@@ -410,18 +489,16 @@ fn capture_loop(
         // capacity is preserved across iterations — the only allocation
         // is the very first one per format change.
         const RING_SIZE: usize = 3;
-        let slot_bytes = (cap_w as usize) * (cap_h as usize)
-            * if is_mjpeg { 3 } else { 2 };
-        let mut ring: [Vec<u8>; RING_SIZE] = std::array::from_fn(|_| {
-            Vec::with_capacity(slot_bytes.max(1))
-        });
+        let slot_bytes = (cap_w as usize) * (cap_h as usize) * if is_mjpeg { 3 } else { 2 };
+        let mut ring: [Vec<u8>; RING_SIZE] =
+            std::array::from_fn(|_| Vec::with_capacity(slot_bytes.max(1)));
         let mut ring_idx: usize = 0;
 
-        let mut frame_count        = 0u64;
-        let mut drop_count         = 0u64;
-        let mut decode_errors      = 0u64;
+        let mut frame_count = 0u64;
+        let mut drop_count = 0u64;
+        let mut decode_errors = 0u64;
         let mut consec_decode_errs = 0u32;
-        let mut stat_timer         = std::time::Instant::now();
+        let mut stat_timer = std::time::Instant::now();
 
         loop {
             let (buf, _meta) = match stream.next() {
@@ -429,7 +506,9 @@ fn capture_loop(
                 Err(e) => {
                     eprintln!("capture: stream.next() error: {e}");
                     // If the receiver is gone, stop
-                    if tx.try_send(None).is_err() { return; }
+                    if tx.try_send(None).is_err() {
+                        return;
+                    }
                     thread::sleep(Duration::from_millis(100));
                     continue;
                 }
@@ -452,7 +531,9 @@ fn capture_loop(
                     ring_idx = (ring_idx + 1) % RING_SIZE;
                     match tx.try_send(Some(frame)) {
                         Ok(_) => {}
-                        Err(std::sync::mpsc::TrySendError::Full(_)) => { drop_count += 1; }
+                        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                            drop_count += 1;
+                        }
                         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                             // Receiver was dropped — device was switched, exit cleanly
                             return;
@@ -460,7 +541,7 @@ fn capture_loop(
                     }
                 }
                 None => {
-                    decode_errors      += 1;
+                    decode_errors += 1;
                     consec_decode_errs += 1;
                     match tx.try_send(None) {
                         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
@@ -479,7 +560,7 @@ fn capture_loop(
 
             if stat_timer.elapsed().as_secs_f64() >= 1.0 {
                 let secs = stat_timer.elapsed().as_secs_f64().max(0.001);
-                let fps  = frame_count as f64 / secs;
+                let fps = frame_count as f64 / secs;
                 fps_out.store((fps * 10.0).round() as u32, Ordering::Relaxed);
                 if debug {
                     eprintln!(
@@ -487,10 +568,10 @@ fn capture_loop(
                         frame_count, drop_count, decode_errors, fps
                     );
                 }
-                frame_count   = 0;
-                drop_count    = 0;
+                frame_count = 0;
+                drop_count = 0;
                 decode_errors = 0;
-                stat_timer    = std::time::Instant::now();
+                stat_timer = std::time::Instant::now();
             }
         } // inner loop
     } // 'restart loop
@@ -507,12 +588,14 @@ fn decode_mjpeg(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     // SDL2's RGB24 texture receives frame data in the format it expects.
     // zune-jpeg folds the YCbCr→RGB conversion into the IDCT pass on
     // SIMD-capable targets (NEON on aarch64, SSE2/AVX2 on x86_64).
-    let options = DecoderOptions::default()
-        .jpeg_set_out_colorspace(ColorSpace::RGB);
+    let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
     decoder.set_options(options);
     let pixels = match decoder.decode() {
         Ok(p) => p,
-        Err(e) => { eprintln!("capture: MJPEG decode error: {e}"); return None; }
+        Err(e) => {
+            eprintln!("capture: MJPEG decode error: {e}");
+            return None;
+        }
     };
     let info = decoder.info()?;
     Some((pixels, info.width as u32, info.height as u32))
@@ -536,15 +619,19 @@ fn passthrough_yuyv_into(data: &[u8], w: u32, h: u32, slot: &mut Vec<u8>) -> Opt
 
 // ── Screenshot capture ─────────────────────────────────────────────────────────
 
+use sdl2::pixels::PixelFormatEnum;
 use sdl2::render::Canvas as SdlCanvas;
 use sdl2::video::Window;
-use sdl2::pixels::PixelFormatEnum;
 use std::fs::File;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Save the current canvas content to a PNG file in /tmp/
 /// Returns the path to the saved file, or None on failure.
-pub fn save_screenshot(sdl_canvas: &SdlCanvas<Window>, canvas_w: u32, canvas_h: u32) -> Option<String> {
+pub fn save_screenshot(
+    sdl_canvas: &SdlCanvas<Window>,
+    canvas_w: u32,
+    canvas_h: u32,
+) -> Option<String> {
     // Create PNG encoder
     let mut file = File::create("/tmp/annotator_screenshot.png").ok()?;
 
@@ -554,7 +641,9 @@ pub fn save_screenshot(sdl_canvas: &SdlCanvas<Window>, canvas_w: u32, canvas_h: 
 
     // Read pixels
     let rect = sdl2::rect::Rect::new(0, menu_h as i32, canvas_w, capture_h);
-    let rgb_data = sdl_canvas.read_pixels(Some(rect), PixelFormatEnum::RGB24).ok()?;
+    let rgb_data = sdl_canvas
+        .read_pixels(Some(rect), PixelFormatEnum::RGB24)
+        .ok()?;
 
     // Encode as PNG
     let mut encoder = png::Encoder::new(&mut file, canvas_w, capture_h);
@@ -580,8 +669,8 @@ pub fn save_screenshot(sdl_canvas: &SdlCanvas<Window>, canvas_w: u32, canvas_h: 
 
 // ── RTSP Capture via FFmpeg ─────────────────────────────────────────────────────
 
-use std::process::Command;
 use std::io::BufReader;
+use std::process::Command;
 
 /// RTSP source identifier for the device picker.
 #[allow(dead_code)]
@@ -604,7 +693,9 @@ pub fn start_rtsp_capture(
     let fps_counter_thread = Arc::clone(&fps_counter);
     let url = url.to_string();
 
-    thread::spawn(move || rtsp_capture_loop(&url, width, height, tx, fps_counter_thread, stop_thread));
+    thread::spawn(move || {
+        rtsp_capture_loop(&url, width, height, tx, fps_counter_thread, stop_thread)
+    });
     (rx, fps_counter, stop)
 }
 
@@ -742,11 +833,16 @@ fn decoder_works(name: &str) -> bool {
     use std::process::Command;
     let out = Command::new("ffmpeg")
         .arg("-hide_banner")
-        .arg("-loglevel").arg("error")
-        .arg("-f").arg("lavfi")
-        .arg("-i").arg("color=c=black:s=64x64:d=0.04:r=25")
-        .arg("-c:v").arg(name)
-        .arg("-f").arg("null")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-f")
+        .arg("lavfi")
+        .arg("-i")
+        .arg("color=c=black:s=64x64:d=0.04:r=25")
+        .arg("-c:v")
+        .arg(name)
+        .arg("-f")
+        .arg("null")
         .arg("-")
         .output();
     match out {
@@ -764,8 +860,10 @@ fn decoder_works(name: &str) -> bool {
                 }
                 // Unknown failure mode — fall back to software rather than
                 // hard-fail.  The watchdog will catch real issues at runtime.
-                eprintln!("[rtsp] decoder probe for {name} returned non-zero, stderr: {}",
-                    stderr.lines().next().unwrap_or("").trim());
+                eprintln!(
+                    "[rtsp] decoder probe for {name} returned non-zero, stderr: {}",
+                    stderr.lines().next().unwrap_or("").trim()
+                );
                 return false;
             }
             true
@@ -798,17 +896,33 @@ fn rtsp_capture_loop(
     candidates.push(None);
 
     for (i, decoder) in candidates.iter().enumerate() {
-        if stop.load(std::sync::atomic::Ordering::SeqCst) { return; }
-
-        match decoder {
-            Some(name) => eprintln!("[rtsp] attempt {}/{} with {}",
-                i + 1, candidates.len(), name),
-            None => eprintln!("[rtsp] attempt {}/{} with software decode",
-                i + 1, candidates.len()),
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
         }
 
-        match try_rtsp_attempt(url, target_w, target_h, &tx, &fps_out, &stop,
-                               decoder.as_deref()) {
+        match decoder {
+            Some(name) => eprintln!(
+                "[rtsp] attempt {}/{} with {}",
+                i + 1,
+                candidates.len(),
+                name
+            ),
+            None => eprintln!(
+                "[rtsp] attempt {}/{} with software decode",
+                i + 1,
+                candidates.len()
+            ),
+        }
+
+        match try_rtsp_attempt(
+            url,
+            target_w,
+            target_h,
+            &tx,
+            &fps_out,
+            &stop,
+            decoder.as_deref(),
+        ) {
             // The attempt's inner loop runs as long as the user hasn't stopped
             // and frames keep flowing.  It only returns here on stop or
             // early failure; either way we're done with this candidate.
@@ -858,20 +972,25 @@ fn try_rtsp_attempt(
 
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-hide_banner")
-       .arg("-loglevel").arg("info")
-       .arg("-rtsp_transport").arg("tcp");
+        .arg("-loglevel")
+        .arg("info")
+        .arg("-rtsp_transport")
+        .arg("tcp");
     if let Some(dec) = decoder {
         cmd.arg("-c:v").arg(dec);
     }
     cmd.arg("-i").arg(url);
     if MAX_OUT_W > 0 {
-        cmd.arg("-vf").arg(format!("scale='min({MAX_OUT_W},iw)':-2"));
+        cmd.arg("-vf")
+            .arg(format!("scale='min({MAX_OUT_W},iw)':-2"));
     }
-    cmd.arg("-pix_fmt").arg("yuv420p")
-       .arg("-f").arg("rawvideo")
-       .arg("pipe:1")
-       .stdout(Stdio::piped())
-       .stderr(Stdio::piped());
+    cmd.arg("-pix_fmt")
+        .arg("yuv420p")
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("pipe:1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -914,7 +1033,7 @@ fn try_rtsp_attempt(
     // documented in the comment above but not implemented.
     let frame_w: u32 = target_w;
     let frame_h: u32 = target_h;
-    let mut frame_bytes: usize = 0;  // set once frame_w/frame_h are known
+    let mut frame_bytes: usize = 0; // set once frame_w/frame_h are known
     let mut carry: Vec<u8> = Vec::with_capacity(8 * 1024 * 1024); // up to 1920x1080 YUV420
 
     let mut fps_frame_count: u32 = 0;
@@ -933,11 +1052,14 @@ fn try_rtsp_attempt(
     let mut last_frame_at = Instant::now();
 
     if debug {
-        eprintln!("[rtsp] started capture from {} with decoder={:?}",
-            url, decoder.unwrap_or("software"));
+        eprintln!(
+            "[rtsp] started capture from {} with decoder={:?}",
+            url,
+            decoder.unwrap_or("software")
+        );
     }
 
-    let mut chunk = [0u8; 65536];  // larger reads = fewer syscalls
+    let mut chunk = [0u8; 65536]; // larger reads = fewer syscalls
 
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
         // Early-failure detector.  Only fires before any frames have arrived;
@@ -948,7 +1070,8 @@ fn try_rtsp_attempt(
                 let _ = child.kill();
                 let _ = child.wait();
                 return AttemptResult::EarlyFailure(
-                    "ffmpeg exited within 5s without producing a frame".into());
+                    "ffmpeg exited within 5s without producing a frame".into(),
+                );
             }
             // ffmpeg is still running but produced nothing in the early
             // window — fall through and let the long watchdog apply.
@@ -959,7 +1082,8 @@ fn try_rtsp_attempt(
             eprintln!(
                 "[rtsp] no frames received in {}s from {}\n        \
                  check URL, credentials, network reachability, and that the camera supports RTSP",
-                watchdog_after.as_secs(), url,
+                watchdog_after.as_secs(),
+                url,
             );
             last_frame_at = Instant::now() - watchdog_after + Duration::from_secs(20);
         }
@@ -967,7 +1091,7 @@ fn try_rtsp_attempt(
         // Once we know the frame size, read exactly that many bytes per
         // iteration and ship a frame.  Before that, just accumulate.
         let need = if frame_bytes == 0 {
-            usize::MAX  // unknown size yet — drain everything
+            usize::MAX // unknown size yet — drain everything
         } else {
             frame_bytes.saturating_sub(carry.len())
         };
@@ -976,12 +1100,15 @@ fn try_rtsp_attempt(
         if to_read == 0 && frame_bytes > 0 {
             // We have a complete frame buffered — ship it.
             let data: Vec<u8> = carry.drain(..frame_bytes).collect();
-            if tx.try_send(Some(Frame::from_owned(
-                data,
-                frame_w,
-                frame_h,
-                FrameFormat::Yuv420,
-            ))).is_ok() {
+            if tx
+                .try_send(Some(Frame::from_owned(
+                    data,
+                    frame_w,
+                    frame_h,
+                    FrameFormat::Yuv420,
+                )))
+                .is_ok()
+            {
                 fps_frame_count += 1;
                 let elapsed = fps_timer.elapsed().as_secs_f32();
                 if elapsed >= 1.0 {
@@ -1002,7 +1129,8 @@ fn try_rtsp_attempt(
                 let _ = child.wait();
                 if fps_frame_count == 0 {
                     return AttemptResult::EarlyFailure(
-                        "ffmpeg stdout EOF with no frames produced".into());
+                        "ffmpeg stdout EOF with no frames produced".into(),
+                    );
                 }
                 let _ = tx.send(None);
                 return AttemptResult::Stopped;

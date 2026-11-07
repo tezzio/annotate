@@ -2,13 +2,15 @@ use sdl2::clipboard::ClipboardUtil;
 use sdl2::event::{Event, WindowEvent};
 use sdl2::keyboard::{Keycode, Mod};
 use sdl2::mouse::MouseButton;
+use std::sync::atomic::Ordering;
 
 use crate::{
     canvas::Canvas,
-    scene::{DrawObject, PenStroke, ShapeObj, HighlightStroke},
+    render_pipeline::DEBUG,
+    scene::{DrawObject, HighlightStroke, PenStroke, ShapeObj},
     state::{AppState, EraserDrag},
-    tools::{Tool, PALETTE},
-    ui::{PickerStage, MENU_HEIGHT},
+    tools::{PALETTE, Tool},
+    ui::{MENU_HEIGHT, PickerStage},
 };
 
 // ── Input event processor ─────────────────────────────────────────────────────
@@ -19,9 +21,9 @@ use crate::{
 /// text tool.  Pass `None` if the video subsystem isn't available (paste will
 /// silently no-op).
 pub fn process_event(
-    event:     &Event,
-    state:     &mut AppState,
-    canvas:    &mut Canvas,
+    event: &Event,
+    state: &mut AppState,
+    canvas: &mut Canvas,
     v2_layout: &mut crate::ui::v2::V2Layout,
     clipboard: Option<&ClipboardUtil>,
 ) -> bool {
@@ -29,7 +31,11 @@ pub fn process_event(
         // ── Quit ──────────────────────────────────────────────────────────────
         Event::Quit { .. } => return false,
 
-        Event::KeyDown { keycode: Some(k), keymod, .. } => {
+        Event::KeyDown {
+            keycode: Some(k),
+            keymod,
+            ..
+        } => {
             // Track Shift / Ctrl modifier state for mouse events (which
             // don't carry modifier flags).  Only update on the physical
             // modifier keys themselves so the flag stays accurate across
@@ -44,12 +50,12 @@ pub fn process_event(
             state.mark_snapshot_dirty();
         }
 
-        Event::KeyUp { keycode: Some(k), .. } => {
-            match *k {
-                Keycode::LShift | Keycode::RShift => state.shift_down = false,
-                _ => {}
-            }
-        }
+        Event::KeyUp {
+            keycode: Some(k), ..
+        } => match *k {
+            Keycode::LShift | Keycode::RShift => state.shift_down = false,
+            _ => {}
+        },
 
         // SDL text input — used when text tool is active or RTSP picker is open
         Event::TextInput { text, .. } => {
@@ -71,7 +77,12 @@ pub fn process_event(
         // Finger events are NOT handled separately — SDL's auto touch→mouse
         // synthesis gives correct window-local pixels; raw FingerDown coords
         // are normalized to the full desktop and break on multi-monitor setups.
-        Event::MouseButtonDown { mouse_btn: MouseButton::Left, x, y, .. } => {
+        Event::MouseButtonDown {
+            mouse_btn: MouseButton::Left,
+            x,
+            y,
+            ..
+        } => {
             handle_press(*x, *y, state, canvas, v2_layout);
             state.mark_snapshot_dirty();
         }
@@ -97,13 +108,24 @@ pub fn process_event(
         }
 
         // ── Mouse button up ───────────────────────────────────────────────────
-        Event::MouseButtonUp { mouse_btn: MouseButton::Left, x, y, .. } => {
+        Event::MouseButtonUp {
+            mouse_btn: MouseButton::Left,
+            x,
+            y,
+            ..
+        } => {
             handle_release(*x, *y, state, canvas);
             state.mark_snapshot_dirty();
         }
 
-        Event::Window { win_event: WindowEvent::Resized(w, h), .. }
-        | Event::Window { win_event: WindowEvent::SizeChanged(w, h), .. } => {
+        Event::Window {
+            win_event: WindowEvent::Resized(w, h),
+            ..
+        }
+        | Event::Window {
+            win_event: WindowEvent::SizeChanged(w, h),
+            ..
+        } => {
             state.window_size = (*w as u32, *h as u32);
             state.mark_snapshot_dirty();
         }
@@ -115,13 +137,25 @@ pub fn process_event(
 
 // ── Shared press / move / release handlers ────────────────────────────────────
 
-fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, v2_layout: &mut crate::ui::v2::V2Layout) {
+fn handle_press(
+    mx: i32,
+    my: i32,
+    state: &mut AppState,
+    canvas: &Canvas,
+    v2_layout: &mut crate::ui::v2::V2Layout,
+) {
     // Settings overlay is open — all clicks go to the overlay, not toolbar/picker
     if state.show_settings_overlay {
+        if DEBUG.load(Ordering::Relaxed) {
+            eprintln!("[dbg] press({mx},{my}) consumed by settings overlay");
+        }
         return;
     }
 
     if state.show_device_picker {
+        if DEBUG.load(Ordering::Relaxed) {
+            eprintln!("[dbg] press({mx},{my}) consumed by device picker");
+        }
         if let Some(picker) = &mut state.device_picker {
             use crate::ui::PickerDismiss;
             match picker.click_dismiss(mx, my, canvas.width as i32, canvas.height as i32) {
@@ -135,7 +169,9 @@ fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, v2_layo
                 }
                 PickerDismiss::None => {}
             }
-            if let Some(result) = picker.click_enter(mx, my, canvas.width as i32, canvas.height as i32) {
+            if let Some(result) =
+                picker.click_enter(mx, my, canvas.width as i32, canvas.height as i32)
+            {
                 state.picker_confirmed = Some(result);
                 state.show_device_picker = false;
             }
@@ -143,6 +179,9 @@ fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, v2_layo
         return;
     }
     if my < MENU_HEIGHT {
+        if DEBUG.load(Ordering::Relaxed) {
+            eprintln!("[dbg] press({mx},{my}) consumed by menu bar (my<{MENU_HEIGHT})");
+        }
         state.pending_menu_click = Some((mx, my));
         return;
     }
@@ -152,15 +191,26 @@ fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, v2_layo
     // the clickable area extends to the right of the rail (for swatches).
     let popout_extends_right = v2_layout.popout_open
         && mx >= crate::ui::v2::RAIL_WIDTH
-        && mx <= crate::ui::v2::RAIL_WIDTH + 6 + 32 + 8;  // rail edge + gap + swatch + margin
+        && mx <= crate::ui::v2::RAIL_WIDTH + 6 + 32 + 8; // rail edge + gap + swatch + margin
     if mx < crate::ui::v2::RAIL_WIDTH || popout_extends_right {
+        if DEBUG.load(Ordering::Relaxed) {
+            eprintln!("[dbg] press({mx},{my}) consumed by V2 toolbar");
+        }
         crate::ui::v2::click_v2_toolbar(mx, my, v2_layout, state);
         return;
     }
-    if state.draw_locked_until.map_or(false, |t| std::time::Instant::now() < t) { return; }
+    if state
+        .draw_locked_until
+        .map_or(false, |t| std::time::Instant::now() < t)
+    {
+        if DEBUG.load(Ordering::Relaxed) {
+            eprintln!("[dbg] press({mx},{my}) suppressed by draw_locked_until");
+        }
+        return;
+    }
     state.mouse_down = true;
     state.drag_start = (mx, my);
-    state.drag_cur   = (mx, my);
+    state.drag_cur = (mx, my);
     match state.active_tool {
         Tool::Select => {
             let hit = state.scene.hit_test(mx, my);
@@ -212,9 +262,19 @@ fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, v2_layo
             // so the committed overlay isn't re-rasterized on every mouse-move.
             state.active_stroke = Some(DrawObject::Pen(PenStroke {
                 points: vec![(mx, my)],
-                color:  state.color,
-                size:   state.brush_size,
+                color: state.color,
+                size: state.brush_size,
             }));
+            if DEBUG.load(Ordering::Relaxed) {
+                eprintln!(
+                    "[dbg] pen_press: ({},{}) color={:?} brush={} scene.objects={}",
+                    mx,
+                    my,
+                    state.color,
+                    state.brush_size,
+                    state.scene.objects().len(),
+                );
+            }
         }
         Tool::Eraser => {
             // Eraser is NOT a drawable scene object.  On mouse-down we just
@@ -231,12 +291,24 @@ fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, v2_layo
             state.scene.push_undo();
             state.active_stroke = Some(DrawObject::Highlight(HighlightStroke {
                 points: vec![(mx, my)],
-                color:  state.color,
-                size:   state.brush_size,
+                color: state.color,
+                size: state.brush_size,
             }));
+            if DEBUG.load(Ordering::Relaxed) {
+                eprintln!(
+                    "[dbg] highlight_press: ({},{}) color={:?} brush={} scene.objects={}",
+                    mx,
+                    my,
+                    state.color,
+                    state.brush_size,
+                    state.scene.objects().len(),
+                );
+            }
         }
         Tool::Laser => {
-            state.laser_trail.push((mx, my, std::time::Instant::now(), state.color));
+            state
+                .laser_trail
+                .push((mx, my, std::time::Instant::now(), state.color));
         }
         // Shape tools: push undo here; object committed on release
         _ => {
@@ -246,14 +318,22 @@ fn handle_press(mx: i32, my: i32, state: &mut AppState, canvas: &Canvas, v2_layo
 }
 
 fn handle_move(mx: i32, my: i32, state: &mut AppState, canvas: &mut Canvas) {
-    if state.show_device_picker { return; }
-    if my < MENU_HEIGHT || mx < crate::ui::v2::RAIL_WIDTH { return; }
-    // Laser pointer tracks hover — no mouse button required
-    if state.active_tool == Tool::Laser {
-        state.laser_trail.push((mx, my, std::time::Instant::now(), state.color));
+    if state.show_device_picker {
         return;
     }
-    if !state.mouse_down { return; }
+    if my < MENU_HEIGHT || mx < crate::ui::v2::RAIL_WIDTH {
+        return;
+    }
+    // Laser pointer tracks hover — no mouse button required
+    if state.active_tool == Tool::Laser {
+        state
+            .laser_trail
+            .push((mx, my, std::time::Instant::now(), state.color));
+        return;
+    }
+    if !state.mouse_down {
+        return;
+    }
     let prev = state.drag_cur;
     state.drag_cur = (mx, my);
     let (dx, dy) = (mx - prev.0, my - prev.1);
@@ -269,8 +349,13 @@ fn handle_move(mx: i32, my: i32, state: &mut AppState, canvas: &mut Canvas) {
                 // Snapshot indices up front so a translate that grows the
                 // objects vec (e.g. via make_mut) doesn't invalidate our
                 // iterators.  We also clamp to current length defensively.
-                let indices: Vec<usize> = state.scene.selected.iter()
-                    .copied().filter(|&i| i < n).collect();
+                let indices: Vec<usize> = state
+                    .scene
+                    .selected
+                    .iter()
+                    .copied()
+                    .filter(|&i| i < n)
+                    .collect();
                 if !indices.is_empty() {
                     for i in indices {
                         if let Some(obj) = state.scene.objects_mut().get_mut(i) {
@@ -284,6 +369,11 @@ fn handle_move(mx: i32, my: i32, state: &mut AppState, canvas: &mut Canvas) {
         Tool::Pen => {
             if let Some(DrawObject::Pen(s)) = state.active_stroke.as_mut() {
                 s.points.push((mx, my));
+                if DEBUG.load(Ordering::Relaxed) && s.points.len() % 16 == 0 {
+                    eprintln!("[dbg] pen_move: stroke now has {} points", s.points.len());
+                }
+            } else if DEBUG.load(Ordering::Relaxed) && state.mouse_down {
+                eprintln!("[dbg] pen_move: mouse_down but NO active_stroke!");
             }
         }
         Tool::Eraser => {
@@ -313,7 +403,9 @@ fn handle_move(mx: i32, my: i32, state: &mut AppState, canvas: &mut Canvas) {
                         let row_base = (y as u32 * canvas.width) as usize * 4;
                         for x in xa..=xb {
                             let dx = x - mx;
-                            if dx * dx + dy * dy > r2 { continue; }
+                            if dx * dx + dy * dy > r2 {
+                                continue;
+                            }
                             let idx = row_base + x as usize * 4;
                             canvas.pixels[idx + 3] = 0;
                         }
@@ -339,6 +431,12 @@ fn handle_move(mx: i32, my: i32, state: &mut AppState, canvas: &mut Canvas) {
         Tool::Highlight => {
             if let Some(DrawObject::Highlight(h)) = state.active_stroke.as_mut() {
                 h.points.push((mx, my));
+                if DEBUG.load(Ordering::Relaxed) && h.points.len() % 16 == 0 {
+                    eprintln!(
+                        "[dbg] highlight_move: stroke now has {} points",
+                        h.points.len()
+                    );
+                }
             }
         }
         // shape tools: preview is drawn by main.rs via preview_object()
@@ -347,19 +445,56 @@ fn handle_move(mx: i32, my: i32, state: &mut AppState, canvas: &mut Canvas) {
 }
 
 fn handle_release(x1: i32, y1: i32, state: &mut AppState, canvas: &mut Canvas) {
-    if !state.mouse_down { return; }
+    if !state.mouse_down {
+        return;
+    }
     state.mouse_down = false;
     let (x0, y0) = state.drag_start;
-    let s = ShapeObj { x0, y0, x1, y1, color: state.color, size: state.brush_size };
+    let s = ShapeObj {
+        x0,
+        y0,
+        x1,
+        y1,
+        color: state.color,
+        size: state.brush_size,
+    };
     match state.active_tool {
-        Tool::Line   => { state.scene.add(DrawObject::Line(s)); }
-        Tool::Rect   => { state.scene.add(DrawObject::Rect(s)); }
-        Tool::Circle => { state.scene.add(DrawObject::Circle(s)); }
-        Tool::Arrow  => { state.scene.add(DrawObject::Arrow(s)); }
+        Tool::Line => {
+            state.scene.add(DrawObject::Line(s));
+        }
+        Tool::Rect => {
+            state.scene.add(DrawObject::Rect(s));
+        }
+        Tool::Circle => {
+            state.scene.add(DrawObject::Circle(s));
+        }
+        Tool::Arrow => {
+            state.scene.add(DrawObject::Arrow(s));
+        }
         // Pen/Highlight: commit the active stroke into the scene
         Tool::Pen | Tool::Highlight => {
             if let Some(stroke) = state.active_stroke.take() {
+                let pts = match &stroke {
+                    DrawObject::Pen(p) => p.points.len(),
+                    DrawObject::Highlight(h) => h.points.len(),
+                    _ => 0,
+                };
+                let obj_count_before = state.scene.objects().len();
                 state.scene.add(stroke);
+                if DEBUG.load(Ordering::Relaxed) {
+                    eprintln!(
+                        "[dbg] pen_release: pts={} scene.objects: {} -> {} scene.dirty={}",
+                        pts,
+                        obj_count_before,
+                        state.scene.objects().len(),
+                        state.scene.dirty,
+                    );
+                }
+            } else if DEBUG.load(Ordering::Relaxed) {
+                eprintln!(
+                    "[dbg] pen_release: NO active_stroke (tool={:?})",
+                    state.active_tool,
+                );
             }
         }
         // Eraser (Photoshop-style layer-aware): the brush already wiped the
@@ -416,7 +551,7 @@ fn handle_keydown(
         return true;
     }
 
-    let ctrl  = mods.contains(Mod::LCTRLMOD)  || mods.contains(Mod::RCTRLMOD);
+    let ctrl = mods.contains(Mod::LCTRLMOD) || mods.contains(Mod::RCTRLMOD);
     let shift = mods.contains(Mod::LSHIFTMOD) || mods.contains(Mod::RSHIFTMOD);
 
     // Text input mode intercepts most keys
@@ -436,9 +571,8 @@ fn handle_keydown(
                 if let Some(cb) = clipboard {
                     if let Ok(text) = cb.clipboard_text() {
                         // Strip newlines — single-line text tool.
-                        let cleaned: String = text.chars()
-                            .filter(|c| *c != '\n' && *c != '\r')
-                            .collect();
+                        let cleaned: String =
+                            text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
                         state.text_buffer.push_str(&cleaned);
                     }
                 }
@@ -487,7 +621,7 @@ fn handle_keydown(
                     // Jump to first row (matches browser/OS list convention).
                     match picker.stage {
                         PickerStage::Devices => picker.device_cursor = 0,
-                        PickerStage::Modes   => picker.mode_cursor   = 0,
+                        PickerStage::Modes => picker.mode_cursor = 0,
                         _ => {}
                     }
                     picker.scroll_to_cursor(state.window_size.1 as i32);
@@ -534,10 +668,8 @@ fn handle_keydown(
                                     // Strip whitespace — RTSP URLs are
                                     // single-line and surrounding newlines
                                     // would break ffmpeg invocation.
-                                    let cleaned: String = text
-                                        .chars()
-                                        .filter(|c| !c.is_whitespace())
-                                        .collect();
+                                    let cleaned: String =
+                                        text.chars().filter(|c| !c.is_whitespace()).collect();
                                     picker.rtsp.url.push_str(&cleaned);
                                 }
                                 Err(e) => eprintln!("[input] clipboard read failed: {e}"),
@@ -556,15 +688,42 @@ fn handle_keydown(
         Keycode::Escape => return false,
 
         // ── Tool selection ────────────────────────────────────────────────────
-        Keycode::P => { commit_text(state); switch_tool(state, Tool::Pen);       }
-        Keycode::L => { commit_text(state); switch_tool(state, Tool::Line);      }
-        Keycode::R => { commit_text(state); switch_tool(state, Tool::Rect);      }
-        Keycode::C => { commit_text(state); switch_tool(state, Tool::Circle);    }
-        Keycode::A => { commit_text(state); switch_tool(state, Tool::Arrow);     }
-        Keycode::T => { commit_text(state); switch_tool(state, Tool::Text);      }
-        Keycode::S => { commit_text(state); switch_tool(state, Tool::Select);    }
-        Keycode::E => { commit_text(state); switch_tool(state, Tool::Eraser);    }
-        Keycode::H => { commit_text(state); switch_tool(state, Tool::Highlight); }
+        Keycode::P => {
+            commit_text(state);
+            switch_tool(state, Tool::Pen);
+        }
+        Keycode::L => {
+            commit_text(state);
+            switch_tool(state, Tool::Line);
+        }
+        Keycode::R => {
+            commit_text(state);
+            switch_tool(state, Tool::Rect);
+        }
+        Keycode::C => {
+            commit_text(state);
+            switch_tool(state, Tool::Circle);
+        }
+        Keycode::A => {
+            commit_text(state);
+            switch_tool(state, Tool::Arrow);
+        }
+        Keycode::T => {
+            commit_text(state);
+            switch_tool(state, Tool::Text);
+        }
+        Keycode::S => {
+            commit_text(state);
+            switch_tool(state, Tool::Select);
+        }
+        Keycode::E => {
+            commit_text(state);
+            switch_tool(state, Tool::Eraser);
+        }
+        Keycode::H => {
+            commit_text(state);
+            switch_tool(state, Tool::Highlight);
+        }
 
         // ── Colour palette ────────────────────────────────────────────────────
         Keycode::Num1 => state.color = PALETTE[0],
@@ -577,21 +736,30 @@ fn handle_keydown(
         Keycode::Num8 => state.color = PALETTE[7],
 
         // ── Brush size ────────────────────────────────────────────────────────
-        Keycode::LeftBracket  => { state.brush_size = state.brush_size.saturating_sub(4).max(1); state.tool_sizes[state.active_tool.index()] = state.brush_size; }
-        Keycode::RightBracket => { state.brush_size = (state.brush_size + 4).min(200); state.tool_sizes[state.active_tool.index()] = state.brush_size; }
+        Keycode::LeftBracket => {
+            state.brush_size = state.brush_size.saturating_sub(4).max(1);
+            state.tool_sizes[state.active_tool.index()] = state.brush_size;
+        }
+        Keycode::RightBracket => {
+            state.brush_size = (state.brush_size + 4).min(200);
+            state.tool_sizes[state.active_tool.index()] = state.brush_size;
+        }
 
         // ── Undo / Redo ───────────────────────────────────────────────────────
         Keycode::Z if ctrl && shift => {
             state.scene.redo();
-            state.draw_locked_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+            state.draw_locked_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
         }
         Keycode::Y if ctrl => {
             state.scene.redo();
-            state.draw_locked_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+            state.draw_locked_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
         }
         Keycode::Z if ctrl => {
             state.scene.undo();
-            state.draw_locked_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+            state.draw_locked_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
         }
 
         // ── Clear / Delete selected ───────────────────────────────────────────
@@ -637,12 +805,14 @@ fn handle_keydown(
 pub fn switch_tool(state: &mut AppState, tool: Tool) {
     state.tool_sizes[state.active_tool.index()] = state.brush_size;
     state.active_tool = tool;
-    state.brush_size  = state.tool_sizes[tool.index()];
+    state.brush_size = state.tool_sizes[tool.index()];
     state.mark_snapshot_dirty();
 }
 
 fn commit_text(state: &mut AppState) {
-    if !state.text_buffer.is_empty() { state.pending_text_commit = true; }
+    if !state.text_buffer.is_empty() {
+        state.pending_text_commit = true;
+    }
     state.text_input_active = false;
     state.mark_snapshot_dirty();
 }
@@ -650,15 +820,24 @@ fn commit_text(state: &mut AppState) {
 /// Returns a live preview `DrawObject` for the current shape drag, if any.
 /// main.rs calls this to render the ghost shape on top of the committed scene.
 pub fn preview_object(state: &AppState) -> Option<DrawObject> {
-    if !state.mouse_down { return None; }
+    if !state.mouse_down {
+        return None;
+    }
     let (x0, y0) = state.drag_start;
     let (x1, y1) = state.drag_cur;
-    let s = ShapeObj { x0, y0, x1, y1, color: state.color, size: state.brush_size };
+    let s = ShapeObj {
+        x0,
+        y0,
+        x1,
+        y1,
+        color: state.color,
+        size: state.brush_size,
+    };
     match state.active_tool {
-        Tool::Line   => Some(DrawObject::Line(s)),
-        Tool::Rect   => Some(DrawObject::Rect(s)),
+        Tool::Line => Some(DrawObject::Line(s)),
+        Tool::Rect => Some(DrawObject::Rect(s)),
         Tool::Circle => Some(DrawObject::Circle(s)),
-        Tool::Arrow  => Some(DrawObject::Arrow(s)),
+        Tool::Arrow => Some(DrawObject::Arrow(s)),
         _ => None,
     }
 }

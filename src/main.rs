@@ -1,19 +1,19 @@
 mod api;
-mod config;
-mod capture;
 mod canvas;
+mod capture;
+mod config;
+mod input;
 mod render_pipeline;
-mod tools;
 mod scene;
 mod state;
+mod tools;
 mod ui;
-mod input;
 
 use std::{
     sync::{
+        Arc, Mutex,
         atomic::Ordering,
-        mpsc::Receiver,
-        Arc,
+        mpsc::{Receiver, SyncSender, sync_channel},
     },
     time::{Duration, Instant},
 };
@@ -26,11 +26,13 @@ use sdl2::{
 
 use canvas::Canvas;
 use capture::{Frame, FrameFormat};
-use render_pipeline::RenderPipeline;
+use render_pipeline::{CanvasFrameCallback, RenderPipeline};
 use scene::DrawObject;
 use state::AppState;
 use tools::Tool;
-use ui::{DevicePicker, OverlaySettings, OverlayAction, TextCache, Toggle, toolbar_height, MENU_HEIGHT};
+use ui::{
+    DevicePicker, MENU_HEIGHT, OverlayAction, OverlaySettings, TextCache, Toggle, toolbar_height,
+};
 
 // ── Application state ─────────────────────────────────────────────────────────
 // `AppState` lives in `state.rs` — one definition shared by the UI, the
@@ -38,7 +40,7 @@ use ui::{DevicePicker, OverlaySettings, OverlayAction, TextCache, Toggle, toolba
 
 // ── Embedded fonts ────────────────────────────────────────────────────────────
 
-const FONT_BYTES:      &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/DejaVuSans.ttf"));
+const FONT_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/DejaVuSans.ttf"));
 const ICON_FONT_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa-solid.otf"));
 
 // ── Per-thread scratch buffers ─────────────────────────────────────────────────
@@ -49,6 +51,47 @@ std::thread_local! {
     static PREVIEW_PTS: std::cell::RefCell<Vec<Point>> = std::cell::RefCell::new(Vec::with_capacity(512));
 }
 
+// ── Twitch streaming ──────────────────────────────────────────────────────────
+
+/// A single annotation canvas frame captured from the render pipeline, ready
+/// for compositing with the video layer and streaming to Twitch.
+struct StreamFrame {
+    /// RGBA pixels of the annotation canvas (already composited with baked bg).
+    annotation_pixels: Arc<Vec<u8>>,
+    width: u32,
+    height: u32,
+}
+
+/// Streaming worker thread.  Receives annotation canvas frames from the
+/// pipeline callback, retrieves the latest video frame from shared storage,
+/// composites them, and pushes to the Twitch ingest server.
+///
+/// Currently a stub: logs frames and exits.  Full RTMP/H.264 implementation
+/// is tracked in docs/twitch-streaming-plan.md.
+fn stream_worker(_rx: Receiver<StreamFrame>, _last_video: Arc<Mutex<Option<Frame>>>) {
+    eprintln!("[stream] streamer thread started");
+    loop {
+        match _rx.recv() {
+            Ok(frame) => {
+                eprintln!(
+                    "[stream] canvas frame ready: {}x{} ({:.1} KB)",
+                    frame.width,
+                    frame.height,
+                    frame.annotation_pixels.len() as f64 / 1024.0,
+                );
+                // TODO: composite with latest video frame
+                // TODO: encode to H.264
+                // TODO: mux into FLV/RTMP
+                // TODO: push to Twitch ingest
+            }
+            Err(_) => {
+                eprintln!("[stream] channel closed, streamer exiting");
+                break;
+            }
+        }
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
@@ -56,19 +99,25 @@ fn main() {
 
     // ── SDL2 init ──────────────────────────────────────────────────────────
     let sdl_context = sdl2::init().expect("SDL2 init");
-    let video       = sdl_context.video().expect("SDL2 video");
+    let video = sdl_context.video().expect("SDL2 video");
     let ttf_context = sdl2::ttf::init().expect("SDL2 TTF init");
 
     // Load bundled font via RWops (no temp file needed)
-    let rwops      = sdl2::rwops::RWops::from_bytes(FONT_BYTES).expect("font RWops");
-    let font       = ttf_context.load_font_from_rwops(rwops, 16).expect("load font");
+    let rwops = sdl2::rwops::RWops::from_bytes(FONT_BYTES).expect("font RWops");
+    let font = ttf_context
+        .load_font_from_rwops(rwops, 16)
+        .expect("load font");
     let font_large = {
         let rw2 = sdl2::rwops::RWops::from_bytes(FONT_BYTES).expect("font RWops");
-        ttf_context.load_font_from_rwops(rw2, 20).expect("load large font")
+        ttf_context
+            .load_font_from_rwops(rw2, 20)
+            .expect("load large font")
     };
     let icon_font = {
         let rw3 = sdl2::rwops::RWops::from_bytes(ICON_FONT_BYTES).expect("icon font RWops");
-        ttf_context.load_font_from_rwops(rw3, 22).expect("load icon font")
+        ttf_context
+            .load_font_from_rwops(rw3, 22)
+            .expect("load icon font")
     };
 
     // ── Window creation ────────────────────────────────────────────────────
@@ -98,22 +147,28 @@ fn main() {
     // SDL2 picks the best available backend (OpenGL/GLES/Metal/Vulkan) automatically.
     // On VMs without GPU passthrough this returns Err — we use the second window
     // with a software renderer instead.
-    let (mut sdl_canvas, using_hardware) = match window
-        .into_canvas()
-        .accelerated()
-        .present_vsync()
-        .build()
-    {
-        Ok(c) => (c, true),
-        Err(reason) => {
-            eprintln!("[annotator] hardware canvas failed ({reason}), falling back to software");
-            let c = win2.into_canvas().software().build().expect("software renderer must succeed");
-            (c, false)
-        }
-    };
+    let (mut sdl_canvas, using_hardware) =
+        match window.into_canvas().accelerated().present_vsync().build() {
+            Ok(c) => (c, true),
+            Err(reason) => {
+                eprintln!(
+                    "[annotator] hardware canvas failed ({reason}), falling back to software"
+                );
+                let c = win2
+                    .into_canvas()
+                    .software()
+                    .build()
+                    .expect("software renderer must succeed");
+                (c, false)
+            }
+        };
     eprintln!(
         "[annotator] renderer: {}",
-        if using_hardware { "hardware (accelerated)" } else { "software (fallback)" }
+        if using_hardware {
+            "hardware (accelerated)"
+        } else {
+            "software (fallback)"
+        }
     );
 
     sdl_canvas.set_blend_mode(BlendMode::Blend);
@@ -142,10 +197,50 @@ fn main() {
 
     // The pipeline owns two CPU canvases (front/back) and a worker thread
     // that rasterizes `scene` (with `committed_canvas` as the input base)
-    // into the back buffer.  The main thread reads `front_pixels()` and
-    // uploads to `committed_tex`.
+    // into the back buffer.  The main thread drains completed frames via
+    // `pipeline.upload_to(&mut committed_tex)` each vsync.
     let pipeline = RenderPipeline::new(canvas_w, canvas_h);
     let mut pipeline_seq: u64 = 0;
+
+    // ── Twitch streaming ─────────────────────────────────────────────────
+    // Channel for canvas frames destined for RTMP streaming.  The pipeline
+    // callback runs on the worker thread and sends frames here; a streaming
+    // worker thread picks them up, composites with the latest video frame,
+    // and pushes to the Twitch ingest server.
+    let (stream_tx, stream_rx): (SyncSender<StreamFrame>, Receiver<StreamFrame>) = sync_channel(2);
+
+    // Shared latest video frame — written by the main render loop's capture
+    // handler and read by the streaming callback.  Wrapped in Arc<Mutex<Option<...>>>
+    // so the pipeline worker can access it without a lifetime conflict.
+    let last_video_for_stream: Arc<Mutex<Option<Frame>>> = Arc::new(Mutex::new(None));
+
+    // Register the canvas capture callback with the pipeline.  When a new
+    // annotation canvas frame is ready, we send it (with dimensions) to the
+    // streaming thread; that thread will composite it with the latest video
+    // frame and push the result to Twitch.
+    let stream_tx_clone = stream_tx.clone();
+    let last_video_clone = Arc::clone(&last_video_for_stream);
+    pipeline.on_canvas_frame(Some(Arc::new(
+        Box::new(move |pixels: Arc<Vec<u8>>, width, height| {
+            // Try to send; drop if the receiver is gone or the channel is full.
+            let frame = StreamFrame {
+                annotation_pixels: pixels,
+                width,
+                height,
+            };
+            let _ = stream_tx_clone.send(frame);
+        }) as CanvasFrameCallback,
+    )));
+
+    // Spawn the streaming worker thread.  It blocks on `stream_rx`, receiving
+    // canvas frames, compositing with the latest video frame, encoding to
+    // H.264, and pushing to the Twitch ingest via RTMP.
+    std::thread::Builder::new()
+        .name("twitch-streamer".into())
+        .spawn(move || {
+            stream_worker(stream_rx, last_video_clone);
+        })
+        .expect("twitch streamer thread failed to spawn");
 
     // ── Video texture (double-buffered) ────────────────────────────────────
     // A single streaming texture produces a subtle horizontal tear line with
@@ -178,7 +273,11 @@ fn main() {
     state.window_size = (canvas_w, canvas_h);
 
     // ── Settings overlay ────────────────────────────────────────────────────
-    let renderer_info = if using_hardware { "hardware (accelerated)".into() } else { "software (fallback)".into() };
+    let renderer_info = if using_hardware {
+        "hardware (accelerated)".into()
+    } else {
+        "software (fallback)".into()
+    };
     state.settings = Some(OverlaySettings {
         cursor: 0,
         laser_fade: 1.2,
@@ -195,7 +294,7 @@ fn main() {
     // ── Device enumeration ─────────────────────────────────────────────────
     let devices = capture::enumerate_devices();
     state.device_picker = Some(DevicePicker::new(devices.clone()));
-    state.show_device_picker = false;  // Start with black screen, no picker shown
+    state.show_device_picker = false; // Start with black screen, no picker shown
 
     // ── Menu bar ───────────────────────────────────────────────────────────
     let mut menu_bar = ui::MenuBar::new(devices);
@@ -203,17 +302,18 @@ fn main() {
     // ── REST API (Crestron) ────────────────────────────────────────────────
     // The main loop publishes a fresh snapshot at the bottom of every frame;
     // API threads only ever read it, so the render loop never blocks on HTTP.
-    let api_snapshot: api::SharedSnapshot =
-        std::sync::Arc::new(std::sync::RwLock::new(state.to_snapshot(
-            menu_bar.active_idx,
-            &menu_bar.devices,
-            0.0,
-            0.0,
-        )));
+    let api_snapshot: api::SharedSnapshot = std::sync::Arc::new(std::sync::RwLock::new(
+        state.to_snapshot(menu_bar.active_idx, &menu_bar.devices, 0.0, 0.0),
+    ));
     // The main loop drains this once per frame; HTTP threads block on the
     // per-command oneshot for at most 500 ms.
     let api_cmd_rx: api::ApiCommandRx = if state.cfg.api.enabled {
-        api::serve(&state.cfg.api.bind, state.cfg.api.port, api_snapshot.clone(), state.cfg.clone())
+        api::serve(
+            &state.cfg.api.bind,
+            state.cfg.api.port,
+            api_snapshot.clone(),
+            state.cfg.clone(),
+        )
     } else {
         eprintln!("[api] disabled by config ([api] enabled = false)");
         let (_tx, rx) = std::sync::mpsc::sync_channel(0);
@@ -236,71 +336,102 @@ fn main() {
     // sender to drop frames we already paid the decode cost for.
     let mut last_video_frame: Option<Frame> = None;
     let debug = std::env::var("ANNOTATOR_DEBUG").is_ok();
-    let mut dbg_render_count  = 0u64;
-    let mut dbg_upload_count  = 0u64;
-    let mut dbg_stat_timer    = Instant::now();
+    render_pipeline::DEBUG.store(debug, Ordering::Relaxed);
+    if debug {
+        eprintln!("[dbg] ANNOTATOR_DEBUG enabled — verbose tracing on");
+        eprintln!(
+            "[dbg] init: canvas={}x{} device_picker={} tools=[{:#?}]",
+            canvas_w,
+            canvas_h,
+            state.show_device_picker,
+            [
+                Tool::Pen,
+                Tool::Line,
+                Tool::Rect,
+                Tool::Circle,
+                Tool::Arrow,
+                Tool::Text,
+                Tool::Select,
+                Tool::Eraser,
+                Tool::Highlight,
+                Tool::Laser,
+            ],
+        );
+    }
+    let mut dbg_render_count = 0u64;
+    let mut dbg_upload_count = 0u64;
+    let mut dbg_stat_timer = Instant::now();
     // Live FPS counters shown in the menu bar
-    let mut display_fps: f32   = 0.0;
-    let mut fps_frame_count    = 0u32;
-    let mut fps_timer          = Instant::now();
-    let mut text_cache         = TextCache::new();
+    let mut display_fps: f32 = 0.0;
+    let mut fps_frame_count = 0u32;
+    let mut fps_timer = Instant::now();
+    let mut text_cache = TextCache::new();
 
     'main: loop {
         let clipboard = video.clipboard();
         for event in event_pump.poll_iter() {
-            if !input::process_event(&event, &mut state, &mut committed_canvas, &mut v2_layout, Some(&clipboard)) {
+            if !input::process_event(
+                &event,
+                &mut state,
+                &mut committed_canvas,
+                &mut v2_layout,
+                Some(&clipboard),
+            ) {
                 break 'main;
             }
 
             // ── Settings overlay keyboard / mouse events ──────────────────────
             if state.show_settings_overlay {
                 match &event {
-                    sdl2::event::Event::KeyDown { keycode: Some(k), .. } => {
-                        match *k {
-                            sdl2::keyboard::Keycode::Escape => {
-                                state.show_settings_overlay = false;
-                                state.mark_snapshot_dirty();
-                            }
-                            sdl2::keyboard::Keycode::Up => {
-                                if let Some(s) = &mut state.settings {
-                                    s.move_up();
-                                }
-                            }
-                            sdl2::keyboard::Keycode::Down => {
-                                if let Some(s) = &mut state.settings {
-                                    s.move_down(canvas_h as i32);
-                                }
-                            }
-                            sdl2::keyboard::Keycode::Left => {
-                                if let Some(s) = &mut state.settings {
-                                    s.adjust(false);
-                                }
-                            }
-                            sdl2::keyboard::Keycode::Right => {
-                                if let Some(s) = &mut state.settings {
-                                    s.adjust(true);
-                                }
-                            }
-                            sdl2::keyboard::Keycode::Return | sdl2::keyboard::Keycode::KpEnter => {
-                                if let Some(s) = &mut state.settings {
-                                    let action = s.enter();
-                                    if action == OverlayAction::ToggleFullscreen {
-                                        state.toggle_fullscreen = true;
-                                        state.show_settings_overlay = false;
-                                        state.mark_snapshot_dirty();
-                                    }
-                                }
-                            }
-                            _ => {}
+                    sdl2::event::Event::KeyDown {
+                        keycode: Some(k), ..
+                    } => match *k {
+                        sdl2::keyboard::Keycode::Escape => {
+                            state.show_settings_overlay = false;
+                            state.mark_snapshot_dirty();
                         }
-                    }
+                        sdl2::keyboard::Keycode::Up => {
+                            if let Some(s) = &mut state.settings {
+                                s.move_up();
+                            }
+                        }
+                        sdl2::keyboard::Keycode::Down => {
+                            if let Some(s) = &mut state.settings {
+                                s.move_down(canvas_h as i32);
+                            }
+                        }
+                        sdl2::keyboard::Keycode::Left => {
+                            if let Some(s) = &mut state.settings {
+                                s.adjust(false);
+                            }
+                        }
+                        sdl2::keyboard::Keycode::Right => {
+                            if let Some(s) = &mut state.settings {
+                                s.adjust(true);
+                            }
+                        }
+                        sdl2::keyboard::Keycode::Return | sdl2::keyboard::Keycode::KpEnter => {
+                            if let Some(s) = &mut state.settings {
+                                let action = s.enter();
+                                if action == OverlayAction::ToggleFullscreen {
+                                    state.toggle_fullscreen = true;
+                                    state.show_settings_overlay = false;
+                                    state.mark_snapshot_dirty();
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
                     sdl2::event::Event::MouseButtonDown { x, y, .. } => {
                         if let Some(s) = &mut state.settings {
                             let canvas_w_i = canvas_w as i32;
                             let canvas_h_i = canvas_h as i32;
                             let action = s.click(*x as i32, *y as i32, canvas_w_i, canvas_h_i);
                             match action {
-                                OverlayAction::Close => { state.show_settings_overlay = false; state.mark_snapshot_dirty(); }
+                                OverlayAction::Close => {
+                                    state.show_settings_overlay = false;
+                                    state.mark_snapshot_dirty();
+                                }
                                 OverlayAction::ToggleFullscreen => {
                                     state.toggle_fullscreen = true;
                                     state.show_settings_overlay = false;
@@ -314,7 +445,11 @@ fn main() {
                 }
             } else {
                 // F3 opens the settings overlay
-                if let sdl2::event::Event::KeyDown { keycode: Some(sdl2::keyboard::Keycode::F3), .. } = &event {
+                if let sdl2::event::Event::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::F3),
+                    ..
+                } = &event
+                {
                     state.show_settings_overlay = true;
                 }
             }
@@ -345,7 +480,7 @@ fn main() {
             video_tex_h = canvas_h;
             committed_canvas.dirty = true;
             pipeline.render_into(&committed_canvas, &state.scene);
-            pipeline_seq = 0;  // reset so the next upload is detected
+            pipeline_seq = 0; // reset so the next upload is detected
             v2_layout = ui::v2::V2Layout::build(canvas_w as i32, canvas_h as i32);
         }
 
@@ -353,15 +488,27 @@ fn main() {
         if let Some((mx, my)) = state.pending_menu_click.take() {
             let action = menu_bar.click(mx, my, canvas_w as i32);
             match action {
-                ui::MenuAction::Undo  => { state.scene.undo(); state.mark_snapshot_dirty(); }
-                ui::MenuAction::Redo  => { state.scene.redo(); state.mark_snapshot_dirty(); }
-                ui::MenuAction::Clear => { state.scene.clear(); state.mark_snapshot_dirty(); }
-                ui::MenuAction::OpenSettings => { state.show_settings_overlay = true; state.mark_snapshot_dirty(); }
+                ui::MenuAction::Undo => {
+                    state.scene.undo();
+                    state.mark_snapshot_dirty();
+                }
+                ui::MenuAction::Redo => {
+                    state.scene.redo();
+                    state.mark_snapshot_dirty();
+                }
+                ui::MenuAction::Clear => {
+                    state.scene.clear();
+                    state.mark_snapshot_dirty();
+                }
+                ui::MenuAction::OpenSettings => {
+                    state.show_settings_overlay = true;
+                    state.mark_snapshot_dirty();
+                }
                 _ => {}
             }
             if let ui::MenuAction::SelectDevice(idx) = action {
                 menu_bar.active_idx = idx;
-                state.input_mode = 0;  // menu quick-switch always uses best mode
+                state.input_mode = 0; // menu quick-switch always uses best mode
                 state.mark_snapshot_dirty();
                 if idx == 0 {
                     capture_stop.store(true, Ordering::Relaxed);
@@ -409,8 +556,11 @@ fn main() {
                             state.cfg.rtsp.url = Some(url.clone());
                             state.cfg.rtsp.enabled = true;
                             eprintln!("[annotator] starting RTSP stream: {}", url);
-                            let (rx, fps, stop) =
-                                capture::start_rtsp_capture(&url, state.cfg.rtsp.width, state.cfg.rtsp.height);
+                            let (rx, fps, stop) = capture::start_rtsp_capture(
+                                &url,
+                                state.cfg.rtsp.width,
+                                state.cfg.rtsp.height,
+                            );
                             capture_rx = rx;
                             capture_fps_counter = fps;
                             capture_stop = stop;
@@ -458,8 +608,7 @@ fn main() {
                 }
                 state::ApiCommandKind::SetBrushSizeDelta(d) => {
                     let cur = state.brush_size as i64;
-                    state.brush_size =
-                        state::clamp_brush_size((cur + d).max(0) as u32);
+                    state.brush_size = state::clamp_brush_size((cur + d).max(0) as u32);
                     state.tool_sizes[state.active_tool.index()] = state.brush_size;
                     state.mark_snapshot_dirty();
                     state::ApiResult::Ok(serde_json::json!({
@@ -511,7 +660,12 @@ fn main() {
         let mut new_video_frame = false;
         if !state.freeze_frame {
             while let Ok(f) = capture_rx.try_recv() {
-                if let Some(frame) = f { last_video_frame = Some(frame); new_video_frame = true; }
+                if let Some(frame) = f {
+                    last_video_frame = Some(frame.clone());
+                    new_video_frame = true;
+                    // Store for the streaming worker to composite with annotation canvas.
+                    *last_video_for_stream.lock().unwrap() = Some(frame);
+                }
             }
         }
 
@@ -567,22 +721,33 @@ fn main() {
         if let Some(frame) = &last_video_frame {
             if frame.width > 0 && frame.height > 0 {
                 let desired_fmt = match frame.format {
-                    FrameFormat::Yuyv   => PixelFormatEnum::YUY2,
+                    FrameFormat::Yuyv => PixelFormatEnum::YUY2,
                     FrameFormat::Yuv420 => PixelFormatEnum::IYUV,
-                    FrameFormat::Rgb24  => PixelFormatEnum::RGB24,
+                    FrameFormat::Rgb24 => PixelFormatEnum::RGB24,
                 };
                 // Recreate BOTH textures if dimensions or format changed.
                 // Recreating only one is a tearing window (the in-flight blit
                 // could be sampling the one we just replaced), so we replace
                 // both atomically and reset the front-index.
-                if frame.width != video_tex_w || frame.height != video_tex_h || desired_fmt != video_tex_fmt {
-                    let t0 = texture_creator.create_texture_streaming(desired_fmt, frame.width, frame.height);
-                    let t1 = texture_creator.create_texture_streaming(desired_fmt, frame.width, frame.height);
+                if frame.width != video_tex_w
+                    || frame.height != video_tex_h
+                    || desired_fmt != video_tex_fmt
+                {
+                    let t0 = texture_creator.create_texture_streaming(
+                        desired_fmt,
+                        frame.width,
+                        frame.height,
+                    );
+                    let t1 = texture_creator.create_texture_streaming(
+                        desired_fmt,
+                        frame.width,
+                        frame.height,
+                    );
                     if let (Ok(t0), Ok(t1)) = (t0, t1) {
                         video_tex = [t0, t1];
                         video_tex_idx = 0;
-                        video_tex_w   = frame.width;
-                        video_tex_h   = frame.height;
+                        video_tex_w = frame.width;
+                        video_tex_h = frame.height;
                         video_tex_fmt = desired_fmt;
                     }
                 }
@@ -593,9 +758,11 @@ fn main() {
                     // contiguous buffer with this exact layout — which is what ffmpeg
                     // produces when `-pix_fmt yuv420p` is set.
                     let pitch = match frame.format {
-                        FrameFormat::Yuyv   => (frame.width * 2) as usize,
-                        FrameFormat::Yuv420 => (frame.width as usize) * (frame.height as usize) * 3 / 2,
-                        FrameFormat::Rgb24  => (frame.width * 3) as usize,
+                        FrameFormat::Yuyv => (frame.width * 2) as usize,
+                        FrameFormat::Yuv420 => {
+                            (frame.width as usize) * (frame.height as usize) * 3 / 2
+                        }
+                        FrameFormat::Rgb24 => (frame.width * 3) as usize,
                     };
                     // Upload into the BACK buffer (the one not being sampled by
                     // this frame's blit).
@@ -623,18 +790,31 @@ fn main() {
                 dbg_upload_count,
                 dbg_render_count as f64 / dbg_stat_timer.elapsed().as_secs_f64().max(0.001)
             );
+            // ── DBG: frame-state summary — what the render loop is seeing.
+            // Useful for diagnosing "strokes don't commit" on resource-
+            // constrained platforms: if scene.dirty never goes true, input
+            // events aren't reaching handle_release.  If pipeline_seq never
+            // advances, the worker is stuck or failed to spawn.
+            eprintln!(
+                "[dbg] frame: scene.dirty={} committed.dirty={} active_stroke={} scene.objects={} pipeline_seq={}",
+                state.scene.dirty,
+                committed_canvas.dirty,
+                state.active_stroke.is_some(),
+                state.scene.objects().len(),
+                pipeline_seq,
+            );
             dbg_render_count = 0;
             dbg_upload_count = 0;
-            dbg_stat_timer   = Instant::now();
+            dbg_stat_timer = Instant::now();
         }
 
         // Update display fps counter every second
         fps_frame_count += 1;
         let fps_elapsed = fps_timer.elapsed().as_secs_f32();
         if fps_elapsed >= 1.0 {
-            display_fps  = fps_frame_count as f32 / fps_elapsed;
+            display_fps = fps_frame_count as f32 / fps_elapsed;
             fps_frame_count = 0;
-            fps_timer    = Instant::now();
+            fps_timer = Instant::now();
         }
 
         // ── Annotation overlay ─────────────────────────────────────────
@@ -648,7 +828,12 @@ fn main() {
         //   2. Active stroke — drawn directly via SDL2 GPU primitives on
         //      top of `committed_tex` (TODO 5).  No CPU canvas, no 8.3 MB
         //      upload per frame.
-        let overlay_src = Rect::new(0, MENU_HEIGHT, canvas_w, canvas_h.saturating_sub(toolbar_height(canvas_w as i32) as u32 + MENU_HEIGHT as u32));
+        let overlay_src = Rect::new(
+            0,
+            MENU_HEIGHT,
+            canvas_w,
+            canvas_h.saturating_sub(toolbar_height(canvas_w as i32) as u32 + MENU_HEIGHT as u32),
+        );
 
         // Live eraser preview: while the eraser is being dragged, skip the
         // background pipeline (the worker would re-rasterize the pre-wipe
@@ -680,7 +865,9 @@ fn main() {
                 let stride = canvas_w as usize * 4;
                 let offset = (y as usize) * stride + (x as usize) * 4;
                 let rect = Rect::new(x, y, w, h);
-                committed_tex.update(Some(rect), &committed_canvas.pixels[offset..], stride).ok();
+                committed_tex
+                    .update(Some(rect), &committed_canvas.pixels[offset..], stride)
+                    .ok();
                 // Reset the accumulator so the next frame starts fresh.
                 state.eraser_dirty_min = (i32::MAX, i32::MAX);
                 state.eraser_dirty_max = (i32::MIN, i32::MIN);
@@ -689,10 +876,19 @@ fn main() {
         } else {
             // Submit a render job whenever scene or input is dirty.
             if state.scene.dirty || committed_canvas.dirty {
+                if debug {
+                    eprintln!(
+                        "[dbg] render: scene.dirty={} committed.dirty={} -> submitting scene (objects={})",
+                        state.scene.dirty,
+                        committed_canvas.dirty,
+                        state.scene.objects().len(),
+                    );
+                }
                 // Copy the input canvas into the pipeline's back buffer so the
                 // worker can use it as the base layer, then submit the scene.
-                // The worker reads front_pixels (== previous render result)
-                // and writes the new render into back_pixels.
+                // The worker rasterizes `scene` into the back buffer, then
+                // atomically swaps front/back; the next `poll()` here will
+                // see the new front and call `upload_to()` to push it to GPU.
                 pipeline.submit_scene(&committed_canvas, &state.scene);
                 committed_canvas.dirty = false;
                 state.scene.dirty = false;
@@ -700,11 +896,21 @@ fn main() {
 
             // Drain any completed worker frames into the GPU texture.
             if pipeline.poll(&mut pipeline_seq) {
+                if debug {
+                    eprintln!(
+                        "[dbg] render: poll returned true (new frame ready), uploading to texture"
+                    );
+                }
                 pipeline.upload_to(&mut committed_tex);
+                if debug {
+                    eprintln!("[dbg] render: texture upload complete");
+                }
             }
         }
 
-        sdl_canvas.copy(&committed_tex, overlay_src, overlay_src).ok();
+        sdl_canvas
+            .copy(&committed_tex, overlay_src, overlay_src)
+            .ok();
 
         // Layer 2: active stroke — direct GPU primitives (TODO 5).
         if let Some(ref active) = state.active_stroke {
@@ -765,9 +971,13 @@ fn main() {
         {
             let laser_fade = state.settings.as_ref().map(|s| s.laser_fade).unwrap_or(1.2);
             let now = Instant::now();
-            state.laser_trail.retain(|(_, _, t, _)| now.duration_since(*t).as_secs_f32() < laser_fade);
+            state
+                .laser_trail
+                .retain(|(_, _, t, _)| now.duration_since(*t).as_secs_f32() < laser_fade);
             let tlen = state.laser_trail.len();
-            let size = (state.tool_sizes[Tool::Laser.index()] as i32).max(1).min(20);
+            let size = (state.tool_sizes[Tool::Laser.index()] as i32)
+                .max(1)
+                .min(20);
             let half = size / 2;
             // Draw connected segments — old end is transparent, new end is opaque
             for i in 1..tlen {
@@ -784,10 +994,9 @@ fn main() {
                 for k in -half..=half {
                     let ox = (px * k as f32).round() as i32;
                     let oy = (py * k as f32).round() as i32;
-                    sdl_canvas.draw_line(
-                        Point::new(x0 + ox, y0 + oy),
-                        Point::new(x1 + ox, y1 + oy),
-                    ).ok();
+                    sdl_canvas
+                        .draw_line(Point::new(x0 + ox, y0 + oy), Point::new(x1 + ox, y1 + oy))
+                        .ok();
                 }
             }
             // Bright head dot at the current cursor position
@@ -796,10 +1005,9 @@ fn main() {
                 sdl_canvas.set_draw_color(Color::RGBA(*r, *g, *b, 255));
                 for dy in -core..=core {
                     let xw = (((core * core - dy * dy) as f32).sqrt()) as i32;
-                    sdl_canvas.draw_line(
-                        Point::new(x - xw, y + dy),
-                        Point::new(x + xw, y + dy),
-                    ).ok();
+                    sdl_canvas
+                        .draw_line(Point::new(x - xw, y + dy), Point::new(x + xw, y + dy))
+                        .ok();
                 }
             }
         }
@@ -862,21 +1070,47 @@ fn main() {
         // Device picker on top
         if state.show_device_picker {
             if let Some(picker) = &state.device_picker {
-                picker.draw(&mut sdl_canvas, &font, canvas_w as i32, canvas_h as i32, &mut text_cache);
+                picker.draw(
+                    &mut sdl_canvas,
+                    &font,
+                    canvas_w as i32,
+                    canvas_h as i32,
+                    &mut text_cache,
+                );
             }
         }
 
         // Settings overlay — modal panel drawn above everything else
         if state.show_settings_overlay {
             if let Some(ref mut settings) = state.settings {
-                settings.draw(&mut sdl_canvas, &font, canvas_w as i32, canvas_h as i32, &mut text_cache);
+                settings.draw(
+                    &mut sdl_canvas,
+                    &font,
+                    canvas_w as i32,
+                    canvas_h as i32,
+                    &mut text_cache,
+                );
             }
         }
 
         // Menu bar (always on top)
         let capture_fps = capture_fps_counter.load(Ordering::Relaxed) as f32 / 10.0;
-        let show_fps = state.settings.as_ref().map(|s| s.show_fps == Toggle::On).unwrap_or(true);
-        menu_bar.draw(&mut sdl_canvas, &font, canvas_w as i32, !state.scene.undo_stack.is_empty(), !state.scene.redo_stack.is_empty(), show_fps, capture_fps, display_fps, &mut text_cache);
+        let show_fps = state
+            .settings
+            .as_ref()
+            .map(|s| s.show_fps == Toggle::On)
+            .unwrap_or(true);
+        menu_bar.draw(
+            &mut sdl_canvas,
+            &font,
+            canvas_w as i32,
+            !state.scene.undo_stack.is_empty(),
+            !state.scene.redo_stack.is_empty(),
+            show_fps,
+            capture_fps,
+            display_fps,
+            &mut text_cache,
+        );
 
         sdl_canvas.present();
 
@@ -889,7 +1123,12 @@ fn main() {
             || state.last_snapshot_publish.elapsed() >= Duration::from_millis(500);
         if snap_due {
             if let Ok(mut snap) = api_snapshot.write() {
-                *snap = state.to_snapshot(menu_bar.active_idx, &menu_bar.devices, display_fps, capture_fps);
+                *snap = state.to_snapshot(
+                    menu_bar.active_idx,
+                    &menu_bar.devices,
+                    display_fps,
+                    capture_fps,
+                );
             }
             state.snapshot_dirty = false;
             state.last_snapshot_publish = Instant::now();
@@ -976,10 +1215,8 @@ fn draw_gpu_thick_line(
     for k in -half..=half {
         let ox = (px * k as f32).round() as i32;
         let oy = (py * k as f32).round() as i32;
-        sdl.draw_line(
-            Point::new(x0 + ox, y0 + oy),
-            Point::new(x1 + ox, y1 + oy),
-        ).ok();
+        sdl.draw_line(Point::new(x0 + ox, y0 + oy), Point::new(x1 + ox, y1 + oy))
+            .ok();
     }
 }
 
@@ -1003,7 +1240,8 @@ fn draw_preview_sdl(sdl: &mut sdl2::render::Canvas<sdl2::video::Window>, obj: &D
                 sdl.draw_line(
                     Point::new(s.x0 + ox, s.y0 + oy),
                     Point::new(s.x1 + ox, s.y1 + oy),
-                ).ok();
+                )
+                .ok();
             }
         }
         DrawObject::Rect(s) => {
@@ -1015,7 +1253,9 @@ fn draw_preview_sdl(sdl: &mut sdl2::render::Canvas<sdl2::video::Window>, obj: &D
             for i in 0..t {
                 let w = (x1 - x0 - 2 * i).max(0) as u32;
                 let h = (y1 - y0 - 2 * i).max(0) as u32;
-                if w == 0 || h == 0 { break; }
+                if w == 0 || h == 0 {
+                    break;
+                }
                 sdl.draw_rect(Rect::new(x0 + i, y0 + i, w, h)).ok();
             }
         }
@@ -1061,16 +1301,23 @@ fn draw_preview_sdl(sdl: &mut sdl2::render::Canvas<sdl2::video::Window>, obj: &D
                 sdl.draw_line(
                     Point::new(s.x0 + ox, s.y0 + oy),
                     Point::new(s.x1 + ox, s.y1 + oy),
-                ).ok();
+                )
+                .ok();
             }
             // arrowhead outline
             let head_len = ((t * 4 + 20) as f32).min(60.0);
-            let head_w   = ((t * 2 + 10) as f32).min(30.0);
+            let head_w = ((t * 2 + 10) as f32).min(30.0);
             let bx = s.x1 - (ux * head_len).round() as i32;
             let by = s.y1 - (uy * head_len).round() as i32;
-            let left  = Point::new(bx + (px * head_w).round() as i32, by + (py * head_w).round() as i32);
-            let right = Point::new(bx - (px * head_w).round() as i32, by - (py * head_w).round() as i32);
-            let tip   = Point::new(s.x1, s.y1);
+            let left = Point::new(
+                bx + (px * head_w).round() as i32,
+                by + (py * head_w).round() as i32,
+            );
+            let right = Point::new(
+                bx - (px * head_w).round() as i32,
+                by - (py * head_w).round() as i32,
+            );
+            let tip = Point::new(s.x1, s.y1);
             sdl.draw_line(tip, left).ok();
             sdl.draw_line(tip, right).ok();
             sdl.draw_line(left, right).ok();
@@ -1080,7 +1327,8 @@ fn draw_preview_sdl(sdl: &mut sdl2::render::Canvas<sdl2::video::Window>, obj: &D
 }
 
 fn scale_rect(canvas_w: u32, canvas_h: u32, frame_w: u32, frame_h: u32) -> Rect {
-    let avail_h = canvas_h.saturating_sub(toolbar_height(canvas_w as i32) as u32 + MENU_HEIGHT as u32);
+    let avail_h =
+        canvas_h.saturating_sub(toolbar_height(canvas_w as i32) as u32 + MENU_HEIGHT as u32);
     let avail_w = canvas_w;
     // Scale frame to fit within available area, preserving aspect ratio
     let scale = (avail_w as f32 / frame_w as f32).min(avail_h as f32 / frame_h as f32);
@@ -1099,7 +1347,9 @@ fn blit_text_to_canvas(
     color: (u8, u8, u8),
     font: &sdl2::ttf::Font,
 ) {
-    if text.is_empty() { return; }
+    if text.is_empty() {
+        return;
+    }
 
     let surface = match font
         .render(text)
@@ -1109,19 +1359,23 @@ fn blit_text_to_canvas(
         Err(_) => return,
     };
 
-    let sw    = surface.width()  as i32;
-    let sh    = surface.height() as i32;
-    let pitch = surface.pitch()  as i32;
+    let sw = surface.width() as i32;
+    let sh = surface.height() as i32;
+    let pitch = surface.pitch() as i32;
 
     surface.with_lock(|pixels| {
         for sy in 0..sh {
             for sx in 0..sw {
                 let dx = pos.0 + sx;
                 let dy = pos.1 + sy;
-                if dx < 0 || dy < 0 { continue; }
+                if dx < 0 || dy < 0 {
+                    continue;
+                }
                 // SDL blended surface: ARGB8888 layout (B G R A in little-endian)
                 let base = (sy * pitch + sx * 4) as usize;
-                if base + 3 >= pixels.len() { continue; }
+                if base + 3 >= pixels.len() {
+                    continue;
+                }
                 let b = pixels[base];
                 let g = pixels[base + 1];
                 let r = pixels[base + 2];

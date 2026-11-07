@@ -14,7 +14,7 @@ use crate::{
     capture::DeviceInfo,
     config,
     scene::{DrawObject, Scene},
-    tools::{Tool, PALETTE},
+    tools::{PALETTE, Tool},
     ui::{DevicePicker, OverlayAction, OverlaySettings},
 };
 
@@ -65,7 +65,7 @@ fn err_json(msg: &str) -> String {
 /// A mutation request handed from an API connection thread to the main loop.
 /// The `reply` oneshot MUST be answered — the HTTP thread is blocked on it.
 pub struct ApiCommand {
-    pub kind:  ApiCommandKind,
+    pub kind: ApiCommandKind,
     pub reply: std::sync::mpsc::SyncSender<ApiResult>,
 }
 
@@ -98,10 +98,16 @@ pub fn clamp_brush_size(px: u32) -> u32 {
 pub fn parse_hex_color(s: &str) -> Result<(u8, u8, u8), String> {
     let s = s.trim().trim_start_matches('#');
     if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("bad hex color '{s}' — expected 6 hex digits (rrggbb)"));
+        return Err(format!(
+            "bad hex color '{s}' — expected 6 hex digits (rrggbb)"
+        ));
     }
     let n = u32::from_str_radix(s, 16).unwrap(); // 6 hexdigits always parse
-    Ok((((n >> 16) & 0xff) as u8, ((n >> 8) & 0xff) as u8, (n & 0xff) as u8))
+    Ok((
+        ((n >> 16) & 0xff) as u8,
+        ((n >> 8) & 0xff) as u8,
+        (n & 0xff) as u8,
+    ))
 }
 
 /// Parse `palette=1..8` against the on-screen `PALETTE`.
@@ -128,19 +134,19 @@ pub fn parse_usize(s: &str, what: &str) -> Result<usize, String> {
 
 pub struct AppState {
     // Tool / drawing
-    pub active_tool:         Tool,
-    pub color:               (u8, u8, u8),
-    pub brush_size:          u32,
+    pub active_tool: Tool,
+    pub color: (u8, u8, u8),
+    pub brush_size: u32,
     /// Per-tool remembered sizes; indexed by Tool::index()
-    pub tool_sizes:          [u32; 10],
+    pub tool_sizes: [u32; 10],
 
     // Laser pointer ephemeral trail: (x, y, timestamp, color)
-    pub laser_trail:         Vec<(i32, i32, Instant, (u8, u8, u8))>,
+    pub laser_trail: Vec<(i32, i32, Instant, (u8, u8, u8))>,
 
     // Mouse drag
-    pub mouse_down:          bool,
-    pub drag_start:          (i32, i32),
-    pub drag_cur:            (i32, i32),
+    pub mouse_down: bool,
+    pub drag_start: (i32, i32),
+    pub drag_cur: (i32, i32),
 
     /// Active stroke being drawn (pen or highlight).  Lives outside the
     /// scene while in progress so the scene's committed texture isn't
@@ -150,12 +156,12 @@ pub struct AppState {
     /// The eraser is *not* tracked here — see [`eraser_drag`].  An eraser
     /// commit mutates the committed canvas pixels directly and then bakes
     /// them into `scene.baked_bg`.
-    pub active_stroke:       Option<DrawObject>,
+    pub active_stroke: Option<DrawObject>,
 
     /// In-progress eraser drag (mouse-down through mouse-up).  When this
     /// is `Some`, `input::handle_release` will apply the erase circles to
     /// the committed canvas and bake the result into the scene.
-    pub eraser_drag:         Option<EraserDrag>,
+    pub eraser_drag: Option<EraserDrag>,
 
     /// Bounding box (inclusive min, exclusive max in canvas pixel space)
     /// of the region of `committed_canvas` that was alpha-zeroed by the
@@ -168,22 +174,22 @@ pub struct AppState {
     ///
     /// Sentinel values (`i32::MAX / i32::MIN`) mean "no wipes since last
     /// reset" and the upload is skipped.
-    pub eraser_dirty_min:    (i32, i32),
-    pub eraser_dirty_max:    (i32, i32),
+    pub eraser_dirty_min: (i32, i32),
+    pub eraser_dirty_max: (i32, i32),
 
     // Scene (object model)
-    pub scene:               Scene,
+    pub scene: Scene,
 
     // Text input
-    pub text_input_active:   bool,
-    pub text_buffer:         String,
-    pub text_pos:            (i32, i32),
+    pub text_input_active: bool,
+    pub text_buffer: String,
+    pub text_pos: (i32, i32),
     pub pending_text_commit: bool,
 
     // Device picker
-    pub show_device_picker:  bool,
-    pub device_picker:       Option<DevicePicker>,
-    pub picker_confirmed:    Option<(usize, usize)>,  // (device_idx, mode_idx)
+    pub show_device_picker: bool,
+    pub device_picker: Option<DevicePicker>,
+    pub picker_confirmed: Option<(usize, usize)>, // (device_idx, mode_idx)
 
     // Set when a select-drag undo snapshot was pushed; cancelled if no movement
     pub pending_select_undo: bool,
@@ -193,46 +199,46 @@ pub struct AppState {
     /// press point; on mouse-up every object whose bounds overlap the
     /// rect (start..cur) is added to the selection.  `None` outside of
     /// a marquee drag.  Drawn live via direct GPU primitives in main.rs.
-    pub marquee:             Option<(i32, i32, i32, i32)>,  // (x0, y0, x1, y1)
+    pub marquee: Option<(i32, i32, i32, i32)>, // (x0, y0, x1, y1)
 
     // Draw lock (set after undo/redo to absorb accidental mouse-down)
-    pub draw_locked_until:   Option<Instant>,
+    pub draw_locked_until: Option<Instant>,
 
     // Video
-    pub freeze_frame:        bool,
+    pub freeze_frame: bool,
     /// Screenshot requested via UI button - consumed by main loop
     pub screenshot_requested: bool,
     /// Mode index (into the active device's `modes[]`) the capture thread was
     /// started with.  0 = "best" (used by menu-bar quick-switch).
-    pub input_mode:          usize,
+    pub input_mode: usize,
 
     // Menu bar
-    pub pending_menu_click:  Option<(i32, i32)>,
+    pub pending_menu_click: Option<(i32, i32)>,
     pub menu_close_requested: bool,
 
     // Window
-    pub toggle_fullscreen:   bool,
-    pub is_fullscreen:       bool,
-    pub window_size:         (u32, u32),
+    pub toggle_fullscreen: bool,
+    pub is_fullscreen: bool,
+    pub window_size: (u32, u32),
 
     /// True while Shift is physically held.  Updated on KeyDown/KeyUp so
     /// mouse-button events (which don't carry modifier state) can check
     /// it for shift-click semantics (e.g. multi-select toggle).
-    pub shift_down:         bool,
+    pub shift_down: bool,
 
     // Config ref
     pub cfg: config::Config,
 
     // Overlay settings panel
     pub show_settings_overlay: bool,
-    pub settings:             Option<OverlaySettings>,
-    pub settings_action:     Option<OverlayAction>,
+    pub settings: Option<OverlaySettings>,
+    pub settings_action: Option<OverlayAction>,
 
     /// Set whenever a field that contributes to [`StateSnapshot`] has been
     /// mutated.  The main loop clears it after publishing a fresh snapshot
     /// to the API threads; while it's false, [`AppState::to_snapshot`] is
     /// not called.  See TODO 4 in perf-todos.md.
-    pub snapshot_dirty:       bool,
+    pub snapshot_dirty: bool,
 
     /// Wall-clock of the last published snapshot — used to throttle
     /// periodic rebuilds of FPS-bearing fields (TODO 4).
@@ -241,51 +247,53 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(cfg: config::Config) -> Self {
-        let color      = config::parse_color(&cfg.tool_color);
+        let color = config::parse_color(&cfg.tool_color);
         let undo_limit = cfg.undo_stack_limit;
-        let tool_size  = cfg.tool_size.max(1);
-        let is_full    = cfg.fullscreen && !cfg.windowed;
-        let tool_sizes: [u32; 10] = [8, tool_size, tool_size, tool_size, tool_size, tool_size, tool_size, 40, 12, 6];
+        let tool_size = cfg.tool_size.max(1);
+        let is_full = cfg.fullscreen && !cfg.windowed;
+        let tool_sizes: [u32; 10] = [
+            10, tool_size, tool_size, tool_size, tool_size, tool_size, tool_size, 40, 12, 6,
+        ];
         let brush_size = tool_sizes[Tool::Pen.index()];
         Self {
-            active_tool:         Tool::Pen,
+            active_tool: Tool::Pen,
             color,
             brush_size,
             tool_sizes,
-            mouse_down:          false,
-            drag_start:          (0, 0),
-            drag_cur:            (0, 0),
-            active_stroke:       None,
-            eraser_drag:         None,
-            scene:               Scene::new(undo_limit),
-            text_input_active:   false,
-            text_buffer:         String::new(),
-            text_pos:            (0, 0),
+            mouse_down: false,
+            drag_start: (0, 0),
+            drag_cur: (0, 0),
+            active_stroke: None,
+            eraser_drag: None,
+            scene: Scene::new(undo_limit),
+            text_input_active: false,
+            text_buffer: String::new(),
+            text_pos: (0, 0),
             pending_text_commit: false,
-            show_device_picker:  true,
-            device_picker:       None,
-            picker_confirmed:    None,
-            toggle_fullscreen:   false,
-            is_fullscreen:       is_full,
-            window_size:         (cfg.width, cfg.height),
-            shift_down:          false,
+            show_device_picker: true,
+            device_picker: None,
+            picker_confirmed: None,
+            toggle_fullscreen: false,
+            is_fullscreen: is_full,
+            window_size: (cfg.width, cfg.height),
+            shift_down: false,
             pending_select_undo: false,
-            marquee:             None,
-            draw_locked_until:   None,
-            freeze_frame:        false,
+            marquee: None,
+            draw_locked_until: None,
+            freeze_frame: false,
             screenshot_requested: false,
-            input_mode:          0,
-            laser_trail:         Vec::new(),
-            pending_menu_click:  None,
+            input_mode: 0,
+            laser_trail: Vec::new(),
+            pending_menu_click: None,
             menu_close_requested: false,
             cfg,
             show_settings_overlay: false,
-            settings:             None,
-            settings_action:     None,
-            snapshot_dirty:       true,  // first frame always rebuilds
+            settings: None,
+            settings_action: None,
+            snapshot_dirty: true, // first frame always rebuilds
             last_snapshot_publish: Instant::now() - std::time::Duration::from_secs(1),
-            eraser_dirty_min:    (i32::MAX, i32::MAX),
-            eraser_dirty_max:    (i32::MIN, i32::MIN),
+            eraser_dirty_min: (i32::MAX, i32::MAX),
+            eraser_dirty_max: (i32::MIN, i32::MIN),
         }
     }
 
@@ -305,22 +313,22 @@ impl AppState {
     pub fn to_snapshot(
         &self,
         active_input: usize,
-        devices:      &[DeviceInfo],
-        fps:          f32,
-        capture_fps:  f32,
+        devices: &[DeviceInfo],
+        fps: f32,
+        capture_fps: f32,
     ) -> StateSnapshot {
         let mut inputs = Vec::with_capacity(devices.len() + 1);
         inputs.push(InputInfo {
             index: 0,
-            name:  "No input (black screen)".to_string(),
-            path:  None,
+            name: "No input (black screen)".to_string(),
+            path: None,
             modes: Vec::new(),
         });
         for (i, d) in devices.iter().enumerate() {
             inputs.push(InputInfo {
                 index: i + 1,
-                name:  d.name.clone(),
-                path:  Some(d.path.display().to_string()),
+                name: d.name.clone(),
+                path: Some(d.path.display().to_string()),
                 modes: d.modes.iter().map(|m| m.label()).collect(),
             });
         }
@@ -338,34 +346,35 @@ impl AppState {
         };
 
         StateSnapshot {
-            api_version:         "1",
-            version:             env!("CARGO_PKG_VERSION"),
-            tool:                self.active_tool.name(),
-            color:               format!(
-                "{:02x}{:02x}{:02x}", self.color.0, self.color.1, self.color.2
+            api_version: "1",
+            version: env!("CARGO_PKG_VERSION"),
+            tool: self.active_tool.name(),
+            color: format!(
+                "{:02x}{:02x}{:02x}",
+                self.color.0, self.color.1, self.color.2
             ),
-            brush_size:          self.brush_size,
-            tool_sizes:          self.tool_sizes,
-            input:               active_input,
-            input_mode:          self.input_mode,
+            brush_size: self.brush_size,
+            tool_sizes: self.tool_sizes,
+            input: active_input,
+            input_mode: self.input_mode,
             inputs,
-            freeze:              self.freeze_frame,
-            fullscreen:          self.is_fullscreen,
+            freeze: self.freeze_frame,
+            fullscreen: self.is_fullscreen,
             laser_on,
             laser_fade,
             show_fps,
             undo_limit,
-            can_undo:            !self.scene.undo_stack.is_empty(),
-            can_redo:            !self.scene.redo_stack.is_empty(),
-            object_count:        self.scene.objects().len(),
+            can_undo: !self.scene.undo_stack.is_empty(),
+            can_redo: !self.scene.redo_stack.is_empty(),
+            object_count: self.scene.objects().len(),
             // Number of selected live objects (0 = nothing selected).
-            selected:            self.scene.selected.len(),
-            drawing:             self.active_stroke.is_some(),
-            text_input_active:   self.text_input_active,
-            device_picker_open:  self.show_device_picker,
-            window_size:         [self.window_size.0, self.window_size.1],
-            fps:                 fps.round() as u32,
-            capture_fps:         capture_fps.round() as u32,
+            selected: self.scene.selected.len(),
+            drawing: self.active_stroke.is_some(),
+            text_input_active: self.text_input_active,
+            device_picker_open: self.show_device_picker,
+            window_size: [self.window_size.0, self.window_size.1],
+            fps: fps.round() as u32,
+            capture_fps: capture_fps.round() as u32,
         }
     }
 }
@@ -378,10 +387,10 @@ impl AppState {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct InputInfo {
     pub index: usize,
-    pub name:  String,
+    pub name: String,
     /// Device path (`/dev/video0`); absent for the index-0 "no input" entry.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub path:  Option<String>,
+    pub path: Option<String>,
     pub modes: Vec<String>,
 }
 
@@ -390,32 +399,32 @@ pub struct InputInfo {
 /// Field order matches the plan's Appendix A.5 payload.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct StateSnapshot {
-    pub api_version:        &'static str,
-    pub version:            &'static str,
-    pub tool:               &'static str,
-    pub color:              String,
-    pub brush_size:         u32,
-    pub tool_sizes:         [u32; 10],
-    pub input:              usize,
-    pub input_mode:         usize,
-    pub inputs:             Vec<InputInfo>,
-    pub freeze:             bool,
-    pub fullscreen:         bool,
-    pub laser_on:           bool,
+    pub api_version: &'static str,
+    pub version: &'static str,
+    pub tool: &'static str,
+    pub color: String,
+    pub brush_size: u32,
+    pub tool_sizes: [u32; 10],
+    pub input: usize,
+    pub input_mode: usize,
+    pub inputs: Vec<InputInfo>,
+    pub freeze: bool,
+    pub fullscreen: bool,
+    pub laser_on: bool,
     /// Seconds; f64 (not f32) so serde_json emits clean decimals like 1.2.
-    pub laser_fade:         f64,
-    pub show_fps:           bool,
-    pub undo_limit:         usize,
-    pub can_undo:           bool,
-    pub can_redo:           bool,
-    pub object_count:       usize,
+    pub laser_fade: f64,
+    pub show_fps: bool,
+    pub undo_limit: usize,
+    pub can_undo: bool,
+    pub can_redo: bool,
+    pub object_count: usize,
     /// Number of currently-selected live objects (0 = nothing selected).
     /// Multi-select: any non-zero count is "something is selected".
-    pub selected:           usize,
-    pub drawing:            bool,
-    pub text_input_active:  bool,
+    pub selected: usize,
+    pub drawing: bool,
+    pub text_input_active: bool,
     pub device_picker_open: bool,
-    pub window_size:        [u32; 2],
-    pub fps:                u32,
-    pub capture_fps:        u32,
+    pub window_size: [u32; 2],
+    pub fps: u32,
+    pub capture_fps: u32,
 }

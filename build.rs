@@ -51,8 +51,8 @@ fn fetch_fa_solid(assets: &Path) {
          6.7.2/fontawesome-free-6.7.2-desktop.zip",
     );
     // Clone so we can reuse the bytes for diagnostics if the entry isn't found.
-    let mut archive =
-        zip::ZipArchive::new(io::Cursor::new(data.clone())).expect("failed to open Font Awesome zip");
+    let mut archive = zip::ZipArchive::new(io::Cursor::new(data.clone()))
+        .expect("failed to open Font Awesome zip");
     let solid_index = (0..archive.len()).find(|&i| {
         archive.by_index(i).ok().map_or(false, |f| {
             let n = f.name().to_owned();
@@ -86,23 +86,8 @@ fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let out = Path::new(&out_dir);
 
+    // The fonts are fetched at build time so that the binary carries them
+    // and does not depend on anything being installed on the target.
     fetch_dejavu(out);
     fetch_fa_solid(out);
-
-    // ANNOTATOR_INNER_BUILD is set by the buildroot annotator package's
-    // ANNOTATOR_BUILD_CMDS before invoking cargo.  When set we are running
-    // inside buildroot and must NOT re-enter build_iso() — doing so would
-    // start another buildroot instance and cause infinite recursion.
-    //
-    // As a belt-and-suspenders guard, also detect the inner build structurally:
-    // when cargo is invoked by buildroot, OUT_DIR lives underneath
-    // "buildroot-output/" in the outer build's output tree.  This check works
-    // even if the env var is stripped by $(TARGET_MAKE_ENV) or a wrapper script.
-    //
-    // ANNOTATOR_BUILD_ISO=1 (opt-in) triggers the full buildroot ISO build.
-    // By default we only build the annotator binary — no buildroot, no git
-    // clone, no make.  See README for cross-compilation / ISO build details.
-    println!("cargo:rerun-if-env-changed=ANNOTATOR_INNER_BUILD");
-    println!("cargo:rerun-if-env-changed=ANNOTATOR_BUILD_ISO");
-    // ISO building is now handled by build-iso.sh using the x86_64 sysroot.
 }

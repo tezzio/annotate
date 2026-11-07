@@ -22,7 +22,7 @@
 //! - `pending: Mutex<Option<SceneSnapshot>>` holds the latest scene to
 //!   render; the worker waits on `cv` for new work.
 
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
@@ -31,14 +31,30 @@ use sdl2::render::Texture;
 use crate::canvas::Canvas;
 use crate::scene::Scene;
 
+/// Callback type for canvas frame capture.
+/// Receives the rendered RGBA pixels (as Arc<Vec<u8>>), width, and height.
+/// Called from the worker thread after each successful render.
+/// `Sync` is required because the callback is stored in a `Mutex` inside
+/// `PipelineInner` which is shared across threads via `Arc`.
+pub type CanvasFrameCallback = Box<dyn Fn(Arc<Vec<u8>>, u32, u32) + Send + Sync>;
+
+/// Shared `ANNOTATOR_DEBUG` gate.  `main.rs` flips this on once at startup
+/// after reading the env var; `input.rs` and `worker_loop` poll it before
+/// each `eprintln!` so the debug cost is one atomic load per site.
+pub static DEBUG: AtomicBool = AtomicBool::new(false);
+
 /// Index of which buffer is currently the "front" (display) canvas.
 /// `0` → `buffers[0]`, `1` → `buffers[1]`.  Toggled by the worker via
 /// `fetch_xor(1)` after each successful render.
 struct FrontIndex(AtomicU8);
 
 impl FrontIndex {
-    fn new() -> Self { Self(AtomicU8::new(0)) }
-    fn get(&self) -> usize { self.0.load(Ordering::Acquire) as usize }
+    fn new() -> Self {
+        Self(AtomicU8::new(0))
+    }
+    fn get(&self) -> usize {
+        self.0.load(Ordering::Acquire) as usize
+    }
     /// Atomically toggle 0↔1 and return the *new* value.
     fn swap(&self) -> usize {
         // fetch_xor returns the previous value; XOR with 1 to get the new one.
@@ -55,27 +71,30 @@ pub struct RenderPipeline {
 
 struct PipelineInner {
     /// Width / height of each buffer (rows × cols of pixels).
-    width:  u32,
+    width: u32,
     height: u32,
     /// Double-buffered CPU canvases.  Held in a Mutex so both the main
     /// thread (which writes the input canvas into the back buffer on
     /// `submit_scene`) and the worker (which writes the rendered result
     /// and swaps the front pointer) can take a `&mut [Canvas; 2]`
-    /// exclusively.  The main thread's only contended operation is the
-    /// input-canvas copy at `submit_scene`; otherwise it just reads
-    /// `front_pixels()` under no lock (the front buffer is stable until
-    /// the next swap).
-    buffers:   Mutex<[Canvas; 2]>,
+    /// exclusively.  The main thread's only contended operations are
+    /// the input-canvas copy at `submit_scene` and the snapshot copy
+    /// inside `upload_to()`; otherwise the front buffer is stable until
+    /// the next swap.
+    buffers: Mutex<[Canvas; 2]>,
     front_idx: FrontIndex,
     /// Latest scene snapshot to render (replaced atomically by submit()).
-    pending:   Mutex<Option<Scene>>,
+    pending: Mutex<Option<Scene>>,
     /// Worker waits on this when `pending` is empty.
-    cv:        Condvar,
+    cv: Condvar,
     /// Set to true on shutdown; worker exits its loop on next wake.
-    shutdown:  Mutex<bool>,
+    shutdown: Mutex<bool>,
     /// Monotonic completion counter; incremented by the worker after
     /// each successful render.  Read by `poll()`.
-    seq:       AtomicU64,
+    seq: AtomicU64,
+    /// Optional callback invoked after each successful render with the
+    /// finished RGBA frame data.  Set via `on_canvas_frame()`.
+    frame_callback: Mutex<Option<Arc<CanvasFrameCallback>>>,
 }
 
 impl RenderPipeline {
@@ -85,22 +104,38 @@ impl RenderPipeline {
         let inner = Arc::new(PipelineInner {
             width,
             height,
-            buffers:   Mutex::new([
-                Canvas::new(width, height),
-                Canvas::new(width, height),
-            ]),
+            buffers: Mutex::new([Canvas::new(width, height), Canvas::new(width, height)]),
             front_idx: FrontIndex::new(),
-            pending:   Mutex::new(None),
-            cv:        Condvar::new(),
-            shutdown:  Mutex::new(false),
-            seq:       AtomicU64::new(0),
+            pending: Mutex::new(None),
+            cv: Condvar::new(),
+            shutdown: Mutex::new(false),
+            seq: AtomicU64::new(0),
+            frame_callback: Mutex::new(None),
         });
 
-        // Spawn worker.
+        // Spawn worker.  IMPORTANT: do NOT discard the spawn result with `let _` —
+        // on resource-constrained platforms (RPi-class SoCs, Radxa Q6A) the
+        // worker can fail to spawn (thread limit, RLIMIT_NPROC) and silently
+        // no scene ever gets rasterized, which manifests as "strokes don't
+        // commit".  When `ANNOTATOR_DEBUG` is set we surface the error so
+        // the operator sees it immediately.
         let worker_inner = Arc::clone(&inner);
-        let _ = thread::Builder::new()
+        match thread::Builder::new()
             .name("scene-rasterizer".into())
-            .spawn(move || worker_loop(worker_inner));
+            .spawn(move || worker_loop(worker_inner))
+        {
+            Ok(_) => {
+                if DEBUG.load(Ordering::Relaxed) {
+                    eprintln!("[dbg] pipeline worker spawned ok");
+                }
+            }
+            Err(e) => {
+                eprintln!("[dbg] FATAL: pipeline worker failed to spawn: {e}");
+                eprintln!(
+                    "[dbg]   scene rendering will never happen — strokes will appear to not commit."
+                );
+            }
+        }
 
         Self { inner }
     }
@@ -122,7 +157,9 @@ impl RenderPipeline {
         let back_idx = self.inner.front_idx.get() ^ 1;
         {
             let mut buffers = self.inner.buffers.lock().unwrap();
-            buffers[back_idx].pixels.copy_from_slice(&committed_canvas.pixels);
+            buffers[back_idx]
+                .pixels
+                .copy_from_slice(&committed_canvas.pixels);
             buffers[back_idx].dirty = true;
         }
 
@@ -133,6 +170,14 @@ impl RenderPipeline {
         {
             let mut slot = self.inner.pending.lock().unwrap();
             *slot = Some((*scene).clone());
+        }
+        if DEBUG.load(Ordering::Relaxed) {
+            eprintln!(
+                "[dbg] submit_scene: objects={} baked_bg={} seq_before={}",
+                scene.objects().len(),
+                scene.baked_bg().is_some(),
+                self.inner.seq.load(Ordering::Relaxed),
+            );
         }
         self.inner.cv.notify_one();
     }
@@ -154,26 +199,27 @@ impl RenderPipeline {
         }
     }
 
-    /// Read the current front canvas's RGBA bytes.  Used by the main
-    /// thread to blit to the GPU texture.
-    ///
-    /// Returns a `Vec<u8>` snapshot (a copy) so the caller can use it
-    /// outside the buffer mutex.  This is necessary because the worker
-    /// may swap the front pointer at any time after we drop the mutex.
-    pub fn front_pixels(&self) -> Vec<u8> {
-        let idx = self.inner.front_idx.get();
-        let buffers = self.inner.buffers.lock().unwrap();
-        buffers[idx].pixels.clone()
-    }
-
     /// Pipeline canvas width.  Reserved for callers that need to query
     /// the dimensions without going through the Scene/Canvas handle.
     #[allow(dead_code)]
-    pub fn width(&self)  -> u32 { self.inner.width  }
+    pub fn width(&self) -> u32 {
+        self.inner.width
+    }
     /// Pipeline canvas height.  Reserved for callers that need to query
     /// the dimensions without going through the Scene/Canvas handle.
     #[allow(dead_code)]
-    pub fn height(&self) -> u32 { self.inner.height }
+    pub fn height(&self) -> u32 {
+        self.inner.height
+    }
+
+    /// Register a callback that is invoked after each successful render
+    /// with the finished RGBA frame (width×height×4 bytes).
+    /// Only one callback can be registered at a time; passing `None`
+    /// clears the existing callback.
+    pub fn on_canvas_frame(&self, cb: Option<Arc<CanvasFrameCallback>>) {
+        let mut slot = self.inner.frame_callback.lock().unwrap();
+        *slot = cb;
+    }
 
     /// Synchronous render into the front buffer.  Used at startup and on
     /// resize, before the worker has produced anything.
@@ -188,49 +234,82 @@ impl RenderPipeline {
             buf.dirty = true;
         }
         self.inner.seq.fetch_add(1, Ordering::Release);
+        if DEBUG.load(Ordering::Relaxed) {
+            eprintln!(
+                "[dbg] render_into (sync): objects={} rendered={} seq={}",
+                scene.objects().len(),
+                rendered,
+                self.inner.seq.load(Ordering::Relaxed),
+            );
+        }
     }
 
     /// Resize both buffers.  Called from the window-resize handler.
     /// Allocates fresh RGBA storage for both `front` and `back`; the
     /// worker will rasterize them on the next scene submit.
+    ///
+    /// IMPORTANT: do NOT terminate the worker here.  The previous
+    /// implementation set `shutdown = true`, waited 5 ms, replaced the
+    /// buffers, then set `shutdown = false` — but the worker had
+    /// already exited its loop on the `shutdown = true` check, and
+    /// nothing ever respawned it.  Result: after the first resize, the
+    /// worker was dead, no further scenes were ever rendered, and the
+    /// texture stayed frozen on whatever the last successful upload
+    /// contained.  This was the root cause of "strokes don't commit"
+    /// on the Radxa Q6A (whose display is 1920×1043, not 1920×1080,
+    /// so a Resized event fires immediately after init).
+    ///
+    /// The correct approach is to replace buffers and update
+    /// dimensions atomically w.r.t. the worker, all under the buffers
+    /// mutex.  The worker holds that mutex for the duration of its
+    /// render+copy, so resize() serializes with it; once resize
+    /// releases, the worker's next iteration reads the new dimensions
+    /// (Acquire-load, synchronized via the lock release) and picks up
+    /// the new buffer sizes on its next render.
     pub fn resize(&self, width: u32, height: u32) {
-        if width == self.inner.width && height == self.inner.height { return; }
-
-        // Signal the worker to exit, then wait for it to drain.
-        *self.inner.shutdown.lock().unwrap() = true;
-        self.inner.cv.notify_all();
-        std::thread::sleep(std::time::Duration::from_millis(5));
-
-        // Replace buffers; resize is single-threaded via the shutdown
-        // handshake above.
-        {
-            let mut buffers = self.inner.buffers.lock().unwrap();
-            *buffers = [
-                Canvas::new(width, height),
-                Canvas::new(width, height),
-            ];
+        let old_w = self.inner.width;
+        let old_h = self.inner.height;
+        if width == old_w && height == old_h {
+            return;
         }
-        // Mutate the immutable width/height fields.  This is unsafe
-        // because we go through Arc::as_ptr; sound because the worker
-        // is currently idle (we just set shutdown=true).
+
+        if DEBUG.load(Ordering::Relaxed) {
+            eprintln!("[dbg] pipeline.resize: {old_w}x{old_h} -> {width}x{height}");
+        }
+
+        let mut buffers = self.inner.buffers.lock().unwrap();
+        *buffers = [Canvas::new(width, height), Canvas::new(width, height)];
+        // SAFETY: we hold the buffers mutex; the worker holds the same
+        // mutex during its render+copy, so there is no concurrent
+        // access to width/height/seq from this point until the lock
+        // is released below.
         let inner_mut = Arc::as_ptr(&self.inner) as *mut PipelineInner;
         unsafe {
-            (*inner_mut).width  = width;
+            (*inner_mut).width = width;
             (*inner_mut).height = height;
             (*inner_mut).seq.store(0, Ordering::Release);
         }
-
-        // Resume worker.
-        *self.inner.shutdown.lock().unwrap() = false;
-        self.inner.cv.notify_all();
+        // Lock released here.  The worker's next iteration will see
+        // the new width/height when it acquires the buffers mutex.
     }
 
     /// Upload the front canvas to a GPU texture.  Used by the main
     /// thread after a successful `poll()`.  Returns `true` if the
     /// texture was updated.
+    ///
+    /// `width` is read under the buffers mutex (via the buffer's own
+    /// `width` field) so it's consistent with the pixels being
+    /// uploaded.  Otherwise a concurrent `resize()` could update
+    /// `width` after we read it but before the GPU upload completes,
+    /// giving the texture a wrong pitch (and on aarch64, possibly a
+    /// stale value).
     pub fn upload_to(&self, tex: &mut Texture) -> bool {
-        let pixels = self.front_pixels();
-        let pitch  = (self.inner.width as usize) * 4;
+        let (pixels, width) = {
+            let buffers = self.inner.buffers.lock().unwrap();
+            let idx = self.inner.front_idx.get();
+            (buffers[idx].pixels.clone(), buffers[idx].width)
+        };
+        let pitch = (width as usize) * 4;
         tex.update(None, &pixels, pitch).is_ok()
     }
 }
@@ -240,41 +319,106 @@ impl RenderPipeline {
 fn worker_loop(inner: Arc<PipelineInner>) {
     use std::sync::atomic::Ordering as Ord;
 
-    loop {
-        // Wait for a new scene snapshot.
-        let scene = {
-            let mut slot = inner.pending.lock().unwrap();
-            loop {
-                if *inner.shutdown.lock().unwrap() { return; }
-                if let Some(s) = slot.take() { break s; }
-                slot = inner.cv.wait(slot).unwrap();
-            }
-        };
+    if DEBUG.load(Ord::Relaxed) {
+        eprintln!(
+            "[dbg] worker_loop: started (thread id {:?})",
+            thread::current().id()
+        );
+    }
 
-        // Render into the back buffer.  We hold the buffers mutex for
-        // the duration of the render so the main thread's submit_scene
-        // can't overwrite our working buffer mid-render.  This is a
-        // long critical section but contention is rare (the main thread
-        // only submits once per scene change, not every frame).
-        let back_idx = inner.front_idx.get() ^ 1;
-        let w = inner.width;
-        let h = inner.height;
-        let mut local = Canvas::new(w, h);
-        {
-            let mut buffers = inner.buffers.lock().unwrap();
-            // Start from whatever's in the back buffer (the main thread
-            // may have just copied the input canvas there in submit_scene).
-            local.pixels.copy_from_slice(&buffers[back_idx].pixels);
-            let rendered = scene.render_to_par(&mut local);
-            if rendered {
-                local.dirty = true;
+    // Wrap the loop in catch_unwind so a panic inside `render_to_par`
+    // (e.g. rayon misbehaving on a weird CPU topology) doesn't silently
+    // kill the worker — leaving the render loop hung on `poll()` and
+    // strokes visually never committing.  We log and exit; the main
+    // thread's next `pipeline.poll()` will see seq stop advancing and
+    // a `[dbg] frame: pipeline_seq=...` summary will show the stall.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        loop {
+            // Wait for a new scene snapshot.
+            let scene = {
+                let mut slot = inner.pending.lock().unwrap();
+                loop {
+                    if *inner.shutdown.lock().unwrap() {
+                        return;
+                    }
+                    if let Some(s) = slot.take() {
+                        break s;
+                    }
+                    slot = inner.cv.wait(slot).unwrap();
+                }
+            };
+
+            if DEBUG.load(Ord::Relaxed) {
+                eprintln!(
+                    "[dbg] worker: woke with scene (objects={} baked_bg={})",
+                    scene.objects().len(),
+                    scene.baked_bg().is_some(),
+                );
             }
-            buffers[back_idx].pixels.copy_from_slice(&local.pixels);
-            buffers[back_idx].dirty = true;
+
+            // Render into the back buffer.  We hold the buffers mutex for
+            // the duration of the render so the main thread's submit_scene
+            // can't overwrite our working buffer mid-render.  This is a
+            // long critical section but contention is rare (the main thread
+            // only submits once per scene change, not every frame).
+            //
+            // CRITICAL: `inner.width` / `inner.height` are read INSIDE the
+            // buffers lock scope, not before it.  `resize()` updates these
+            // fields under the same lock; reading them under the lock gives
+            // us Acquire semantics on the lock-release in resize, so we
+            // always see a consistent (buffers, width, height) triple.
+            // Reading them outside the lock would race with resize and
+            // panic on `copy_from_slice` if our local canvas is the wrong
+            // size for the (new) buffers.
+            let back_idx = inner.front_idx.get() ^ 1;
+            let render_start = std::time::Instant::now();
+            let render_ms;
+            let new_front;
+            let frame_pixels;
+            let frame_w;
+            let frame_h;
+            {
+                let mut buffers = inner.buffers.lock().unwrap();
+                let w = inner.width;
+                let h = inner.height;
+                let mut local = Canvas::new(w, h);
+                // Start from whatever's in the back buffer (the main thread
+                // may have just copied the input canvas there in submit_scene).
+                local.pixels.copy_from_slice(&buffers[back_idx].pixels);
+                let rendered = scene.render_to_par(&mut local);
+                if rendered {
+                    local.dirty = true;
+                }
+                buffers[back_idx].pixels.copy_from_slice(&local.pixels);
+                buffers[back_idx].dirty = true;
+                render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
+                // Capture pixels for callback before releasing the lock.
+                frame_w = w;
+                frame_h = h;
+                frame_pixels = buffers[back_idx].pixels.clone();
+                // Publish: swap front/back.  After this, the new buffer is front.
+                new_front = inner.front_idx.swap();
+            }
+            inner.seq.fetch_add(1, Ord::Release);
+
+            // Invoke frame capture callback if one is registered.
+            if let Some(cb) = inner.frame_callback.lock().unwrap().as_ref() {
+                cb(Arc::new(frame_pixels), frame_w, frame_h);
+            }
+
+            if DEBUG.load(Ord::Relaxed) {
+                eprintln!(
+                    "[dbg] worker: rendered in {:.1} ms, new_front={} seq={}",
+                    render_ms,
+                    new_front,
+                    inner.seq.load(Ord::Relaxed),
+                );
+            }
         }
+    }));
 
-        // Publish: swap front/back.  After this, the new buffer is front.
-        let _ = inner.front_idx.swap();
-        inner.seq.fetch_add(1, Ord::Release);
+    if let Err(e) = result {
+        eprintln!("[dbg] FATAL: pipeline worker PANICKED: {:?}", e);
+        eprintln!("[dbg]   scene rendering has STOPPED.  Strokes will appear to not commit.");
     }
 }

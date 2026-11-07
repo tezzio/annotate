@@ -15,9 +15,9 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender},
         Arc, RwLock, RwLockReadGuard,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     },
     time::Duration,
 };
@@ -25,8 +25,8 @@ use std::{
 use crate::{
     config::Config,
     state::{
-        parse_hex_color, parse_palette_index, parse_usize, ApiCommand, ApiCommandKind,
-        ApiResult, StateSnapshot,
+        ApiCommand, ApiCommandKind, ApiResult, StateSnapshot, parse_hex_color, parse_palette_index,
+        parse_usize,
     },
     tools::Tool,
 };
@@ -41,12 +41,12 @@ pub type SharedSnapshot = Arc<RwLock<StateSnapshot>>;
 pub type ApiCommandRx = Receiver<ApiCommand>;
 
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
-const MAX_IN_FLIGHT:     usize = 4;
-const IO_TIMEOUT:        Duration = Duration::from_secs(2);
+const MAX_IN_FLIGHT: usize = 4;
+const IO_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a connection thread waits for the main loop to apply a mutation.
-const REPLY_TIMEOUT:     Duration = Duration::from_millis(500);
+const REPLY_TIMEOUT: Duration = Duration::from_millis(500);
 /// Channel depth — a Crestron sends one command at a time; 16 is generous.
-const COMMAND_QUEUE:     usize = 16;
+const COMMAND_QUEUE: usize = 16;
 
 // ── Server ────────────────────────────────────────────────────────────────────
 
@@ -75,7 +75,13 @@ pub fn serve(bind: &str, port: u16, snapshot: SharedSnapshot, cfg: Config) -> Ap
     cmd_rx
 }
 
-fn accept_loop(listener: TcpListener, snapshot: SharedSnapshot, cmd_tx: SyncSender<ApiCommand>, cfg: Config, sessions: SessionStore) {
+fn accept_loop(
+    listener: TcpListener,
+    snapshot: SharedSnapshot,
+    cmd_tx: SyncSender<ApiCommand>,
+    cfg: Config,
+    sessions: SessionStore,
+) {
     let in_flight = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let mut stream = match stream {
@@ -88,13 +94,18 @@ fn accept_loop(listener: TcpListener, snapshot: SharedSnapshot, cmd_tx: SyncSend
         // Hard cap on concurrent connections — a Crestron opens one socket
         // per command, so anything above a handful is abuse.
         if in_flight.load(Ordering::SeqCst) >= MAX_IN_FLIGHT {
-            let _ = write_response(&mut stream, 503, &err_body("busy — too many connections"), "application/json");
+            let _ = write_response(
+                &mut stream,
+                503,
+                &err_body("busy — too many connections"),
+                "application/json",
+            );
             continue;
         }
         in_flight.fetch_add(1, Ordering::SeqCst);
-        let snap     = snapshot.clone();
-        let tx       = cmd_tx.clone();
-        let count    = in_flight.clone();
+        let snap = snapshot.clone();
+        let tx = cmd_tx.clone();
+        let count = in_flight.clone();
         let cfg_clone = cfg.clone();
         let sess_clone = sessions.clone();
         let spawned = std::thread::Builder::new().spawn(move || {
@@ -107,20 +118,31 @@ fn accept_loop(listener: TcpListener, snapshot: SharedSnapshot, cmd_tx: SyncSend
     }
 }
 
-fn handle_connection(mut stream: TcpStream, snapshot: &SharedSnapshot, cmd_tx: &SyncSender<ApiCommand>, cfg: &Config, sessions: &SessionStore) {
+fn handle_connection(
+    mut stream: TcpStream,
+    snapshot: &SharedSnapshot,
+    cmd_tx: &SyncSender<ApiCommand>,
+    cfg: &Config,
+    sessions: &SessionStore,
+) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let (status, body, ctype) = match read_request(&mut stream) {
-        Ok(Some(req))            => route(&req, snapshot, cmd_tx, cfg, sessions),
-        Ok(None)                 => return,   // peer connected, sent nothing
+        Ok(Some(req)) => route(&req, snapshot, cmd_tx, cfg, sessions),
+        Ok(None) => return, // peer connected, sent nothing
         Err(ReadError::TooLarge) => (400, err_body("request too large"), "application/json"),
         Err(ReadError::Malformed) => (400, err_body("malformed request"), "application/json"),
-        Err(ReadError::Io(_))    => return,   // timeout / reset — peer is gone
+        Err(ReadError::Io(_)) => return, // timeout / reset — peer is gone
     };
     let _ = write_response(&mut stream, status, &body, ctype);
 }
 
-fn write_response(stream: &mut TcpStream, status: u16, body: &str, content_type: &str) -> std::io::Result<()> {
+fn write_response(
+    stream: &mut TcpStream,
+    status: u16,
+    body: &str,
+    content_type: &str,
+) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -128,7 +150,7 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &str, content_type:
         404 => "Not Found",
         405 => "Method Not Allowed",
         503 => "Service Unavailable",
-        _   => "Status",
+        _ => "Status",
     };
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\n\
@@ -156,11 +178,11 @@ enum ReadError {
 
 struct Request {
     method: String,
-    path:   String,
+    path: String,
     /// Decoded query-string params (merged with the POSTed form on control calls).
-    query:  HashMap<String, String>,
+    query: HashMap<String, String>,
     /// Raw request body, form-decoded by the control endpoints.
-    body:   Vec<u8>,
+    body: Vec<u8>,
 }
 
 /// Read one request.  `Ok(None)` = clean EOF before any bytes arrived.
@@ -172,7 +194,7 @@ fn read_request<R: Read>(r: &mut R) -> Result<Option<Request>, ReadError> {
     let header_len = loop {
         match r.read(&mut chunk) {
             Ok(0) if buf.is_empty() => return Ok(None),
-            Ok(0) => return Err(ReadError::Malformed),  // EOF mid-headers
+            Ok(0) => return Err(ReadError::Malformed), // EOF mid-headers
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
                 if buf.len() > MAX_REQUEST_BYTES {
@@ -192,7 +214,10 @@ fn read_request<R: Read>(r: &mut R) -> Result<Option<Request>, ReadError> {
     // Request line: "METHOD SP TARGET SP HTTP/x.y"
     let request_line = lines.next().ok_or(ReadError::Malformed)?;
     let mut parts = request_line.split_whitespace();
-    let method = parts.next().ok_or(ReadError::Malformed)?.to_ascii_uppercase();
+    let method = parts
+        .next()
+        .ok_or(ReadError::Malformed)?
+        .to_ascii_uppercase();
     let target = parts.next().ok_or(ReadError::Malformed)?.to_string();
     if parts.next().is_none() {
         return Err(ReadError::Malformed);
@@ -214,7 +239,7 @@ fn read_request<R: Read>(r: &mut R) -> Result<Option<Request>, ReadError> {
     // ── Body ─────────────────────────────────────────────────────────────
     while buf.len() < header_len + content_length {
         match r.read(&mut chunk) {
-            Ok(0) => return Err(ReadError::Malformed),  // EOF mid-body
+            Ok(0) => return Err(ReadError::Malformed), // EOF mid-body
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
                 if buf.len() > MAX_REQUEST_BYTES {
@@ -295,7 +320,13 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
-fn route(req: &Request, snapshot: &SharedSnapshot, cmd_tx: &SyncSender<ApiCommand>, cfg: &Config, sessions: &SessionStore) -> (u16, String, &'static str) {
+fn route(
+    req: &Request,
+    snapshot: &SharedSnapshot,
+    cmd_tx: &SyncSender<ApiCommand>,
+    cfg: &Config,
+    sessions: &SessionStore,
+) -> (u16, String, &'static str) {
     // ── Portal routes ────────────────────────────────────────────────────────────
     match req.path.as_str() {
         "/portal/login" if req.method == "POST" => {
@@ -304,8 +335,16 @@ fn route(req: &Request, snapshot: &SharedSnapshot, cmd_tx: &SyncSender<ApiComman
             let password = p.get("password").cloned().unwrap_or_default();
             if let Some(user) = cfg.verify_credentials(&username, &password) {
                 let token = generate_token();
-                sessions.write().unwrap().insert(token.clone(), user.username.clone());
-                return (200, serde_json::json!({ "ok": true, "token": token, "username": user.username }).to_string(), "application/json");
+                sessions
+                    .write()
+                    .unwrap()
+                    .insert(token.clone(), user.username.clone());
+                return (
+                    200,
+                    serde_json::json!({ "ok": true, "token": token, "username": user.username })
+                        .to_string(),
+                    "application/json",
+                );
             } else {
                 return (401, err_body("invalid credentials"), "application/json");
             }
@@ -315,13 +354,21 @@ fn route(req: &Request, snapshot: &SharedSnapshot, cmd_tx: &SyncSender<ApiComman
             if let Some(token) = p.get("token") {
                 sessions.write().unwrap().remove(token);
             }
-            return (200, serde_json::json!({ "ok": true }).to_string(), "application/json");
+            return (
+                200,
+                serde_json::json!({ "ok": true }).to_string(),
+                "application/json",
+            );
         }
         "/portal/check" if req.method == "GET" => {
             let p = &req.query;
             if let Some(token) = p.get("token") {
                 if let Some(username) = sessions.read().unwrap().get(token) {
-                    return (200, serde_json::json!({ "ok": true, "username": username }).to_string(), "application/json");
+                    return (
+                        200,
+                        serde_json::json!({ "ok": true, "username": username }).to_string(),
+                        "application/json",
+                    );
                 }
             }
             return (401, err_body("not authenticated"), "application/json");
@@ -344,18 +391,26 @@ fn route(req: &Request, snapshot: &SharedSnapshot, cmd_tx: &SyncSender<ApiComman
     match req.path.as_str() {
         // ── Read endpoints (GET only) ─────────────────────────────────────
         "/api/v1/health" | "/api/v1/state" | "/api/v1/inputs" if req.method != "GET" => {
-            return (405, err_body("method not allowed — use GET"), "application/json");
+            return (
+                405,
+                err_body("method not allowed — use GET"),
+                "application/json",
+            );
         }
         "/api/v1/health" => {
-            return (200, serde_json::json!({
-                "ok": true,
-                "version": env!("CARGO_PKG_VERSION"),
-            }).to_string(), "application/json");
+            return (
+                200,
+                serde_json::json!({
+                    "ok": true,
+                    "version": env!("CARGO_PKG_VERSION"),
+                })
+                .to_string(),
+                "application/json",
+            );
         }
         "/api/v1/state" => {
             let snap = read_snapshot(snapshot);
-            let mut v = serde_json::to_value(&*snap)
-                .unwrap_or_else(|_| serde_json::json!({}));
+            let mut v = serde_json::to_value(&*snap).unwrap_or_else(|_| serde_json::json!({}));
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("ok".into(), true.into());
                 if let Some(ref user) = authenticated {
@@ -366,17 +421,26 @@ fn route(req: &Request, snapshot: &SharedSnapshot, cmd_tx: &SyncSender<ApiComman
         }
         "/api/v1/inputs" => {
             let snap = read_snapshot(snapshot);
-            return (200, serde_json::json!({
-                "ok": true,
-                "active": snap.input,
-                "inputs": snap.inputs,
-            }).to_string(), "application/json");
+            return (
+                200,
+                serde_json::json!({
+                    "ok": true,
+                    "active": snap.input,
+                    "inputs": snap.inputs,
+                })
+                .to_string(),
+                "application/json",
+            );
         }
 
         // ── Control endpoints (GET with query string or POST with form body) ──
         "/api/v1/tool" | "/api/v1/color" | "/api/v1/brush_size" | "/api/v1/input" => {
             if req.method != "GET" && req.method != "POST" {
-                return (405, err_body("method not allowed — use GET or POST"), "application/json");
+                return (
+                    405,
+                    err_body("method not allowed — use GET or POST"),
+                    "application/json",
+                );
             }
             let kind = match control_command(req) {
                 Ok(k) => k,
@@ -418,23 +482,20 @@ fn control_command(req: &Request) -> Result<ApiCommandKind, String> {
     match req.path.as_str() {
         "/api/v1/tool" => {
             let name = p.get("name").ok_or("missing param 'name'")?;
-            let tool = Tool::from_name(name)
-                .ok_or_else(|| format!("unknown tool '{name}'"))?;
+            let tool = Tool::from_name(name).ok_or_else(|| format!("unknown tool '{name}'"))?;
             Ok(ApiCommandKind::SetTool(tool))
         }
-        "/api/v1/color" => {
-            match (p.get("hex"), p.get("palette")) {
-                (Some(h), _) => {
-                    let (r, g, b) = parse_hex_color(h)?;
-                    Ok(ApiCommandKind::SetColor(r, g, b))
-                }
-                (None, Some(pal)) => {
-                    let (r, g, b) = parse_palette_index(pal)?;
-                    Ok(ApiCommandKind::SetColor(r, g, b))
-                }
-                (None, None) => Err("missing param 'hex' or 'palette'".into()),
+        "/api/v1/color" => match (p.get("hex"), p.get("palette")) {
+            (Some(h), _) => {
+                let (r, g, b) = parse_hex_color(h)?;
+                Ok(ApiCommandKind::SetColor(r, g, b))
             }
-        }
+            (None, Some(pal)) => {
+                let (r, g, b) = parse_palette_index(pal)?;
+                Ok(ApiCommandKind::SetColor(r, g, b))
+            }
+            (None, None) => Err("missing param 'hex' or 'palette'".into()),
+        },
         "/api/v1/brush_size" => {
             match (p.get("px"), p.get("delta")) {
                 (Some(px), _) => Ok(ApiCommandKind::SetBrushSize(
@@ -473,7 +534,13 @@ fn control_command(req: &Request) -> Result<ApiCommandKind, String> {
 /// Hand a validated command to the main loop and wait for its verdict.
 fn dispatch(kind: ApiCommandKind, cmd_tx: &SyncSender<ApiCommand>) -> (u16, String) {
     let (reply_tx, reply_rx) = sync_channel::<ApiResult>(1);
-    if cmd_tx.send(ApiCommand { kind, reply: reply_tx }).is_err() {
+    if cmd_tx
+        .send(ApiCommand {
+            kind,
+            reply: reply_tx,
+        })
+        .is_err()
+    {
         return (503, err_body("main loop unavailable"));
     }
     let result = match reply_rx.recv_timeout(REPLY_TIMEOUT) {
@@ -504,15 +571,20 @@ mod tests {
 
     fn get(target: &str) -> Request {
         let (path, query) = split_target(target);
-        Request { method: "GET".into(), path, query, body: Vec::new() }
+        Request {
+            method: "GET".into(),
+            path,
+            query,
+            body: Vec::new(),
+        }
     }
 
     #[test]
     fn percent_decode_handles_plus_hex_and_literals() {
         assert_eq!(percent_decode("a+b%20c%2fD"), "a b c/D");
         assert_eq!(percent_decode("%C3%BF"), "\u{FF}"); // valid UTF-8 for ÿ
-        assert_eq!(percent_decode("%FF"), "\u{FFFD}");  // lone byte → replacement char
-        assert_eq!(percent_decode("%zz"), "%zz");   // bad hex kept literal
+        assert_eq!(percent_decode("%FF"), "\u{FFFD}"); // lone byte → replacement char
+        assert_eq!(percent_decode("%zz"), "%zz"); // bad hex kept literal
         assert_eq!(percent_decode("100%"), "100%"); // trailing % kept literal
     }
 
@@ -541,7 +613,10 @@ mod tests {
     #[test]
     fn rejects_malformed_and_oversized() {
         let mut garbage = std::io::Cursor::new(&b"not an http request"[..]);
-        assert!(matches!(read_request(&mut garbage), Err(ReadError::Malformed)));
+        assert!(matches!(
+            read_request(&mut garbage),
+            Err(ReadError::Malformed)
+        ));
 
         let big = vec![b'X'; MAX_REQUEST_BYTES + 16];
         let mut cur = std::io::Cursor::new(big);
@@ -551,8 +626,16 @@ mod tests {
     #[test]
     fn tool_name_mapping_round_trips() {
         for t in [
-            Tool::Pen, Tool::Line, Tool::Rect, Tool::Circle, Tool::Arrow,
-            Tool::Text, Tool::Select, Tool::Eraser, Tool::Highlight, Tool::Laser,
+            Tool::Pen,
+            Tool::Line,
+            Tool::Rect,
+            Tool::Circle,
+            Tool::Arrow,
+            Tool::Text,
+            Tool::Select,
+            Tool::Eraser,
+            Tool::Highlight,
+            Tool::Laser,
         ] {
             assert_eq!(Tool::from_name(t.name()), Some(t));
         }
@@ -567,19 +650,19 @@ mod tests {
         let cfg = Config::default();
         let sessions: SessionStore = Arc::new(RwLock::new(HashMap::new()));
 
-        let (status, body) = route(&get("/api/v1/health"), &snap, &tx, &cfg, &sessions);
+        let (status, body, _) = route(&get("/api/v1/health"), &snap, &tx, &cfg, &sessions);
         assert_eq!(status, 200);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
 
-        let (status, body) = route(&get("/nope"), &snap, &tx, &cfg, &sessions);
+        let (status, body, _) = route(&get("/nope"), &snap, &tx, &cfg, &sessions);
         assert_eq!(status, 404);
         assert!(body.contains("\"ok\":false"));
 
         let mut post = get("/api/v1/state");
         post.method = "POST".into();
-        let (status, _) = route(&post, &snap, &tx, &cfg, &sessions);
+        let (status, _, _) = route(&post, &snap, &tx, &cfg, &sessions);
         assert_eq!(status, 405);
     }
 
@@ -599,14 +682,14 @@ mod tests {
         let cfg = Config::default();
         let sessions: SessionStore = Arc::new(RwLock::new(HashMap::new()));
 
-        let (status, body) = route(&get("/api/v1/state?fmt=json"), &snap, &tx, &cfg, &sessions);
+        let (status, body, _) = route(&get("/api/v1/state?fmt=json"), &snap, &tx, &cfg, &sessions);
         assert_eq!(status, 200);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["tool"], "pen");
         assert_eq!(v["input"], 1);
 
-        let (status, body) = route(&get("/api/v1/inputs"), &snap, &tx, &cfg, &sessions);
+        let (status, body, _) = route(&get("/api/v1/inputs"), &snap, &tx, &cfg, &sessions);
         assert_eq!(status, 200);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["ok"], true);
@@ -623,7 +706,7 @@ mod tests {
         assert!(matches!(r, ApiCommandKind::SetTool(Tool::Pen)));
 
         assert!(control_command(&get("/api/v1/tool?name=LASER")).is_ok());
-        assert!(control_command(&get("/api/v1/tool")).is_err());            // missing
+        assert!(control_command(&get("/api/v1/tool")).is_err()); // missing
         assert!(control_command(&get("/api/v1/tool?name=brush")).is_err()); // unknown
     }
 

@@ -109,15 +109,33 @@ impl Default for RtspConfig {
 
 // ── serde defaults ────────────────────────────────────────────────────────────
 
-fn default_width() -> u32 { 1920 }
-fn default_height() -> u32 { 1080 }
-fn default_fullscreen() -> bool { true }
-fn default_tool_color() -> String { "ffffff".to_string() }
-fn default_tool_size() -> u32 { 4 }
-fn default_undo_stack_limit() -> usize { 20 }
-fn default_api_enabled() -> bool { true }
-fn default_api_bind() -> String { "0.0.0.0".to_string() }
-fn default_api_port() -> u16 { 8080 }
+fn default_width() -> u32 {
+    1920
+}
+fn default_height() -> u32 {
+    1080
+}
+fn default_fullscreen() -> bool {
+    true
+}
+fn default_tool_color() -> String {
+    "ffffff".to_string()
+}
+fn default_tool_size() -> u32 {
+    4
+}
+fn default_undo_stack_limit() -> usize {
+    20
+}
+fn default_api_enabled() -> bool {
+    true
+}
+fn default_api_bind() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_api_port() -> u16 {
+    8080
+}
 
 // ── Default impl ──────────────────────────────────────────────────────────────
 
@@ -133,13 +151,11 @@ impl Default for Config {
             undo_stack_limit: default_undo_stack_limit(),
             api: ApiConfig::default(),
             rtsp: RtspConfig::default(),
-            users: vec![
-                User {
-                    username: "admin".to_string(),
-                    password_hash: hash_password("admin"),
-                    is_admin: true,
-                }
-            ],
+            users: vec![User {
+                username: "admin".to_string(),
+                password_hash: hash_password("admin"),
+                is_admin: true,
+            }],
         }
     }
 }
@@ -151,7 +167,7 @@ impl User {
 }
 
 pub fn hash_password(password: &str) -> String {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(password.as_bytes());
     hasher.update(b"annotator-salt"); // simple static salt
@@ -168,7 +184,8 @@ impl Config {
     }
 
     pub fn verify_credentials(&self, username: &str, password: &str) -> Option<&User> {
-        self.find_user(username).filter(|u| u.verify_password(password))
+        self.find_user(username)
+            .filter(|u| u.verify_password(password))
     }
 }
 
@@ -176,9 +193,9 @@ impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             enabled: default_api_enabled(),
-            bind:    default_api_bind(),
-            port:    default_api_port(),
-            token:   None,
+            bind: default_api_bind(),
+            port: default_api_port(),
+            token: None,
         }
     }
 }
@@ -229,8 +246,8 @@ pub fn parse_color(hex: &str) -> (u8, u8, u8) {
         if let Ok(n) = u32::from_str_radix(s, 16) {
             return (
                 ((n >> 16) & 0xff) as u8,
-                ((n >> 8)  & 0xff) as u8,
-                ( n        & 0xff) as u8,
+                ((n >> 8) & 0xff) as u8,
+                (n & 0xff) as u8,
             );
         }
     }
