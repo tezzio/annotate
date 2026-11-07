@@ -121,9 +121,19 @@ LINK_LIBS=(
 # would pick the older one and the binary would fail with
 # "GLIBC_2.39 not found".
 if [[ "$ARCH" == "aarch64" ]]; then
-    RPATH="$SHARED_DIR:$LIBDIR:$LIBDIR2:$SYSROOT/usr/lib/$MULTIARCH/pulseaudio:$SYSROOT/usr/$MULTIARCH/lib"
+    # The binary is copied to the target device, so the directories the
+    # DEVICE uses have to come first.  The library directory is only a
+    # fallback, so the cross build can still be run on the build
+    # machine (where /usr/lib/aarch64-linux-gnu does not exist).
+    DEVICE_RPATH="/usr/lib/$MULTIARCH:/lib/$MULTIARCH"
+    RPATH="$DEVICE_RPATH:$SHARED_DIR:$LIBDIR:$LIBDIR2:$SYSROOT/usr/lib/$MULTIARCH/pulseaudio:$SYSROOT/usr/$MULTIARCH/lib"
 else
-    RPATH="$HOST_RT_DIR:$SHARED_DIR"
+    # Same idea as the cross build: the system's own directories come
+    # first so a binary copied to another machine finds the libraries
+    # that are installed there.  The library directory is the fallback
+    # for the build machine itself.
+    DEVICE_RPATH="/usr/lib/$MULTIARCH:/lib/$MULTIARCH"
+    RPATH="$DEVICE_RPATH:$HOST_RT_DIR:$SHARED_DIR"
 fi
 
 # The compiler has to find the headers in the library directory too.
@@ -242,10 +252,13 @@ $CROSS_GCCLIB/crtbeginS.o $CROSS_GCCLIB/crtendS.o $CROSS_LIBC/crtn.o"
     # The dynamic loader has to be named explicitly: rustc links with
     # -nodefaultlibs, which drops the usual ld-linux entry, and the
     # binary would then have no INTERP segment at all.
-    LOADER="$CROSS_LIBC/ld-linux-aarch64.so.1"
-    if [[ -f "$LOADER" ]]; then
-        EXTRA_LDFLAGS="$EXTRA_LDFLAGS --dynamic-linker=$LOADER"
-    fi
+    #
+    # The name has to be the one the DEVICE uses and not the path
+    # inside the library directory: the binary is copied to the target
+    # machine, where the build tree does not exist, and the loader
+    # would fail to start the program at all.
+    LOADER="/lib/ld-linux-aarch64.so.1"
+    EXTRA_LDFLAGS="$EXTRA_LDFLAGS --dynamic-linker=$LOADER"
 
     RUSTFLAGS+=("-C link-self-contained=no")
 else
