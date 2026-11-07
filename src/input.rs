@@ -52,23 +52,17 @@ pub fn process_event(
 
         Event::KeyUp {
             keycode: Some(k), ..
-        } => match *k {
-            Keycode::LShift | Keycode::RShift => state.shift_down = false,
-            _ => {}
-        },
+        } => {
+            if matches!(*k, Keycode::LShift | Keycode::RShift) {
+                state.shift_down = false;
+            }
+        }
 
-        // SDL text input — used when text tool is active or RTSP picker is open
+        // SDL text input — used when the text tool is active
         Event::TextInput { text, .. } => {
             if state.active_tool == Tool::Text && state.text_input_active {
                 state.text_buffer.push_str(text);
                 state.mark_snapshot_dirty();
-            } else if state.show_device_picker {
-                if let Some(picker) = &mut state.device_picker {
-                    if picker.stage == PickerStage::Rtsp {
-                        picker.rtsp.url.push_str(text);
-                        state.mark_snapshot_dirty();
-                    }
-                }
             }
         }
 
@@ -163,10 +157,6 @@ fn handle_press(
                     state.show_device_picker = false;
                     return;
                 }
-                PickerDismiss::Back => {
-                    // Stage already reset to Devices by click_dismiss; leave modal open.
-                    return;
-                }
                 PickerDismiss::None => {}
             }
             if let Some(result) =
@@ -190,8 +180,7 @@ fn handle_press(
     // V2: clicks in the left rail are toolbar clicks. If the popout is open,
     // the clickable area extends to the right of the rail (for swatches).
     let popout_extends_right = v2_layout.popout_open
-        && mx >= crate::ui::v2::RAIL_WIDTH
-        && mx <= crate::ui::v2::RAIL_WIDTH + 6 + 32 + 8; // rail edge + gap + swatch + margin
+        && (crate::ui::v2::RAIL_WIDTH..=crate::ui::v2::RAIL_WIDTH + 6 + 32 + 8).contains(&mx); // rail edge + gap + swatch + margin
     if mx < crate::ui::v2::RAIL_WIDTH || popout_extends_right {
         if DEBUG.load(Ordering::Relaxed) {
             eprintln!("[dbg] press({mx},{my}) consumed by V2 toolbar");
@@ -201,7 +190,7 @@ fn handle_press(
     }
     if state
         .draw_locked_until
-        .map_or(false, |t| std::time::Instant::now() < t)
+        .is_some_and(|t| std::time::Instant::now() < t)
     {
         if DEBUG.load(Ordering::Relaxed) {
             eprintln!("[dbg] press({mx},{my}) suppressed by draw_locked_until");
@@ -505,10 +494,10 @@ fn handle_release(x1: i32, y1: i32, state: &mut AppState, canvas: &mut Canvas) {
         // remaining brush pixels on the bake so non-live pixels wipe
         // through to transparency too.
         Tool::Eraser => {
-            if let Some(drag) = state.eraser_drag.take() {
-                if !drag.points.is_empty() {
-                    state.scene.erase_path(&drag.points, drag.radius, canvas);
-                }
+            if let Some(drag) = state.eraser_drag.take()
+                && !drag.points.is_empty()
+            {
+                state.scene.erase_path(&drag.points, drag.radius, canvas);
             }
         }
         Tool::Select => {
@@ -568,30 +557,28 @@ fn handle_keydown(
                 state.text_buffer.pop();
             }
             Keycode::V if ctrl => {
-                if let Some(cb) = clipboard {
-                    if let Ok(text) = cb.clipboard_text() {
-                        // Strip newlines — single-line text tool.
-                        let cleaned: String =
-                            text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-                        state.text_buffer.push_str(&cleaned);
-                    }
+                if let Some(cb) = clipboard
+                    && let Ok(text) = cb.clipboard_text()
+                {
+                    // Strip newlines — single-line text tool.
+                    let cleaned: String =
+                        text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+                    state.text_buffer.push_str(&cleaned);
                 }
             }
             // ── Select-all shortcut for multi-select ────────────────────────
-            Keycode::A if ctrl => {
-                if state.active_tool == Tool::Select {
-                    // Select every live object.  No undo snapshot — this is
-                    // a pure selection change, no scene mutation.
-                    let n = state.scene.objects().len();
-                    let mut sel: Vec<usize> = (0..n).collect();
-                    state.scene.selected.clear();
-                    state.scene.selected.append(&mut sel);
-                    state.mark_snapshot_dirty();
-                }
-                // Outside Select, Ctrl+A is intentionally unbound (the
-                // existing `Keycode::A` (without Ctrl) below still switches
-                // to the Arrow tool).
+            Keycode::A if ctrl && state.active_tool == Tool::Select => {
+                // Select every live object.  No undo snapshot — this is
+                // a pure selection change, no scene mutation.
+                let n = state.scene.objects().len();
+                let mut sel: Vec<usize> = (0..n).collect();
+                state.scene.selected.clear();
+                state.scene.selected.append(&mut sel);
+                state.mark_snapshot_dirty();
             }
+            // Outside Select, Ctrl+A is intentionally unbound (the
+            // existing `Keycode::A` (without Ctrl) below still switches
+            // to the Arrow tool).
             _ => {}
         }
         return true;
@@ -622,7 +609,6 @@ fn handle_keydown(
                     match picker.stage {
                         PickerStage::Devices => picker.device_cursor = 0,
                         PickerStage::Modes => picker.mode_cursor = 0,
-                        _ => {}
                     }
                     picker.scroll_to_cursor(state.window_size.1 as i32);
                 }
@@ -635,7 +621,6 @@ fn handle_keydown(
                         PickerStage::Modes => {
                             picker.mode_cursor = picker.current_mode_count().saturating_sub(1);
                         }
-                        _ => {}
                     }
                     picker.scroll_to_cursor(state.window_size.1 as i32);
                 }
@@ -649,32 +634,10 @@ fn handle_keydown(
                     if picker.stage == PickerStage::Devices {
                         state.show_device_picker = false;
                     } else {
-                        // Modes / Rtsp: go back to Devices without closing
-                        // the modal.  `dismiss()` resets cursors and the
-                        // RTSP URL buffer so the next open is clean.
+                        // Modes: go back to Devices without closing the
+                        // modal.  `dismiss()` resets the cursors so the
+                        // next open is clean.
                         picker.dismiss();
-                    }
-                }
-                Keycode::Backspace => {
-                    if picker.stage == PickerStage::Rtsp {
-                        picker.rtsp.url.pop();
-                    }
-                }
-                Keycode::V if ctrl => {
-                    if picker.stage == PickerStage::Rtsp {
-                        if let Some(cb) = clipboard {
-                            match cb.clipboard_text() {
-                                Ok(text) => {
-                                    // Strip whitespace — RTSP URLs are
-                                    // single-line and surrounding newlines
-                                    // would break ffmpeg invocation.
-                                    let cleaned: String =
-                                        text.chars().filter(|c| !c.is_whitespace()).collect();
-                                    picker.rtsp.url.push_str(&cleaned);
-                                }
-                                Err(e) => eprintln!("[input] clipboard read failed: {e}"),
-                            }
-                        }
                     }
                 }
                 _ => {}

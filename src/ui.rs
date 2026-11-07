@@ -245,6 +245,7 @@ impl MenuBar {
     }
 
     /// Draw the menu bar (and dropdown if open)
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &self,
         sdl: &mut SdlCanvas<Window>,
@@ -392,7 +393,7 @@ impl MenuBar {
                     cache,
                     &label,
                     color,
-                    Rect::new(rr.x + 8, rr.y, (rr.width() - 8) as u32, rr.height()),
+                    Rect::new(rr.x + 8, rr.y, rr.width() - 8, rr.height()),
                 );
             }
         }
@@ -457,7 +458,6 @@ impl MenuBar {
 pub enum PickerStage {
     Devices,
     Modes,
-    Rtsp,
 }
 
 /// What the header control (close X / back arrow) should do for a given
@@ -466,20 +466,8 @@ pub enum PickerStage {
 pub enum PickerDismiss {
     /// No header hit.
     None,
-    /// Header was clicked on a sub-stage (e.g. Rtsp) — reset stage to
-    /// Devices, but leave the modal open.
-    Back,
     /// Header was clicked on the top-level stage — close the modal.
     Close,
-}
-
-/// RTSP stream URL entered via the picker UI.  Credentials belong in the
-/// URL itself (e.g. `rtsp://user:pass@host/path`) — that's the standard
-/// RTSP convention and what `ffmpeg -i` accepts directly, so there's no need
-/// to model them as separate fields.
-#[derive(Clone, Default)]
-pub struct RtspEntry {
-    pub url: String,
 }
 
 pub struct DevicePicker {
@@ -488,8 +476,6 @@ pub struct DevicePicker {
     pub mode_cursor: usize,
     pub stage: PickerStage,
     pub scroll_offset: usize,
-    /// In-progress RTSP URL edit.  Only meaningful while `stage == Rtsp`.
-    pub rtsp: RtspEntry,
 }
 
 impl DevicePicker {
@@ -500,31 +486,26 @@ impl DevicePicker {
             mode_cursor: 0,
             stage: PickerStage::Devices,
             scroll_offset: 0,
-            rtsp: RtspEntry::default(),
         }
     }
 
     /// Reset the picker to its initial Devices stage.  Used by both the
     /// close button and the keyboard dismiss path so reopening the picker
-    /// doesn't land the user on a stale Modes or Rtsp screen.
+    /// doesn't land the user on a stale Modes screen.
     pub fn dismiss(&mut self) {
         self.stage = PickerStage::Devices;
         self.device_cursor = 0;
         self.mode_cursor = 0;
         self.scroll_offset = 0;
-        self.rtsp = RtspEntry::default();
     }
 
     pub fn entry_count(&self) -> usize {
-        self.devices.len() + 1 + 1
-    } // +1 for "No input", +1 for "RTSP"
+        self.devices.len() + 1
+    } // +1 for "No input"
 
     pub fn label(&self, idx: usize) -> String {
-        let rtsp_idx = self.devices.len() + 1;
         if idx == 0 {
             "No input  (black screen)".to_string()
-        } else if idx == rtsp_idx {
-            "➕ RTSP Stream".to_string()
         } else {
             let dev = &self.devices[idx - 1];
             format!("{}  [{}]", dev.name, dev.path.display())
@@ -532,10 +513,7 @@ impl DevicePicker {
     }
 
     fn caps_label(&self, idx: usize) -> String {
-        let rtsp_idx = self.devices.len() + 1;
         if idx == 0 {
-            String::new()
-        } else if idx == rtsp_idx {
             String::new()
         } else {
             self.devices[idx - 1].caps_summary.clone()
@@ -551,7 +529,6 @@ impl DevicePicker {
         let cursor = match self.stage {
             PickerStage::Devices => self.device_cursor,
             PickerStage::Modes => self.mode_cursor,
-            PickerStage::Rtsp => 0,
         };
         if cursor >= self.scroll_offset + max_visible {
             self.scroll_offset = cursor + 1 - max_visible;
@@ -579,8 +556,6 @@ impl DevicePicker {
                     }
                 }
             }
-            // RTSP has a single URL field; up/down are no-ops.
-            PickerStage::Rtsp => {}
         }
     }
 
@@ -597,8 +572,6 @@ impl DevicePicker {
                     self.mode_cursor += 1;
                 }
             }
-            // RTSP has a single URL field; up/down are no-ops.
-            PickerStage::Rtsp => {}
         }
     }
 
@@ -610,7 +583,7 @@ impl DevicePicker {
         let header_h = 64i32;
         let footer_h = 36i32;
         let avail_h = canvas_h - 40;
-        let max_visible = ((avail_h - header_h - footer_h) / row_h).max(1) as i32;
+        let max_visible = ((avail_h - header_h - footer_h) / row_h).max(1);
 
         let (cursor_ref, total) = match self.stage {
             PickerStage::Devices => {
@@ -621,8 +594,6 @@ impl DevicePicker {
                 let t = self.current_mode_count() as i32;
                 (&mut self.mode_cursor, t)
             }
-            // RTSP is a single field — wheel has no list to scroll.
-            PickerStage::Rtsp => return,
         };
 
         if total <= 0 {
@@ -656,15 +627,8 @@ impl DevicePicker {
     pub fn enter(&mut self) -> Option<(usize, usize)> {
         match self.stage {
             PickerStage::Devices => {
-                let rtsp_idx = self.devices.len() + 1;
                 if self.device_cursor == 0 {
                     return Some((0, 0));
-                } else if self.device_cursor == rtsp_idx {
-                    // RTSP entry selected - switch to RTSP stage
-                    self.stage = PickerStage::Rtsp;
-                    self.rtsp = RtspEntry::default();
-                    self.scroll_offset = 0;
-                    return None;
                 }
                 let modes = &self.devices[self.device_cursor - 1].modes;
                 if modes.len() <= 1 {
@@ -681,20 +645,6 @@ impl DevicePicker {
                 self.stage = PickerStage::Devices;
                 result
             }
-            PickerStage::Rtsp => {
-                // Return special marker (usize::MAX, 0) to indicate RTSP
-                // The main loop will read self.rtsp for the configuration
-                Some((usize::MAX, 0))
-            }
-        }
-    }
-
-    /// Get the RTSP configuration (only valid after RTSP stage is confirmed)
-    pub fn rtsp_config(&self) -> Option<RtspEntry> {
-        if self.stage == PickerStage::Rtsp {
-            Some(self.rtsp.clone())
-        } else {
-            None
         }
     }
 
@@ -710,7 +660,6 @@ impl DevicePicker {
         let visible = match self.stage {
             PickerStage::Devices => self.entry_count().min(max_visible),
             PickerStage::Modes => self.current_mode_count().min(max_visible),
-            PickerStage::Rtsp => 3.min(max_visible),
         };
         let panel_h = header_h + row_h * visible as i32 + footer_h;
         let py = (canvas_h - panel_h) / 2;
@@ -732,16 +681,8 @@ impl DevicePicker {
         if !self.close_rect(canvas_w, canvas_h).contains_point((mx, my)) {
             return PickerDismiss::None;
         }
-        match self.stage {
-            PickerStage::Rtsp => {
-                self.dismiss();
-                PickerDismiss::Back
-            }
-            _ => {
-                self.dismiss();
-                PickerDismiss::Close
-            }
-        }
+        self.dismiss();
+        PickerDismiss::Close
     }
 
     pub fn click_enter(
@@ -794,11 +735,6 @@ impl DevicePicker {
                         return self.enter();
                     }
                 }
-                None
-            }
-            PickerStage::Rtsp => {
-                // Single URL field — clicking it focuses it for typing; Enter
-                // commits (handled by the caller via `enter()`).
                 None
             }
         }
@@ -1065,89 +1001,6 @@ impl DevicePicker {
                     &tc,
                     cache,
                     "\u{2191}\u{2193} navigate   Enter to confirm   Esc to go back",
-                    Color::RGB(100, 100, 100),
-                    Rect::new(
-                        px + 16,
-                        py + panel_h - footer_h + 8,
-                        (panel_w - 32) as u32,
-                        20,
-                    ),
-                );
-            }
-
-            PickerStage::Rtsp => {
-                let panel_h = header_h + row_h + footer_h;
-                let py = (canvas_h - panel_h) / 2;
-
-                sdl.set_draw_color(Color::RGB(0x22, 0x22, 0x22));
-                sdl.fill_rect(Rect::new(px, py, panel_w as u32, panel_h as u32))
-                    .ok();
-                sdl.set_draw_color(Color::RGB(0x44, 0x44, 0x44));
-                sdl.draw_rect(Rect::new(px, py, panel_w as u32, panel_h as u32))
-                    .ok();
-
-                // Back button (top-right of header) — RTSP is reached by
-                // drilling down from the Devices list, so this returns the
-                // user there rather than closing the modal.
-                let cr = self.close_rect(canvas_w, canvas_h);
-                sdl.set_draw_color(Color::RGB(60, 60, 60));
-                sdl.fill_rect(cr).ok();
-                sdl.set_draw_color(Color::RGB(0x55, 0x55, 0x55));
-                sdl.draw_rect(cr).ok();
-                render_text_centered(
-                    sdl,
-                    font,
-                    &tc,
-                    cache,
-                    "\u{2190}",
-                    Color::RGB(200, 200, 200),
-                    cr,
-                );
-
-                render_text(
-                    sdl,
-                    font,
-                    &tc,
-                    cache,
-                    "RTSP Stream URL",
-                    Color::RGB(220, 220, 220),
-                    Rect::new(px + 16, py + 16, (panel_w - 32) as u32, 32),
-                );
-
-                // Single URL row
-                let ry = py + header_h;
-                let row_rect = Rect::new(px + 8, ry, (panel_w - 16) as u32, (row_h - 4) as u32);
-                sdl.set_draw_color(Color::RGB(0x2a, 0x4a, 0x7a));
-                sdl.fill_rect(row_rect).ok();
-                sdl.set_draw_color(Color::RGB(0x4a, 0x9e, 0xff));
-                sdl.draw_rect(row_rect).ok();
-
-                let url_value = if self.rtsp.url.is_empty() {
-                    "rtsp://user:pass@camera:554/Preview_01_main".to_string()
-                } else {
-                    format!("{}\u{2502}", self.rtsp.url) // cursor bar
-                };
-                let value_col = if self.rtsp.url.is_empty() {
-                    Color::RGB(70, 100, 130)
-                } else {
-                    Color::RGB(140, 210, 255)
-                };
-                render_text(
-                    sdl,
-                    font,
-                    &tc,
-                    cache,
-                    &url_value,
-                    value_col,
-                    Rect::new(px + 20, ry + 4, (panel_w - 40) as u32, 22),
-                );
-
-                render_text(
-                    sdl,
-                    font,
-                    &tc,
-                    cache,
-                    "Reolink: /Preview_01_main  \u{b7}  /Preview_01_sub  \u{b7}  /ch01/0/main  \u{b7}  /fe-p  /fe-w",
                     Color::RGB(100, 100, 100),
                     Rect::new(
                         px + 16,

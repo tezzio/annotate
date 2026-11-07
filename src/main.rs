@@ -10,11 +10,7 @@ mod tools;
 mod ui;
 
 use std::{
-    sync::{
-        Arc, Mutex,
-        atomic::Ordering,
-        mpsc::{Receiver, SyncSender, sync_channel},
-    },
+    sync::{Arc, atomic::Ordering, mpsc::Receiver},
     time::{Duration, Instant},
 };
 
@@ -26,7 +22,7 @@ use sdl2::{
 
 use canvas::Canvas;
 use capture::{Frame, FrameFormat};
-use render_pipeline::{CanvasFrameCallback, RenderPipeline};
+use render_pipeline::RenderPipeline;
 use scene::DrawObject;
 use state::AppState;
 use tools::Tool;
@@ -49,47 +45,6 @@ const ICON_FONT_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa-soli
 // buffer instead.
 std::thread_local! {
     static PREVIEW_PTS: std::cell::RefCell<Vec<Point>> = std::cell::RefCell::new(Vec::with_capacity(512));
-}
-
-// ── Twitch streaming ──────────────────────────────────────────────────────────
-
-/// A single annotation canvas frame captured from the render pipeline, ready
-/// for compositing with the video layer and streaming to Twitch.
-struct StreamFrame {
-    /// RGBA pixels of the annotation canvas (already composited with baked bg).
-    annotation_pixels: Arc<Vec<u8>>,
-    width: u32,
-    height: u32,
-}
-
-/// Streaming worker thread.  Receives annotation canvas frames from the
-/// pipeline callback, retrieves the latest video frame from shared storage,
-/// composites them, and pushes to the Twitch ingest server.
-///
-/// Currently a stub: logs frames and exits.  Full RTMP/H.264 implementation
-/// is tracked in docs/twitch-streaming-plan.md.
-fn stream_worker(_rx: Receiver<StreamFrame>, _last_video: Arc<Mutex<Option<Frame>>>) {
-    eprintln!("[stream] streamer thread started");
-    loop {
-        match _rx.recv() {
-            Ok(frame) => {
-                eprintln!(
-                    "[stream] canvas frame ready: {}x{} ({:.1} KB)",
-                    frame.width,
-                    frame.height,
-                    frame.annotation_pixels.len() as f64 / 1024.0,
-                );
-                // TODO: composite with latest video frame
-                // TODO: encode to H.264
-                // TODO: mux into FLV/RTMP
-                // TODO: push to Twitch ingest
-            }
-            Err(_) => {
-                eprintln!("[stream] channel closed, streamer exiting");
-                break;
-            }
-        }
-    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -201,46 +156,6 @@ fn main() {
     // `pipeline.upload_to(&mut committed_tex)` each vsync.
     let pipeline = RenderPipeline::new(canvas_w, canvas_h);
     let mut pipeline_seq: u64 = 0;
-
-    // ── Twitch streaming ─────────────────────────────────────────────────
-    // Channel for canvas frames destined for RTMP streaming.  The pipeline
-    // callback runs on the worker thread and sends frames here; a streaming
-    // worker thread picks them up, composites with the latest video frame,
-    // and pushes to the Twitch ingest server.
-    let (stream_tx, stream_rx): (SyncSender<StreamFrame>, Receiver<StreamFrame>) = sync_channel(2);
-
-    // Shared latest video frame — written by the main render loop's capture
-    // handler and read by the streaming callback.  Wrapped in Arc<Mutex<Option<...>>>
-    // so the pipeline worker can access it without a lifetime conflict.
-    let last_video_for_stream: Arc<Mutex<Option<Frame>>> = Arc::new(Mutex::new(None));
-
-    // Register the canvas capture callback with the pipeline.  When a new
-    // annotation canvas frame is ready, we send it (with dimensions) to the
-    // streaming thread; that thread will composite it with the latest video
-    // frame and push the result to Twitch.
-    let stream_tx_clone = stream_tx.clone();
-    let last_video_clone = Arc::clone(&last_video_for_stream);
-    pipeline.on_canvas_frame(Some(Arc::new(
-        Box::new(move |pixels: Arc<Vec<u8>>, width, height| {
-            // Try to send; drop if the receiver is gone or the channel is full.
-            let frame = StreamFrame {
-                annotation_pixels: pixels,
-                width,
-                height,
-            };
-            let _ = stream_tx_clone.send(frame);
-        }) as CanvasFrameCallback,
-    )));
-
-    // Spawn the streaming worker thread.  It blocks on `stream_rx`, receiving
-    // canvas frames, compositing with the latest video frame, encoding to
-    // H.264, and pushing to the Twitch ingest via RTMP.
-    std::thread::Builder::new()
-        .name("twitch-streamer".into())
-        .spawn(move || {
-            stream_worker(stream_rx, last_video_clone);
-        })
-        .expect("twitch streamer thread failed to spawn");
 
     // ── Video texture (double-buffered) ────────────────────────────────────
     // A single streaming texture produces a subtle horizontal tear line with
@@ -426,7 +341,7 @@ fn main() {
                         if let Some(s) = &mut state.settings {
                             let canvas_w_i = canvas_w as i32;
                             let canvas_h_i = canvas_h as i32;
-                            let action = s.click(*x as i32, *y as i32, canvas_w_i, canvas_h_i);
+                            let action = s.click(*x, *y, canvas_w_i, canvas_h_i);
                             match action {
                                 OverlayAction::Close => {
                                     state.show_settings_overlay = false;
@@ -544,29 +459,6 @@ fn main() {
                 capture_rx = capture::null_receiver();
                 capture_fps_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
                 last_video_frame = None;
-            } else if dev_idx == usize::MAX {
-                // RTSP stream selected - get config from picker
-                if let Some(ref picker) = state.device_picker {
-                    if let Some(rtsp) = picker.rtsp_config() {
-                        // Save RTSP URL for persistence.  Credentials live in
-                        // the URL itself (e.g. rtsp://user:pass@host/path),
-                        // which is what ffmpeg accepts directly.
-                        let url = rtsp.url.trim().to_string();
-                        if !url.is_empty() {
-                            state.cfg.rtsp.url = Some(url.clone());
-                            state.cfg.rtsp.enabled = true;
-                            eprintln!("[annotator] starting RTSP stream: {}", url);
-                            let (rx, fps, stop) = capture::start_rtsp_capture(
-                                &url,
-                                state.cfg.rtsp.width,
-                                state.cfg.rtsp.height,
-                            );
-                            capture_rx = rx;
-                            capture_fps_counter = fps;
-                            capture_stop = stop;
-                        }
-                    }
-                }
             } else if let Some(picker) = &state.device_picker {
                 capture_stop.store(true, Ordering::Relaxed);
                 let dev = &picker.devices[dev_idx - 1];
@@ -661,10 +553,8 @@ fn main() {
         if !state.freeze_frame {
             while let Ok(f) = capture_rx.try_recv() {
                 if let Some(frame) = f {
-                    last_video_frame = Some(frame.clone());
+                    last_video_frame = Some(frame);
                     new_video_frame = true;
-                    // Store for the streaming worker to composite with annotation canvas.
-                    *last_video_for_stream.lock().unwrap() = Some(frame);
                 }
             }
         }
@@ -718,68 +608,61 @@ fn main() {
         // where `new_video_frame` is true, so when no capture frame arrives
         // the GPU keeps blitting from the same front buffer (no spurious
         // texture switches).
-        if let Some(frame) = &last_video_frame {
-            if frame.width > 0 && frame.height > 0 {
-                let desired_fmt = match frame.format {
-                    FrameFormat::Yuyv => PixelFormatEnum::YUY2,
-                    FrameFormat::Yuv420 => PixelFormatEnum::IYUV,
-                    FrameFormat::Rgb24 => PixelFormatEnum::RGB24,
+        if let Some(frame) = &last_video_frame
+            && frame.width > 0
+            && frame.height > 0
+        {
+            let desired_fmt = match frame.format {
+                FrameFormat::Yuyv => PixelFormatEnum::YUY2,
+                FrameFormat::Rgb24 => PixelFormatEnum::RGB24,
+            };
+            // Recreate BOTH textures if dimensions or format changed.
+            // Recreating only one is a tearing window (the in-flight blit
+            // could be sampling the one we just replaced), so we replace
+            // both atomically and reset the front-index.
+            if frame.width != video_tex_w
+                || frame.height != video_tex_h
+                || desired_fmt != video_tex_fmt
+            {
+                let t0 = texture_creator.create_texture_streaming(
+                    desired_fmt,
+                    frame.width,
+                    frame.height,
+                );
+                let t1 = texture_creator.create_texture_streaming(
+                    desired_fmt,
+                    frame.width,
+                    frame.height,
+                );
+                if let (Ok(t0), Ok(t1)) = (t0, t1) {
+                    video_tex = [t0, t1];
+                    video_tex_idx = 0;
+                    video_tex_w = frame.width;
+                    video_tex_h = frame.height;
+                    video_tex_fmt = desired_fmt;
+                }
+            }
+            if new_video_frame {
+                dbg_upload_count += 1;
+                let pitch = match frame.format {
+                    FrameFormat::Yuyv => (frame.width * 2) as usize,
+                    FrameFormat::Rgb24 => (frame.width * 3) as usize,
                 };
-                // Recreate BOTH textures if dimensions or format changed.
-                // Recreating only one is a tearing window (the in-flight blit
-                // could be sampling the one we just replaced), so we replace
-                // both atomically and reset the front-index.
-                if frame.width != video_tex_w
-                    || frame.height != video_tex_h
-                    || desired_fmt != video_tex_fmt
-                {
-                    let t0 = texture_creator.create_texture_streaming(
-                        desired_fmt,
-                        frame.width,
-                        frame.height,
-                    );
-                    let t1 = texture_creator.create_texture_streaming(
-                        desired_fmt,
-                        frame.width,
-                        frame.height,
-                    );
-                    if let (Ok(t0), Ok(t1)) = (t0, t1) {
-                        video_tex = [t0, t1];
-                        video_tex_idx = 0;
-                        video_tex_w = frame.width;
-                        video_tex_h = frame.height;
-                        video_tex_fmt = desired_fmt;
-                    }
-                }
-                if new_video_frame {
-                    dbg_upload_count += 1;
-                    // YUV420 is planar: full Y plane, then U, then V (each half-res).
-                    // SDL2's IYUV texture expects width*height*3/2 bytes in a single
-                    // contiguous buffer with this exact layout — which is what ffmpeg
-                    // produces when `-pix_fmt yuv420p` is set.
-                    let pitch = match frame.format {
-                        FrameFormat::Yuyv => (frame.width * 2) as usize,
-                        FrameFormat::Yuv420 => {
-                            (frame.width as usize) * (frame.height as usize) * 3 / 2
-                        }
-                        FrameFormat::Rgb24 => (frame.width * 3) as usize,
-                    };
-                    // Upload into the BACK buffer (the one not being sampled by
-                    // this frame's blit).
-                    let back_idx = video_tex_idx ^ 1;
-                    video_tex[back_idx].update(None, &frame.data, pitch).ok();
-                }
-                dbg_render_count += 1;
-                let dst = scale_rect(canvas_w, canvas_h, frame.width, frame.height);
-                // Blit the FRONT buffer — the GPU is currently sampling this
-                // texture and our upload targeted the OTHER one, so there is
-                // no write-during-read hazard.
-                sdl_canvas.copy(&video_tex[video_tex_idx], None, dst).ok();
-                // Rotate after the blit: the buffer we just wrote becomes the
-                // front for next frame.
-                if new_video_frame {
-                    video_tex_idx ^= 1;
-                }
+                // Upload into the BACK buffer (the one not being sampled by
+                // this frame's blit).
+                let back_idx = video_tex_idx ^ 1;
+                video_tex[back_idx].update(None, &frame.data, pitch).ok();
+            }
+            dbg_render_count += 1;
+            let dst = scale_rect(canvas_w, canvas_h, frame.width, frame.height);
+            // Blit the FRONT buffer — the GPU is currently sampling this
+            // texture and our upload targeted the OTHER one, so there is
+            // no write-during-read hazard.
+            sdl_canvas.copy(&video_tex[video_tex_idx], None, dst).ok();
+            // Rotate after the blit: the buffer we just wrote becomes the
+            // front for next frame.
+            if new_video_frame {
+                video_tex_idx ^= 1;
             }
         }
 
@@ -975,9 +858,7 @@ fn main() {
                 .laser_trail
                 .retain(|(_, _, t, _)| now.duration_since(*t).as_secs_f32() < laser_fade);
             let tlen = state.laser_trail.len();
-            let size = (state.tool_sizes[Tool::Laser.index()] as i32)
-                .max(1)
-                .min(20);
+            let size = (state.tool_sizes[Tool::Laser.index()] as i32).clamp(1, 20);
             let half = size / 2;
             // Draw connected segments — old end is transparent, new end is opaque
             for i in 1..tlen {
@@ -1017,7 +898,7 @@ fn main() {
         // via SDL2 directly (never composited into the canvas) so it's purely
         // a UI hint and disappears on mouse-up.
         if let Some(ref drag) = state.eraser_drag {
-            let r = (drag.radius as i32).max(1).min(80);
+            let r = (drag.radius as i32).clamp(1, 80);
             sdl_canvas.set_draw_color(Color::RGBA(220, 220, 220, 220));
             for &(cx, cy) in drag.points.iter().rev().take(6) {
                 let steps = 36usize;
@@ -1068,29 +949,29 @@ fn main() {
         );
 
         // Device picker on top
-        if state.show_device_picker {
-            if let Some(picker) = &state.device_picker {
-                picker.draw(
-                    &mut sdl_canvas,
-                    &font,
-                    canvas_w as i32,
-                    canvas_h as i32,
-                    &mut text_cache,
-                );
-            }
+        if state.show_device_picker
+            && let Some(picker) = &state.device_picker
+        {
+            picker.draw(
+                &mut sdl_canvas,
+                &font,
+                canvas_w as i32,
+                canvas_h as i32,
+                &mut text_cache,
+            );
         }
 
         // Settings overlay — modal panel drawn above everything else
-        if state.show_settings_overlay {
-            if let Some(ref mut settings) = state.settings {
-                settings.draw(
-                    &mut sdl_canvas,
-                    &font,
-                    canvas_w as i32,
-                    canvas_h as i32,
-                    &mut text_cache,
-                );
-            }
+        if state.show_settings_overlay
+            && let Some(ref mut settings) = state.settings
+        {
+            settings.draw(
+                &mut sdl_canvas,
+                &font,
+                canvas_w as i32,
+                canvas_h as i32,
+                &mut text_cache,
+            );
         }
 
         // Menu bar (always on top)
@@ -1189,7 +1070,7 @@ fn draw_gpu_disc(
     (cx, cy): (i32, i32),
     r: i32,
 ) {
-    let r2 = (r * r) as i32;
+    let r2 = r * r;
     for dy in -r..=r {
         for dx in -r..=r {
             if dx * dx + dy * dy <= r2 {
@@ -1229,7 +1110,7 @@ fn draw_preview_sdl(sdl: &mut sdl2::render::Canvas<sdl2::video::Window>, obj: &D
         DrawObject::Line(s) => {
             let (r, g, b) = s.color;
             sdl.set_draw_color(Color::RGBA(r, g, b, ALPHA));
-            let t = (s.size as i32).max(1).min(40);
+            let t = (s.size as i32).clamp(1, 40);
             let dx = (s.x1 - s.x0) as f32;
             let dy = (s.y1 - s.y0) as f32;
             let len = (dx * dx + dy * dy).sqrt().max(0.001);
@@ -1247,7 +1128,7 @@ fn draw_preview_sdl(sdl: &mut sdl2::render::Canvas<sdl2::video::Window>, obj: &D
         DrawObject::Rect(s) => {
             let (r, g, b) = s.color;
             sdl.set_draw_color(Color::RGBA(r, g, b, ALPHA));
-            let t = (s.size as i32).max(1).min(20);
+            let t = (s.size as i32).clamp(1, 20);
             let (x0, x1) = (s.x0.min(s.x1), s.x0.max(s.x1));
             let (y0, y1) = (s.y0.min(s.y1), s.y0.max(s.y1));
             for i in 0..t {
@@ -1262,13 +1143,13 @@ fn draw_preview_sdl(sdl: &mut sdl2::render::Canvas<sdl2::video::Window>, obj: &D
         DrawObject::Circle(s) => {
             let (r, g, b) = s.color;
             sdl.set_draw_color(Color::RGBA(r, g, b, ALPHA));
-            let t = (s.size as i32).max(1).min(20);
+            let t = (s.size as i32).clamp(1, 20);
             let cx = (s.x0 + s.x1) / 2;
             let cy = (s.y0 + s.y1) / 2;
             let base_rx = ((s.x1 - s.x0).abs() / 2) as f32;
             let base_ry = ((s.y1 - s.y0).abs() / 2) as f32;
             let perimeter = 2.0 * std::f32::consts::PI * base_rx.max(base_ry);
-            let steps = (perimeter as usize).max(16).min(512);
+            let steps = (perimeter as usize).clamp(16, 512);
             for dr in 0..t {
                 PREVIEW_PTS.with(|cell| {
                     let mut pts = cell.borrow_mut();
@@ -1288,7 +1169,7 @@ fn draw_preview_sdl(sdl: &mut sdl2::render::Canvas<sdl2::video::Window>, obj: &D
         DrawObject::Arrow(s) => {
             let (r, g, b) = s.color;
             sdl.set_draw_color(Color::RGBA(r, g, b, ALPHA));
-            let t = (s.size as i32).max(1).min(40);
+            let t = (s.size as i32).clamp(1, 40);
             let dx = (s.x1 - s.x0) as f32;
             let dy = (s.y1 - s.y0) as f32;
             let len = (dx * dx + dy * dy).sqrt().max(0.001);

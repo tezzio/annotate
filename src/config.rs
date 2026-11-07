@@ -39,10 +39,6 @@ pub struct Config {
     /// REST API settings (`[api]` section) — Crestron / remote control
     #[serde(default)]
     pub api: ApiConfig,
-
-    /// RTSP stream settings for Visionary NextGen AV over IP
-    #[serde(default)]
-    pub rtsp: RtspConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,40 +67,6 @@ pub struct ApiConfig {
     /// query param).  `None` = no authentication.
     #[serde(default)]
     pub token: Option<String>,
-}
-
-/// RTSP stream configuration for Visionary NextGen AV over IP sources.
-/// Credentials belong in the URL itself (`rtsp://user:pass@host/path`) —
-/// that's the standard RTSP convention and is what `ffmpeg -i` accepts
-/// directly, so there's no need to store them as separate fields.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RtspConfig {
-    /// Enable RTSP as a video source
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// RTSP stream URL (e.g. "rtsp://user:pass@192.168.1.100:554/stream1")
-    #[serde(default)]
-    pub url: Option<String>,
-
-    /// RTSP stream width (0 = auto detect)
-    #[serde(default)]
-    pub width: u32,
-
-    /// RTSP stream height (0 = auto detect)
-    #[serde(default)]
-    pub height: u32,
-}
-
-impl Default for RtspConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            url: None,
-            width: 0,
-            height: 0,
-        }
-    }
 }
 
 // ── serde defaults ────────────────────────────────────────────────────────────
@@ -150,7 +112,7 @@ impl Default for Config {
             tool_size: default_tool_size(),
             undo_stack_limit: default_undo_stack_limit(),
             api: ApiConfig::default(),
-            rtsp: RtspConfig::default(),
+
             users: vec![User {
                 username: "admin".to_string(),
                 password_hash: hash_password("admin"),
@@ -242,14 +204,14 @@ pub fn save(cfg: &Config) -> Result<(), String> {
 /// Parse a `rrggbb` hex string into `(r, g, b)` bytes, defaulting to white on error.
 pub fn parse_color(hex: &str) -> (u8, u8, u8) {
     let s = hex.trim_start_matches('#');
-    if s.len() == 6 {
-        if let Ok(n) = u32::from_str_radix(s, 16) {
-            return (
-                ((n >> 16) & 0xff) as u8,
-                ((n >> 8) & 0xff) as u8,
-                (n & 0xff) as u8,
-            );
-        }
+    if s.len() == 6
+        && let Ok(n) = u32::from_str_radix(s, 16)
+    {
+        return (
+            ((n >> 16) & 0xff) as u8,
+            ((n >> 8) & 0xff) as u8,
+            (n & 0xff) as u8,
+        );
     }
     (255, 255, 255)
 }

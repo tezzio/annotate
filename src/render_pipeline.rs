@@ -31,13 +31,6 @@ use sdl2::render::Texture;
 use crate::canvas::Canvas;
 use crate::scene::Scene;
 
-/// Callback type for canvas frame capture.
-/// Receives the rendered RGBA pixels (as Arc<Vec<u8>>), width, and height.
-/// Called from the worker thread after each successful render.
-/// `Sync` is required because the callback is stored in a `Mutex` inside
-/// `PipelineInner` which is shared across threads via `Arc`.
-pub type CanvasFrameCallback = Box<dyn Fn(Arc<Vec<u8>>, u32, u32) + Send + Sync>;
-
 /// Shared `ANNOTATOR_DEBUG` gate.  `main.rs` flips this on once at startup
 /// after reading the env var; `input.rs` and `worker_loop` poll it before
 /// each `eprintln!` so the debug cost is one atomic load per site.
@@ -92,9 +85,6 @@ struct PipelineInner {
     /// Monotonic completion counter; incremented by the worker after
     /// each successful render.  Read by `poll()`.
     seq: AtomicU64,
-    /// Optional callback invoked after each successful render with the
-    /// finished RGBA frame data.  Set via `on_canvas_frame()`.
-    frame_callback: Mutex<Option<Arc<CanvasFrameCallback>>>,
 }
 
 impl RenderPipeline {
@@ -110,7 +100,6 @@ impl RenderPipeline {
             cv: Condvar::new(),
             shutdown: Mutex::new(false),
             seq: AtomicU64::new(0),
-            frame_callback: Mutex::new(None),
         });
 
         // Spawn worker.  IMPORTANT: do NOT discard the spawn result with `let _` —
@@ -210,15 +199,6 @@ impl RenderPipeline {
     #[allow(dead_code)]
     pub fn height(&self) -> u32 {
         self.inner.height
-    }
-
-    /// Register a callback that is invoked after each successful render
-    /// with the finished RGBA frame (width×height×4 bytes).
-    /// Only one callback can be registered at a time; passing `None`
-    /// clears the existing callback.
-    pub fn on_canvas_frame(&self, cb: Option<Arc<CanvasFrameCallback>>) {
-        let mut slot = self.inner.frame_callback.lock().unwrap();
-        *slot = cb;
     }
 
     /// Synchronous render into the front buffer.  Used at startup and on
@@ -374,9 +354,6 @@ fn worker_loop(inner: Arc<PipelineInner>) {
             let render_start = std::time::Instant::now();
             let render_ms;
             let new_front;
-            let frame_pixels;
-            let frame_w;
-            let frame_h;
             {
                 let mut buffers = inner.buffers.lock().unwrap();
                 let w = inner.width;
@@ -392,20 +369,11 @@ fn worker_loop(inner: Arc<PipelineInner>) {
                 buffers[back_idx].pixels.copy_from_slice(&local.pixels);
                 buffers[back_idx].dirty = true;
                 render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
-                // Capture pixels for callback before releasing the lock.
-                frame_w = w;
-                frame_h = h;
-                frame_pixels = buffers[back_idx].pixels.clone();
-                // Publish: swap front/back.  After this, the new buffer is front.
                 new_front = inner.front_idx.swap();
             }
             inner.seq.fetch_add(1, Ord::Release);
 
             // Invoke frame capture callback if one is registered.
-            if let Some(cb) = inner.frame_callback.lock().unwrap().as_ref() {
-                cb(Arc::new(frame_pixels), frame_w, frame_h);
-            }
-
             if DEBUG.load(Ord::Relaxed) {
                 eprintln!(
                     "[dbg] worker: rendered in {:.1} ms, new_front={} seq={}",

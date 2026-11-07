@@ -226,10 +226,10 @@ fn read_request<R: Read>(r: &mut R) -> Result<Option<Request>, ReadError> {
     // Only header we act on (phase 2 needs the body for POSTed forms).
     let mut content_length = 0usize;
     for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("content-length") {
-                content_length = value.trim().parse().map_err(|_| ReadError::Malformed)?;
-            }
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse().map_err(|_| ReadError::Malformed)?;
         }
     }
     if header_len + content_length > MAX_REQUEST_BYTES {
@@ -362,14 +362,14 @@ fn route(
         }
         "/portal/check" if req.method == "GET" => {
             let p = &req.query;
-            if let Some(token) = p.get("token") {
-                if let Some(username) = sessions.read().unwrap().get(token) {
-                    return (
-                        200,
-                        serde_json::json!({ "ok": true, "username": username }).to_string(),
-                        "application/json",
-                    );
-                }
+            if let Some(token) = p.get("token")
+                && let Some(username) = sessions.read().unwrap().get(token)
+            {
+                return (
+                    200,
+                    serde_json::json!({ "ok": true, "username": username }).to_string(),
+                    "application/json",
+                );
             }
             return (401, err_body("not authenticated"), "application/json");
         }
@@ -390,24 +390,20 @@ fn route(
     // ── API routes ─────────────────────────────────────────────────────────
     match req.path.as_str() {
         // ── Read endpoints (GET only) ─────────────────────────────────────
-        "/api/v1/health" | "/api/v1/state" | "/api/v1/inputs" if req.method != "GET" => {
-            return (
-                405,
-                err_body("method not allowed — use GET"),
-                "application/json",
-            );
-        }
-        "/api/v1/health" => {
-            return (
-                200,
-                serde_json::json!({
-                    "ok": true,
-                    "version": env!("CARGO_PKG_VERSION"),
-                })
-                .to_string(),
-                "application/json",
-            );
-        }
+        "/api/v1/health" | "/api/v1/state" | "/api/v1/inputs" if req.method != "GET" => (
+            405,
+            err_body("method not allowed — use GET"),
+            "application/json",
+        ),
+        "/api/v1/health" => (
+            200,
+            serde_json::json!({
+                "ok": true,
+                "version": env!("CARGO_PKG_VERSION"),
+            })
+            .to_string(),
+            "application/json",
+        ),
         "/api/v1/state" => {
             let snap = read_snapshot(snapshot);
             let mut v = serde_json::to_value(&*snap).unwrap_or_else(|_| serde_json::json!({}));
@@ -417,11 +413,11 @@ fn route(
                     obj.insert("authenticated_as".into(), user.clone().into());
                 }
             }
-            return (200, v.to_string(), "application/json");
+            (200, v.to_string(), "application/json")
         }
         "/api/v1/inputs" => {
             let snap = read_snapshot(snapshot);
-            return (
+            (
                 200,
                 serde_json::json!({
                     "ok": true,
@@ -430,7 +426,7 @@ fn route(
                 })
                 .to_string(),
                 "application/json",
-            );
+            )
         }
 
         // ── Control endpoints (GET with query string or POST with form body) ──
@@ -447,10 +443,10 @@ fn route(
                 Err(msg) => return (400, err_body(&msg), "application/json"),
             };
             let (s, b) = dispatch(kind, cmd_tx);
-            return (s, b, "application/json");
+            (s, b, "application/json")
         }
 
-        _ => return (404, err_body("not found"), "application/json"),
+        _ => (404, err_body("not found"), "application/json"),
     }
 }
 
@@ -466,10 +462,11 @@ fn generate_token() -> String {
 /// Merged parameters: the POSTed urlencoded form overlays the query string.
 fn params(req: &Request) -> HashMap<String, String> {
     let mut p = req.query.clone();
-    if req.method == "POST" && !req.body.is_empty() {
-        if let Ok(form) = std::str::from_utf8(&req.body) {
-            p.extend(parse_query(form));
-        }
+    if req.method == "POST"
+        && !req.body.is_empty()
+        && let Ok(form) = std::str::from_utf8(&req.body)
+    {
+        p.extend(parse_query(form));
     }
     p
 }
@@ -562,213 +559,6 @@ fn err_body(msg: &str) -> String {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::state::InputInfo;
-    use crate::tools::Tool;
-
-    fn get(target: &str) -> Request {
-        let (path, query) = split_target(target);
-        Request {
-            method: "GET".into(),
-            path,
-            query,
-            body: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn percent_decode_handles_plus_hex_and_literals() {
-        assert_eq!(percent_decode("a+b%20c%2fD"), "a b c/D");
-        assert_eq!(percent_decode("%C3%BF"), "\u{FF}"); // valid UTF-8 for ÿ
-        assert_eq!(percent_decode("%FF"), "\u{FFFD}"); // lone byte → replacement char
-        assert_eq!(percent_decode("%zz"), "%zz"); // bad hex kept literal
-        assert_eq!(percent_decode("100%"), "100%"); // trailing % kept literal
-    }
-
-    #[test]
-    fn query_parsing_decodes_pairs_and_flags() {
-        let q = parse_query("a=1&b=two+words&flag&c=%3D");
-        assert_eq!(q.get("a").unwrap(), "1");
-        assert_eq!(q.get("b").unwrap(), "two words");
-        assert_eq!(q.get("flag").unwrap(), "");
-        assert_eq!(q.get("c").unwrap(), "=");
-        assert!(parse_query("").is_empty());
-    }
-
-    #[test]
-    fn parses_post_with_form_body() {
-        let raw: &[u8] = b"POST /api/v1/brush_size?fmt=text HTTP/1.1\r\n\
-                           Host: anno\r\nContent-Length: 5\r\n\r\npx=12";
-        let mut cur = std::io::Cursor::new(raw);
-        let r = read_request(&mut cur).unwrap().unwrap();
-        assert_eq!(r.method, "POST");
-        assert_eq!(r.path, "/api/v1/brush_size");
-        assert_eq!(r.query.get("fmt").unwrap(), "text");
-        assert_eq!(r.body, b"px=12");
-    }
-
-    #[test]
-    fn rejects_malformed_and_oversized() {
-        let mut garbage = std::io::Cursor::new(&b"not an http request"[..]);
-        assert!(matches!(
-            read_request(&mut garbage),
-            Err(ReadError::Malformed)
-        ));
-
-        let big = vec![b'X'; MAX_REQUEST_BYTES + 16];
-        let mut cur = std::io::Cursor::new(big);
-        assert!(matches!(read_request(&mut cur), Err(ReadError::TooLarge)));
-    }
-
-    #[test]
-    fn tool_name_mapping_round_trips() {
-        for t in [
-            Tool::Pen,
-            Tool::Line,
-            Tool::Rect,
-            Tool::Circle,
-            Tool::Arrow,
-            Tool::Text,
-            Tool::Select,
-            Tool::Eraser,
-            Tool::Highlight,
-            Tool::Laser,
-        ] {
-            assert_eq!(Tool::from_name(t.name()), Some(t));
-        }
-        assert_eq!(Tool::from_name("PEN"), Some(Tool::Pen)); // case-insensitive
-        assert_eq!(Tool::from_name("brush"), None);
-    }
-
-    #[test]
-    fn route_health_404_and_method_gate() {
-        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
-        let (tx, _rx) = sync_channel::<ApiCommand>(4);
-        let cfg = Config::default();
-        let sessions: SessionStore = Arc::new(RwLock::new(HashMap::new()));
-
-        let (status, body, _) = route(&get("/api/v1/health"), &snap, &tx, &cfg, &sessions);
-        assert_eq!(status, 200);
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["ok"], true);
-        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
-
-        let (status, body, _) = route(&get("/nope"), &snap, &tx, &cfg, &sessions);
-        assert_eq!(status, 404);
-        assert!(body.contains("\"ok\":false"));
-
-        let mut post = get("/api/v1/state");
-        post.method = "POST".into();
-        let (status, _, _) = route(&post, &snap, &tx, &cfg, &sessions);
-        assert_eq!(status, 405);
-    }
-
-    #[test]
-    fn route_state_and_inputs_come_from_snapshot() {
-        let mut s = StateSnapshot::default();
-        s.tool = "pen";
-        s.input = 1;
-        s.inputs.push(InputInfo {
-            index: 0,
-            name: "No input (black screen)".into(),
-            path: None,
-            modes: vec![],
-        });
-        let snap: SharedSnapshot = Arc::new(RwLock::new(s));
-        let (tx, _rx) = sync_channel::<ApiCommand>(4);
-        let cfg = Config::default();
-        let sessions: SessionStore = Arc::new(RwLock::new(HashMap::new()));
-
-        let (status, body, _) = route(&get("/api/v1/state?fmt=json"), &snap, &tx, &cfg, &sessions);
-        assert_eq!(status, 200);
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["ok"], true);
-        assert_eq!(v["tool"], "pen");
-        assert_eq!(v["input"], 1);
-
-        let (status, body, _) = route(&get("/api/v1/inputs"), &snap, &tx, &cfg, &sessions);
-        assert_eq!(status, 200);
-        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["ok"], true);
-        assert_eq!(v["active"], 1);
-        assert_eq!(v["inputs"][0]["index"], 0);
-        assert_eq!(v["inputs"][0]["name"], "No input (black screen)");
-    }
-
-    // ── Phase 2: control-endpoint parsing ────────────────────────────────
-
-    #[test]
-    fn tool_endpoint_validates_names() {
-        let r = control_command(&get("/api/v1/tool?name=pen")).unwrap();
-        assert!(matches!(r, ApiCommandKind::SetTool(Tool::Pen)));
-
-        assert!(control_command(&get("/api/v1/tool?name=LASER")).is_ok());
-        assert!(control_command(&get("/api/v1/tool")).is_err()); // missing
-        assert!(control_command(&get("/api/v1/tool?name=brush")).is_err()); // unknown
-    }
-
-    #[test]
-    fn color_endpoint_hex_and_palette() {
-        let r = control_command(&get("/api/v1/color?hex=ff3333")).unwrap();
-        assert!(matches!(r, ApiCommandKind::SetColor(255, 51, 51)));
-
-        let r = control_command(&get("/api/v1/color?palette=1")).unwrap();
-        assert!(matches!(r, ApiCommandKind::SetColor(255, 255, 255)));
-
-        assert!(control_command(&get("/api/v1/color?hex=zzzzzz")).is_err());
-        assert!(control_command(&get("/api/v1/color?hex=fff")).is_err());
-        assert!(control_command(&get("/api/v1/color?palette=9")).is_err());
-        assert!(control_command(&get("/api/v1/color?palette=0")).is_err());
-        assert!(control_command(&get("/api/v1/color")).is_err());
-    }
-
-    #[test]
-    fn brush_size_endpoint_px_and_delta() {
-        let r = control_command(&get("/api/v1/brush_size?px=12")).unwrap();
-        assert!(matches!(r, ApiCommandKind::SetBrushSize(12)));
-
-        let r = control_command(&get("/api/v1/brush_size?delta=-4")).unwrap();
-        assert!(matches!(r, ApiCommandKind::SetBrushSizeDelta(-4)));
-
-        assert!(control_command(&get("/api/v1/brush_size?delta=99")).is_err()); // range
-        assert!(control_command(&get("/api/v1/brush_size?px=abc")).is_err());
-        assert!(control_command(&get("/api/v1/brush_size")).is_err());
-    }
-
-    #[test]
-    fn input_endpoint_index_and_optional_mode() {
-        let r = control_command(&get("/api/v1/input?index=2")).unwrap();
-        assert!(matches!(r, ApiCommandKind::SetInput { index: 2, mode: 0 }));
-
-        let r = control_command(&get("/api/v1/input?index=1&mode=3")).unwrap();
-        assert!(matches!(r, ApiCommandKind::SetInput { index: 1, mode: 3 }));
-
-        assert!(control_command(&get("/api/v1/input")).is_err());
-        assert!(control_command(&get("/api/v1/input?index=-1")).is_err());
-    }
-
-    #[test]
-    fn post_form_body_overlays_query_string() {
-        let mut r = get("/api/v1/tool?name=pen");
-        r.method = "POST".into();
-        r.body = b"name=eraser".to_vec();
-        let cmd = control_command(&r).unwrap();
-        assert!(matches!(cmd, ApiCommandKind::SetTool(Tool::Eraser))); // body wins
-    }
-
-    #[test]
-    fn dispatch_reports_missing_main_loop() {
-        // Channel exists but nobody drains and the receiver is dropped.
-        let (tx, rx) = sync_channel::<ApiCommand>(1);
-        drop(rx);
-        let (status, body) = dispatch(ApiCommandKind::SetTool(Tool::Pen), &tx);
-        assert_eq!(status, 503);
-        assert!(body.contains("\"ok\":false"));
-    }
-}
 
 // ── Web Portal HTML ───────────────────────────────────────────────────────────
 
@@ -1028,3 +818,212 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
     </script>
 </body>
 </html>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::InputInfo;
+    use crate::tools::Tool;
+
+    fn get(target: &str) -> Request {
+        let (path, query) = split_target(target);
+        Request {
+            method: "GET".into(),
+            path,
+            query,
+            body: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn percent_decode_handles_plus_hex_and_literals() {
+        assert_eq!(percent_decode("a+b%20c%2fD"), "a b c/D");
+        assert_eq!(percent_decode("%C3%BF"), "\u{FF}"); // valid UTF-8 for ÿ
+        assert_eq!(percent_decode("%FF"), "\u{FFFD}"); // lone byte → replacement char
+        assert_eq!(percent_decode("%zz"), "%zz"); // bad hex kept literal
+        assert_eq!(percent_decode("100%"), "100%"); // trailing % kept literal
+    }
+
+    #[test]
+    fn query_parsing_decodes_pairs_and_flags() {
+        let q = parse_query("a=1&b=two+words&flag&c=%3D");
+        assert_eq!(q.get("a").unwrap(), "1");
+        assert_eq!(q.get("b").unwrap(), "two words");
+        assert_eq!(q.get("flag").unwrap(), "");
+        assert_eq!(q.get("c").unwrap(), "=");
+        assert!(parse_query("").is_empty());
+    }
+
+    #[test]
+    fn parses_post_with_form_body() {
+        let raw: &[u8] = b"POST /api/v1/brush_size?fmt=text HTTP/1.1\r\n\
+                           Host: anno\r\nContent-Length: 5\r\n\r\npx=12";
+        let mut cur = std::io::Cursor::new(raw);
+        let r = read_request(&mut cur).unwrap().unwrap();
+        assert_eq!(r.method, "POST");
+        assert_eq!(r.path, "/api/v1/brush_size");
+        assert_eq!(r.query.get("fmt").unwrap(), "text");
+        assert_eq!(r.body, b"px=12");
+    }
+
+    #[test]
+    fn rejects_malformed_and_oversized() {
+        let mut garbage = std::io::Cursor::new(&b"not an http request"[..]);
+        assert!(matches!(
+            read_request(&mut garbage),
+            Err(ReadError::Malformed)
+        ));
+
+        let big = vec![b'X'; MAX_REQUEST_BYTES + 16];
+        let mut cur = std::io::Cursor::new(big);
+        assert!(matches!(read_request(&mut cur), Err(ReadError::TooLarge)));
+    }
+
+    #[test]
+    fn tool_name_mapping_round_trips() {
+        for t in [
+            Tool::Pen,
+            Tool::Line,
+            Tool::Rect,
+            Tool::Circle,
+            Tool::Arrow,
+            Tool::Text,
+            Tool::Select,
+            Tool::Eraser,
+            Tool::Highlight,
+            Tool::Laser,
+        ] {
+            assert_eq!(Tool::from_name(t.name()), Some(t));
+        }
+        assert_eq!(Tool::from_name("PEN"), Some(Tool::Pen)); // case-insensitive
+        assert_eq!(Tool::from_name("brush"), None);
+    }
+
+    #[test]
+    fn route_health_404_and_method_gate() {
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, _rx) = sync_channel::<ApiCommand>(4);
+        let cfg = Config::default();
+        let sessions: SessionStore = Arc::new(RwLock::new(HashMap::new()));
+
+        let (status, body, _) = route(&get("/api/v1/health"), &snap, &tx, &cfg, &sessions);
+        assert_eq!(status, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+
+        let (status, body, _) = route(&get("/nope"), &snap, &tx, &cfg, &sessions);
+        assert_eq!(status, 404);
+        assert!(body.contains("\"ok\":false"));
+
+        let mut post = get("/api/v1/state");
+        post.method = "POST".into();
+        let (status, _, _) = route(&post, &snap, &tx, &cfg, &sessions);
+        assert_eq!(status, 405);
+    }
+
+    #[test]
+    fn route_state_and_inputs_come_from_snapshot() {
+        let mut s = StateSnapshot {
+            tool: "pen",
+            input: 1,
+            ..Default::default()
+        };
+        s.inputs.push(InputInfo {
+            index: 0,
+            name: "No input (black screen)".into(),
+            path: None,
+            modes: vec![],
+        });
+        let snap: SharedSnapshot = Arc::new(RwLock::new(s));
+        let (tx, _rx) = sync_channel::<ApiCommand>(4);
+        let cfg = Config::default();
+        let sessions: SessionStore = Arc::new(RwLock::new(HashMap::new()));
+
+        let (status, body, _) = route(&get("/api/v1/state?fmt=json"), &snap, &tx, &cfg, &sessions);
+        assert_eq!(status, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["tool"], "pen");
+        assert_eq!(v["input"], 1);
+
+        let (status, body, _) = route(&get("/api/v1/inputs"), &snap, &tx, &cfg, &sessions);
+        assert_eq!(status, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["active"], 1);
+        assert_eq!(v["inputs"][0]["index"], 0);
+        assert_eq!(v["inputs"][0]["name"], "No input (black screen)");
+    }
+
+    // ── Phase 2: control-endpoint parsing ────────────────────────────────
+
+    #[test]
+    fn tool_endpoint_validates_names() {
+        let r = control_command(&get("/api/v1/tool?name=pen")).unwrap();
+        assert!(matches!(r, ApiCommandKind::SetTool(Tool::Pen)));
+
+        assert!(control_command(&get("/api/v1/tool?name=LASER")).is_ok());
+        assert!(control_command(&get("/api/v1/tool")).is_err()); // missing
+        assert!(control_command(&get("/api/v1/tool?name=brush")).is_err()); // unknown
+    }
+
+    #[test]
+    fn color_endpoint_hex_and_palette() {
+        let r = control_command(&get("/api/v1/color?hex=ff3333")).unwrap();
+        assert!(matches!(r, ApiCommandKind::SetColor(255, 51, 51)));
+
+        let r = control_command(&get("/api/v1/color?palette=1")).unwrap();
+        assert!(matches!(r, ApiCommandKind::SetColor(255, 255, 255)));
+
+        assert!(control_command(&get("/api/v1/color?hex=zzzzzz")).is_err());
+        assert!(control_command(&get("/api/v1/color?hex=fff")).is_err());
+        assert!(control_command(&get("/api/v1/color?palette=9")).is_err());
+        assert!(control_command(&get("/api/v1/color?palette=0")).is_err());
+        assert!(control_command(&get("/api/v1/color")).is_err());
+    }
+
+    #[test]
+    fn brush_size_endpoint_px_and_delta() {
+        let r = control_command(&get("/api/v1/brush_size?px=12")).unwrap();
+        assert!(matches!(r, ApiCommandKind::SetBrushSize(12)));
+
+        let r = control_command(&get("/api/v1/brush_size?delta=-4")).unwrap();
+        assert!(matches!(r, ApiCommandKind::SetBrushSizeDelta(-4)));
+
+        assert!(control_command(&get("/api/v1/brush_size?delta=99")).is_err()); // range
+        assert!(control_command(&get("/api/v1/brush_size?px=abc")).is_err());
+        assert!(control_command(&get("/api/v1/brush_size")).is_err());
+    }
+
+    #[test]
+    fn input_endpoint_index_and_optional_mode() {
+        let r = control_command(&get("/api/v1/input?index=2")).unwrap();
+        assert!(matches!(r, ApiCommandKind::SetInput { index: 2, mode: 0 }));
+
+        let r = control_command(&get("/api/v1/input?index=1&mode=3")).unwrap();
+        assert!(matches!(r, ApiCommandKind::SetInput { index: 1, mode: 3 }));
+
+        assert!(control_command(&get("/api/v1/input")).is_err());
+        assert!(control_command(&get("/api/v1/input?index=-1")).is_err());
+    }
+
+    #[test]
+    fn post_form_body_overlays_query_string() {
+        let mut r = get("/api/v1/tool?name=pen");
+        r.method = "POST".into();
+        r.body = b"name=eraser".to_vec();
+        let cmd = control_command(&r).unwrap();
+        assert!(matches!(cmd, ApiCommandKind::SetTool(Tool::Eraser))); // body wins
+    }
+
+    #[test]
+    fn dispatch_reports_missing_main_loop() {
+        // Channel exists but nobody drains and the receiver is dropped.
+        let (tx, rx) = sync_channel::<ApiCommand>(1);
+        drop(rx);
+        let (status, body) = dispatch(ApiCommandKind::SetTool(Tool::Pen), &tx);
+        assert_eq!(status, 503);
+        assert!(body.contains("\"ok\":false"));
+    }
+}
