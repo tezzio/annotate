@@ -1,3 +1,8 @@
+// The drawing primitives below take their geometry as plain scalars —
+// a canvas plus a handful of coordinates.  Bundling them into structs
+// would obscure the call sites without making the code shorter.
+#![allow(clippy::too_many_arguments)]
+
 use crate::canvas::Canvas;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

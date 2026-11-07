@@ -220,7 +220,7 @@ impl V2Layout {
         self.rail.color_popout.clear();
         for i in 0..8 {
             let sw_x = RAIL_WIDTH + 6;
-            let sw_y = self.rail.color_tile.y + i as i32 * (SWATCH_SIZE + SWATCH_GAP);
+            let sw_y = self.rail.color_tile.y + i * (SWATCH_SIZE + SWATCH_GAP);
             self.rail.color_popout.push(Rect::new(
                 sw_x,
                 sw_y,
@@ -255,6 +255,7 @@ impl V2Layout {
 // ── Drawing ─────────────────────────────────────────────────────────────────
 
 /// Draw the V2 scrollable left rail.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_v2_toolbar(
     sdl: &mut SdlCanvas<Window>,
     font: &Font,
@@ -357,17 +358,17 @@ pub fn draw_v2_toolbar(
     // Color popout
     if layout.popout_open {
         // Background panel covering all swatches
-        if let Some(first) = layout.rail.color_popout.first() {
-            if let Some(last) = layout.rail.color_popout.last() {
-                let px = first.x - 6;
-                let py = first.y - 6;
-                let pw = SWATCH_SIZE + 12;
-                let ph = (last.y + SWATCH_SIZE) - first.y + 12;
-                sdl.set_draw_color(Color::RGB(25, 25, 28));
-                sdl.fill_rect(Rect::new(px, py, pw as u32, ph as u32)).ok();
-                sdl.set_draw_color(Color::RGB(45, 45, 50));
-                sdl.draw_rect(Rect::new(px, py, pw as u32, ph as u32)).ok();
-            }
+        if let Some(first) = layout.rail.color_popout.first()
+            && let Some(last) = layout.rail.color_popout.last()
+        {
+            let px = first.x - 6;
+            let py = first.y - 6;
+            let pw = SWATCH_SIZE + 12;
+            let ph = (last.y + SWATCH_SIZE) - first.y + 12;
+            sdl.set_draw_color(Color::RGB(25, 25, 28));
+            sdl.fill_rect(Rect::new(px, py, pw as u32, ph as u32)).ok();
+            sdl.set_draw_color(Color::RGB(45, 45, 50));
+            sdl.draw_rect(Rect::new(px, py, pw as u32, ph as u32)).ok();
         }
         for (i, sr) in layout.rail.color_popout.iter().enumerate() {
             let (r, g, b) = PALETTE[i];

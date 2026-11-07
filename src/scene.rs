@@ -326,9 +326,7 @@ impl DrawObject {
                 // trims it.  Compute the closest point on the segment to
                 // any eraser disc; if within r, chop at that point.
                 if let Some(t) = segment_eraser_t(s.x0, s.y0, s.x1, s.y1, eraser_path, r) {
-                    if t < 0.02 {
-                        EraseResult::Removed
-                    } else if t > 0.98 {
+                    if !(0.02..=0.98).contains(&t) {
                         EraseResult::Removed
                     } else {
                         // Split: keep the (0..t) sub-segment.
@@ -384,7 +382,7 @@ fn erase_outcome(out: Vec<DrawObject>) -> EraseResult {
 
 /// True if a point lies inside any eraser disc along `path`.
 fn point_in_eraser(p: (i32, i32), path: &[(i32, i32)], r: i32) -> bool {
-    let r2 = (r * r) as i32;
+    let r2 = r * r;
     for &(cx, cy) in path {
         let dx = p.0 - cx;
         let dy = p.1 - cy;
@@ -428,6 +426,9 @@ fn point_near_segment(p: (i32, i32), a: (i32, i32), b: (i32, i32), r: i32) -> bo
 }
 
 /// True if a segment intersects an axis-aligned rect.
+// Segment/rectangle intersection takes the two endpoints and the four
+// rectangle edges as plain coordinates; a struct would only add noise.
+#[allow(clippy::too_many_arguments)]
 fn segment_intersects_rect(
     x0: i32,
     y0: i32,
@@ -950,11 +951,12 @@ impl Scene {
         //    and don't benefit from parallelization — do them inline on the
         //    caller thread.
         canvas.clear();
-        if let Some(bg) = &self.inner.baked_bg {
-            if bg.width == canvas.width && bg.height == canvas.height {
-                let n = bg.pixels.len().min(canvas.pixels.len());
-                canvas.pixels[..n].copy_from_slice(&bg.pixels[..n]);
-            }
+        if let Some(bg) = &self.inner.baked_bg
+            && bg.width == canvas.width
+            && bg.height == canvas.height
+        {
+            let n = bg.pixels.len().min(canvas.pixels.len());
+            canvas.pixels[..n].copy_from_slice(&bg.pixels[..n]);
         }
 
         // 2. Parallel object rasterization.  Split the canvas rows into
@@ -979,7 +981,7 @@ impl Scene {
             .par_chunks_mut(chunk_rows as usize * stride)
             .enumerate()
             .for_each(|(chunk_idx, chunk)| {
-                let y_start = (chunk_idx as u32 * chunk_rows_u) as u32;
+                let y_start = chunk_idx as u32 * chunk_rows_u;
                 let rows = (chunk.len() / stride_u) as u32;
                 // SAFETY: `chunk` is an exclusive `&mut [u8]` whose length
                 // is `rows * stride_u`.  We never read outside this range
@@ -1004,12 +1006,9 @@ impl Scene {
     /// `Some(index)`.  The baked background is never hit-tested — it's
     /// intentionally not selectable.
     pub fn hit_test(&self, px: i32, py: i32) -> Option<usize> {
-        for i in (0..self.inner.objects.len()).rev() {
-            if self.inner.objects[i].hit_test(px, py) {
-                return Some(i);
-            }
-        }
-        None
+        (0..self.inner.objects.len())
+            .rev()
+            .find(|&i| self.inner.objects[i].hit_test(px, py))
     }
 
     // ── Multi-select helpers ────────────────────────────────────────────────

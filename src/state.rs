@@ -69,6 +69,9 @@ pub struct ApiCommand {
     pub reply: std::sync::mpsc::SyncSender<ApiResult>,
 }
 
+// The `Set*` prefix groups the mutation commands together, which is what
+// the REST handler dispatches on.
+#[allow(clippy::enum_variant_names)]
 pub enum ApiCommandKind {
     /// Switch tool, preserving per-tool size memory (like `input::switch_tool`).
     SetTool(Tool),
@@ -141,6 +144,7 @@ pub struct AppState {
     pub tool_sizes: [u32; 10],
 
     // Laser pointer ephemeral trail: (x, y, timestamp, color)
+    #[allow(clippy::type_complexity)]
     pub laser_trail: Vec<(i32, i32, Instant, (u8, u8, u8))>,
 
     // Mouse drag

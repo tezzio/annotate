@@ -54,7 +54,7 @@ fn fetch_fa_solid(assets: &Path) {
     let mut archive = zip::ZipArchive::new(io::Cursor::new(data.clone()))
         .expect("failed to open Font Awesome zip");
     let solid_index = (0..archive.len()).find(|&i| {
-        archive.by_index(i).ok().map_or(false, |f| {
+        archive.by_index(i).ok().is_some_and(|f| {
             let n = f.name().to_owned();
             // The exact filename varies across releases (space vs dash before "Solid").
             n.ends_with(".otf") && n.contains("Free") && n.contains("Solid")
@@ -79,8 +79,6 @@ fn fetch_fa_solid(assets: &Path) {
         }
     }
 }
-
-/// Compile the annotator crate as a release binary into `target_dir` using a
 
 fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
