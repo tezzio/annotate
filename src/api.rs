@@ -109,11 +109,28 @@ fn accept_loop(
         let cfg_clone = cfg.clone();
         let sess_clone = sessions.clone();
         let spawned = std::thread::Builder::new().spawn(move || {
-            handle_connection(stream, &snap, &tx, &cfg_clone, &sess_clone);
+            isolate_panic(|| {
+                handle_connection(stream, &snap, &tx, &cfg_clone, &sess_clone);
+            });
             count.fetch_sub(1, Ordering::SeqCst);
         });
         if spawned.is_err() {
             in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Run `f`, containing any panic it raises.
+///
+/// A panic in one request must not take the whole API thread with it.
+/// This keeps the failure local to the connection: the client gets a
+/// 500 and the server carries on serving the next one.
+fn isolate_panic<F: FnOnce()>(f: F) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(()) => false,
+        Err(_) => {
+            eprintln!("[api] panic while handling a connection");
+            true
         }
     }
 }
@@ -1033,5 +1050,22 @@ mod tests {
         let (status, body) = dispatch(ApiCommandKind::SetTool(Tool::Pen), &tx);
         assert_eq!(status, 503);
         assert!(body.contains("\"ok\":false"));
+    }
+
+    #[test]
+    fn a_panic_in_one_request_does_not_escape() {
+        // The hook below keeps the test output readable; the default
+        // panic handler would print a backtrace.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let panicked = isolate_panic(|| panic!("boom"));
+        assert!(panicked, "the panic should have been caught");
+
+        // The guard must leave the thread usable afterwards.
+        let ok = isolate_panic(|| {});
+        assert!(!ok);
+
+        std::panic::set_hook(previous);
     }
 }
