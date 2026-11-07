@@ -6,7 +6,24 @@ Everything that was completed has been removed from this file.  If a feature
 is not listed here, it is shipped and working.
 
 Last updated: 2026-11-07
+## Where to download builds
 
+Every push to `main` triggers GitHub Actions.  Completed runs upload the
+built binaries as artifacts:
+
+- `annotator-linux-x86_64`
+- `annotator-linux-aarch64`
+
+Go to **Actions → the latest CI run → Artifacts** and download either
+binary.  The artifacts are kept for 90 days (GitHub default).
+
+Pushing a tag like `v0.2.0` creates a GitHub Release and attaches the
+renamed binaries:
+
+- `annotator-0.2.0-linux-x86_64`
+- `annotator-0.2.0-linux-aarch64`
+
+The workflow is in `.github/workflows/build.yml`.
 ---
 
 ## 1. Verification of current state

@@ -69,9 +69,6 @@ case "$ARCH" in
 esac
 
 SYSROOT="$TARGET_DIR/$ARCH-libs"
-# The path is baked into the binaries' RUNPATH, so it has to be
-# absolute.
-SYSROOT="$(cd "$(dirname "$SYSROOT")" && pwd)/$(basename "$SYSROOT")"
 APT_STATE="$TARGET_DIR/apt-state/$ARCH"
 DEB_CACHE="$TARGET_DIR/apt-cache/$ARCH"
 KEYRING_DIR="$TARGET_DIR/apt-keyring"
@@ -257,6 +254,17 @@ if [[ $CLEAN -eq 1 ]]; then
     exit 0
 fi
 
+ensure_target_dir
+
+# The path is baked into the binaries' RUNPATH, so it has to be absolute.
+# TARGET_DIR is guaranteed to exist now, so resolve it once and anchor
+# every other path to it.
+TARGET_DIR="$(cd "$TARGET_DIR" && pwd)"
+SYSROOT="$TARGET_DIR/$ARCH-libs"
+APT_STATE="$TARGET_DIR/apt-state/$ARCH"
+DEB_CACHE="$TARGET_DIR/apt-cache/$ARCH"
+KEYRING_DIR="$TARGET_DIR/apt-keyring"
+
 if [[ -d "$SYSROOT" ]]; then
     if [[ $FORCE -eq 0 ]]; then
         info "Sysroot already present at $SYSROOT (use --force to rebuild)"
@@ -266,7 +274,6 @@ if [[ -d "$SYSROOT" ]]; then
     rm -rf "$SYSROOT"
 fi
 
-ensure_target_dir
 mkdir -p "$SYSROOT" "$DEB_CACHE"
 
 ensure_keyring
