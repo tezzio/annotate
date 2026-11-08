@@ -661,17 +661,21 @@ fn main() {
             }
         }
 
-        // ── Text commit onto canvas ────────────────────────────────────────
+        // ── Text commit onto the scene ─────────────────────────────────────
+        // Text becomes a real scene object rather than pixels painted
+        // straight onto the canvas.  That way it can be selected, moved,
+        // undone and saved like any other annotation.
         if state.pending_text_commit {
             state.pending_text_commit = false;
-            blit_text_to_canvas(
-                &mut committed_canvas,
-                &state.text_buffer,
-                state.text_pos,
-                state.color,
-                &font_large,
-            );
+            let text = state.text_buffer.clone();
+            let pos = state.text_pos;
+            let color = state.color;
+            if let Some(obj) = make_text_obj(&text, pos, color, 20, &font_large) {
+                state.scene.push_undo();
+                state.scene.add(scene::DrawObject::Text(obj));
+            }
             state.text_buffer.clear();
+            state.mark_snapshot_dirty();
         }
 
         // ── Render ────────────────────────────────────────────────────────
@@ -1365,51 +1369,141 @@ fn scale_rect(canvas_w: u32, canvas_h: u32, frame_w: u32, frame_h: u32) -> Rect 
     Rect::new(x, y, dst_w, dst_h)
 }
 
-/// Blit SDL_ttf-rendered text into the RGBA annotation canvas buffer
-fn blit_text_to_canvas(
-    canvas: &mut Canvas,
+/// Rasterize text into a [`TextObj`] — a first-class scene object.
+///
+/// The glyphs are rendered once, here on the main thread where the SDL TTF
+/// font is available, and stored as an RGBA bitmap.  The scene then
+/// renders text like any other object, which keeps the render path free
+/// of font dependencies and therefore still safe to run on the background
+/// rasterizer thread.
+///
+/// Returns `None` for empty text or when the font cannot render it.
+fn make_text_obj(
     text: &str,
     pos: (i32, i32),
     color: (u8, u8, u8),
+    size: u32,
     font: &sdl2::ttf::Font,
-) {
+) -> Option<scene::TextObj> {
     if text.is_empty() {
-        return;
+        return None;
     }
-
-    let surface = match font
+    let surface = font
         .render(text)
         .blended(sdl2::pixels::Color::RGB(color.0, color.1, color.2))
-    {
-        Ok(s) => s,
-        Err(_) => return,
-    };
+        .ok()?;
 
-    let sw = surface.width() as i32;
-    let sh = surface.height() as i32;
-    let pitch = surface.pitch() as i32;
+    let sw = surface.width();
+    let sh = surface.height();
+    if sw == 0 || sh == 0 {
+        return None;
+    }
+    let pitch = surface.pitch() as usize;
 
+    // Extract the alpha channel into a single-channel bitmap.  The scene
+    // stores the glyph shape plus the text colour, so the RGB of the
+    // rendered surface is redundant.
+    let mut bitmap = vec![0u8; (sw as usize) * (sh as usize)];
     surface.with_lock(|pixels| {
-        for sy in 0..sh {
-            for sx in 0..sw {
-                let dx = pos.0 + sx;
-                let dy = pos.1 + sy;
-                if dx < 0 || dy < 0 {
-                    continue;
-                }
-                // SDL blended surface: ARGB8888 layout (B G R A in little-endian)
-                let base = (sy * pitch + sx * 4) as usize;
+        for sy in 0..sh as usize {
+            for sx in 0..sw as usize {
+                let base = sy * pitch + sx * 4;
                 if base + 3 >= pixels.len() {
                     continue;
                 }
-                let b = pixels[base];
-                let g = pixels[base + 1];
-                let r = pixels[base + 2];
-                let a = pixels[base + 3];
-                if a > 0 {
-                    canvas.put_pixel(dx, dy, r, g, b, a);
-                }
+                // SDL blended surface: ARGB8888 (B G R A in little-endian).
+                bitmap[sy * sw as usize + sx] = pixels[base + 3];
             }
         }
     });
+
+    Some(scene::TextObj {
+        text: text.to_string(),
+        x: pos.0,
+        y: pos.1,
+        color,
+        size,
+        bitmap,
+        bitmap_width: sw,
+        bitmap_height: sh,
+    })
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rasterize a string with the real bundled font.
+    ///
+    /// SDL TTF needs no window for surface rendering, so this works
+    /// headless.  If the font cannot be loaded the test is skipped rather
+    /// than failed — a missing bundled font is an environment problem, not
+    /// a logic error.
+    fn rasterize(text: &str) -> Option<scene::TextObj> {
+        let ttf = sdl2::ttf::init().ok()?;
+        let rwops = sdl2::rwops::RWops::from_bytes(FONT_BYTES).ok()?;
+        let font = ttf.load_font_from_rwops(rwops, 20).ok()?;
+        make_text_obj(text, (10, 20), (255, 0, 0), 20, &font)
+    }
+
+    #[test]
+    fn text_rasterizes_to_a_non_empty_bitmap() {
+        let Some(obj) = rasterize("Hello") else {
+            eprintln!("skipping: SDL TTF font unavailable in this environment");
+            return;
+        };
+        assert_eq!(obj.text, "Hello");
+        assert_eq!(obj.x, 10);
+        assert_eq!(obj.y, 20);
+        assert_eq!(obj.color, (255, 0, 0));
+        assert_eq!(obj.size, 20);
+        assert!(obj.bitmap_width > 0);
+        assert!(obj.bitmap_height > 0);
+        assert_eq!(
+            obj.bitmap.len(),
+            (obj.bitmap_width * obj.bitmap_height) as usize
+        );
+        // Some pixels must carry ink.
+        assert!(obj.bitmap.iter().any(|&a| a > 0));
+    }
+
+    #[test]
+    fn empty_text_produces_no_object() {
+        assert!(rasterize("").is_none());
+    }
+
+    #[test]
+    fn a_rasterized_text_object_renders_onto_a_canvas() {
+        let Some(obj) = rasterize("Ag") else {
+            eprintln!("skipping: SDL TTF font unavailable in this environment");
+            return;
+        };
+        let mut canvas = Canvas::new(200, 100);
+        scene::DrawObject::Text(obj.clone()).render(&mut canvas);
+        // At least one pixel of ink reached the canvas.
+        assert!(canvas.pixels.iter().any(|&p| p > 0));
+        // The bounds match the bitmap size.
+        let (bx, by, bw, bh) = scene::DrawObject::Text(obj.clone()).bounds();
+        assert_eq!(bw as u32, obj.bitmap_width);
+        assert_eq!(bh as u32, obj.bitmap_height);
+        assert_eq!(bx, obj.x);
+        assert_eq!(by, obj.y);
+    }
+
+    #[test]
+    fn a_rasterized_text_object_can_be_selected_and_moved() {
+        let Some(obj) = rasterize("Test") else {
+            eprintln!("skipping: SDL TTF font unavailable in this environment");
+            return;
+        };
+        let mut sc = scene::Scene::new(8);
+        sc.add(scene::DrawObject::Text(obj));
+        let (bx, by, _, _) = sc.objects()[0].bounds();
+        assert_eq!(sc.hit_test(bx, by), Some(0));
+        sc.objects_mut()[0].translate(4, 6);
+        assert_eq!(sc.objects()[0].bounds().0, bx + 4);
+        assert_eq!(sc.objects()[0].bounds().1, by + 6);
+    }
 }

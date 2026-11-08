@@ -466,6 +466,17 @@ impl AppState {
             can_undo: !self.scene.undo_stack.is_empty(),
             can_redo: !self.scene.redo_stack.is_empty(),
             object_count: self.scene.objects().len(),
+            // The text of every text annotation, in drawing order.  Lets a
+            // client read back what was written without pulling the whole
+            // scene.
+            texts: self
+                .scene
+                .text_contents()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
+            // Point size of each text annotation, parallel to `texts`.
+            text_sizes: self.scene.text_sizes(),
             // Number of selected live objects (0 = nothing selected).
             selected: self.scene.selected.len(),
             drawing: self.active_stroke.is_some(),
@@ -519,6 +530,10 @@ pub struct StateSnapshot {
     pub can_undo: bool,
     pub can_redo: bool,
     pub object_count: usize,
+    /// The text content of every text annotation, in drawing order.
+    pub texts: Vec<String>,
+    /// Point size of each text annotation, parallel to `texts`.
+    pub text_sizes: Vec<u32>,
     /// Number of currently-selected live objects (0 = nothing selected).
     /// Multi-select: any non-zero count is "something is selected".
     pub selected: usize,

@@ -28,17 +28,39 @@ pub struct ShapeObj {
     pub size: u32,
 }
 
-/// Text annotation.  Currently dead because text rendering goes through
-/// `blit_text_to_canvas` in `main.rs` (which uses SDL TTF directly), but
-/// the type is kept here so the REST API can model text objects in the
-/// scene graph.  See `DrawObject::Text`.
-#[allow(dead_code)]
+/// A text annotation.
+///
+/// The glyphs are rasterized into `bitmap` at commit time (on the main
+/// thread, where the SDL TTF font is available) and the scene stores that
+/// bitmap rather than the font.  This keeps text a real scene object —
+/// selectable, movable, undoable, serializable — while the render path
+/// stays pure pixel work and can still run on the background rasterizer
+/// thread.
+///
+/// `bitmap` holds the glyph coverage as one alpha byte per pixel,
+/// row-major, `bitmap_width` pixels wide and `bitmap_height` tall.  The
+/// colour lives in `color`, so only the shape needs storing.  `text` and
+/// `size` are retained so the object can be re-rendered and exported as
+/// text.
 #[derive(Clone, Debug)]
 pub struct TextObj {
     pub text: String,
     pub x: i32,
     pub y: i32,
     pub color: (u8, u8, u8),
+    /// Point size the text was rendered at.
+    pub size: u32,
+    /// Glyph coverage, one alpha byte per pixel.
+    pub bitmap: Vec<u8>,
+    pub bitmap_width: u32,
+    pub bitmap_height: u32,
+}
+
+impl TextObj {
+    /// Pixel dimensions of the rasterized glyphs.
+    pub fn bitmap_size(&self) -> (u32, u32) {
+        (self.bitmap_width, self.bitmap_height)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -59,10 +81,7 @@ pub enum DrawObject {
     Circle(ShapeObj),
     Arrow(ShapeObj),
     Highlight(HighlightStroke),
-    /// Text annotations — currently rendered via `blit_text_to_canvas`
-    /// outside the scene graph, but the variant is reserved for future
-    /// API-driven text editing.
-    #[allow(dead_code)]
+    /// A text annotation, rendered from its pre-rasterized bitmap.
     Text(TextObj),
 }
 
@@ -106,9 +125,20 @@ impl DrawObject {
                     draw_highlight(canvas, x, y, rad, r, g, b);
                 }
             }
-            DrawObject::Text(_) => {
-                // Text is blitted separately via blit_text_to_canvas in main.rs
-                // because it needs SDL TTF; rendering here is a no-op.
+            DrawObject::Text(t) => {
+                let (r, g, b) = t.color;
+                for y in 0..t.bitmap_height as i32 {
+                    for x in 0..t.bitmap_width as i32 {
+                        let src = (y as u32 * t.bitmap_width + x as u32) as usize;
+                        let Some(&alpha) = t.bitmap.get(src) else {
+                            continue;
+                        };
+                        if alpha == 0 {
+                            continue;
+                        }
+                        canvas.put_pixel(t.x + x, t.y + y, r, g, b, alpha);
+                    }
+                }
             }
         }
     }
@@ -157,9 +187,24 @@ impl DrawObject {
                     slice_highlight(s, x, y, rad, r, g, b);
                 }
             }
-            DrawObject::Text(_) => {
-                // Text is blitted separately via blit_text_to_canvas in main.rs
-                // because it needs SDL TTF; rendering here is a no-op.
+            DrawObject::Text(t) => {
+                let (r, g, b) = t.color;
+                for y in 0..t.bitmap_height as i32 {
+                    for x in 0..t.bitmap_width as i32 {
+                        let src = (y as u32 * t.bitmap_width + x as u32) as usize;
+                        let Some(&alpha) = t.bitmap.get(src) else {
+                            continue;
+                        };
+                        if alpha == 0 {
+                            continue;
+                        }
+                        // SAFETY: `put_pixel` bounds-checks against the
+                        // canvas dimensions and the row range.
+                        unsafe {
+                            s.put_pixel(t.x + x, t.y + y, r, g, b, alpha);
+                        }
+                    }
+                }
             }
         }
     }
@@ -178,7 +223,10 @@ impl DrawObject {
                 let (ty, by) = (s.y0.min(s.y1) - pad, s.y0.max(s.y1) + pad);
                 (lx, ty, rx - lx, by - ty)
             }
-            DrawObject::Text(t) => (t.x, t.y, 300, 40),
+            DrawObject::Text(t) => {
+                let (w, h) = t.bitmap_size();
+                (t.x, t.y, w as i32, h as i32)
+            }
         }
     }
 
@@ -357,7 +405,18 @@ impl DrawObject {
                     EraseResult::Unchanged
                 }
             }
-            DrawObject::Text(_) => EraseResult::Unchanged,
+            DrawObject::Text(t) => {
+                // Text is a whole-object primitive: the glyphs are
+                // rasterized, so there is no meaningful way to trim them
+                // the way a vector stroke can be trimmed.  If the brush
+                // reaches the text's box, the text goes — matching how
+                // Rect/Circle/Arrow behave.
+                if text_touched(t, eraser_path, r) {
+                    EraseResult::Removed
+                } else {
+                    EraseResult::Unchanged
+                }
+            }
         }
     }
 }
@@ -533,6 +592,33 @@ fn segment_eraser_t(
     best_t
 }
 
+/// True when the eraser brush reaches a text object's glyphs.
+///
+/// The text is rasterized, so the hit test samples the glyph coverage
+/// directly: any pixel with ink inside an eraser disc counts as a hit.
+fn text_touched(t: &TextObj, path: &[(i32, i32)], r: i32) -> bool {
+    let r2 = (r * r) as i64;
+    for y in 0..t.bitmap_height as i32 {
+        // Rows far from the brush's vertical reach cannot hit.
+        let row_y = t.y + y;
+        for x in 0..t.bitmap_width as i32 {
+            let src = (y as u32 * t.bitmap_width + x as u32) as usize;
+            if t.bitmap.get(src).is_none_or(|&a| a == 0) {
+                continue;
+            }
+            let px = t.x + x;
+            for &(cx, cy) in path {
+                let dx = (px - cx) as i64;
+                let dy = (row_y - cy) as i64;
+                if dx * dx + dy * dy <= r2 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn shape_touched(s: &ShapeObj, path: &[(i32, i32)], r: i32) -> bool {
     // Sample a few points along the bounding-box perimeter plus the two
     // endpoints.  Plenty for an eraser hit-test (the user sees the
@@ -694,6 +780,32 @@ impl Scene {
 
     pub fn objects(&self) -> &[DrawObject] {
         &self.inner.objects
+    }
+
+    /// The text content of every text annotation in the scene, in drawing
+    /// order.  Used by the API to expose what has been written without
+    /// having to deserialize the whole scene.
+    pub fn text_contents(&self) -> Vec<&str> {
+        self.inner
+            .objects
+            .iter()
+            .filter_map(|o| match o {
+                DrawObject::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The point size of every text annotation, in drawing order.
+    pub fn text_sizes(&self) -> Vec<u32> {
+        self.inner
+            .objects
+            .iter()
+            .filter_map(|o| match o {
+                DrawObject::Text(t) => Some(t.size),
+                _ => None,
+            })
+            .collect()
     }
     /// Read-only access to the baked background.  Reserved for future
     /// callers (e.g. screenshot utilities that want to export just the
@@ -1093,5 +1205,107 @@ impl Scene {
     #[allow(dead_code)]
     pub fn selection_count(&self) -> usize {
         self.selected.len()
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 2×2 text bitmap with ink in the top-left pixel only.
+    fn test_text(x: i32, y: i32) -> TextObj {
+        TextObj {
+            text: "hi".into(),
+            x,
+            y,
+            color: (255, 0, 0),
+            size: 20,
+            bitmap: vec![255, 0, 0, 0],
+            bitmap_width: 2,
+            bitmap_height: 2,
+        }
+    }
+
+    #[test]
+    fn text_bounds_match_the_rasterized_size() {
+        let obj = DrawObject::Text(test_text(10, 20));
+        assert_eq!(obj.bounds(), (10, 20, 2, 2));
+    }
+
+    #[test]
+    fn text_translates() {
+        let mut obj = DrawObject::Text(test_text(10, 20));
+        obj.translate(5, -7);
+        assert_eq!(obj.bounds(), (15, 13, 2, 2));
+    }
+
+    #[test]
+    fn text_hit_test_uses_its_real_box() {
+        let obj = DrawObject::Text(test_text(100, 100));
+        assert!(obj.hit_test(100, 100));
+        assert!(obj.hit_test(102, 102));
+        // 8px hit radius, so just outside the box still counts.
+        assert!(obj.hit_test(110, 110));
+        assert!(!obj.hit_test(200, 200));
+    }
+
+    #[test]
+    fn text_renders_its_ink_onto_the_canvas() {
+        let mut canvas = Canvas::new(16, 16);
+        let obj = DrawObject::Text(test_text(4, 5));
+        obj.render(&mut canvas);
+        // The single ink pixel lands at (4, 5).
+        let idx = ((5 * 16 + 4) * 4) as usize;
+        assert_eq!(canvas.pixels[idx], 255); // r
+        assert_eq!(canvas.pixels[idx + 1], 0); // g
+        assert_eq!(canvas.pixels[idx + 2], 0); // b
+        assert_eq!(canvas.pixels[idx + 3], 255); // a
+        // A neighbouring pixel with no ink is untouched.
+        let blank = ((5 * 16 + 5) * 4) as usize;
+        assert_eq!(canvas.pixels[blank + 3], 0);
+    }
+
+    #[test]
+    fn text_is_removed_when_the_eraser_reaches_it() {
+        let t = test_text(100, 100);
+        // The brush sits on the ink pixel.
+        let path = [(100, 100)];
+        assert!(text_touched(&t, &path, 10));
+        // The brush is far away.
+        assert!(!text_touched(&t, &[(500, 500)], 10));
+    }
+
+    #[test]
+    fn text_survives_an_eraser_that_misses_it() {
+        let mut scene = Scene::new(8);
+        scene.add(DrawObject::Text(test_text(100, 100)));
+        assert_eq!(scene.objects().len(), 1);
+        // The eraser path is far away, so nothing changes.
+        let mut canvas = Canvas::new(64, 64);
+        scene.erase_path(&[(10, 10)], 6, &mut canvas);
+        assert_eq!(scene.objects().len(), 1);
+    }
+
+    #[test]
+    fn text_participates_in_undo() {
+        let mut scene = Scene::new(8);
+        scene.push_undo();
+        scene.add(DrawObject::Text(test_text(0, 0)));
+        assert_eq!(scene.objects().len(), 1);
+        scene.undo();
+        assert_eq!(scene.objects().len(), 0);
+        scene.redo();
+        assert_eq!(scene.objects().len(), 1);
+    }
+
+    #[test]
+    fn text_can_be_selected_by_a_marquee() {
+        let mut scene = Scene::new(8);
+        scene.add(DrawObject::Text(test_text(50, 50)));
+        let added = scene.select_add_in_rect(40, 40, 80, 80);
+        assert_eq!(added, vec![0]);
+        assert!(scene.is_selected(0));
     }
 }
