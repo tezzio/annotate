@@ -466,10 +466,14 @@ fn route(
                 return (200, text_state(&snap), "text/plain");
             }
             let mut v = serde_json::to_value(&*snap).unwrap_or_else(|_| serde_json::json!({}));
-            if let Some(obj) = v.as_object_mut()
-                && let Some(ref user) = authenticated
-            {
-                obj.insert("authenticated_as".into(), user.clone().into());
+            if let Some(obj) = v.as_object_mut() {
+                // `input_mode` is the mode index the capture thread was
+                // actually started with (0 = the device's "best" mode).
+                // It is authoritative on every path — the menu bar, the
+                // device picker and the API all report it the same way.
+                if let Some(ref user) = authenticated {
+                    obj.insert("authenticated_as".into(), user.clone().into());
+                }
             }
             reply(200, ApiPayload::Ok(v), text_mode)
         }
@@ -483,6 +487,12 @@ fn route(
                 ApiPayload::Ok(serde_json::json!({
                     "active": snap.input,
                     "input_mode": snap.input_mode,
+                    "mode_label": snap
+                        .inputs
+                        .get(snap.input)
+                        .and_then(|i| i.modes.get(snap.input_mode))
+                        .cloned()
+                        .unwrap_or_default(),
                     "inputs": snap.inputs,
                 })),
                 text_mode,
@@ -934,12 +944,13 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
             const r = await api(endpoint, {method:'POST'});
             if (r.ok) {
                 setStatus(label + ' OK', true);
-                // Reflect the change immediately instead of waiting for
-                // the next poll tick.
-                await poll();
             } else {
                 setStatus(label + ' failed: ' + (r.error || 'unknown error'), false);
             }
+            // Re-read the state either way: on success it shows the change
+            // immediately, on failure it snaps the control back to the
+            // value the server actually holds.
+            await poll();
             return r;
         } catch (e) {
             setStatus(label + ' failed: ' + e.message, false);
@@ -955,6 +966,9 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
                 document.getElementById('user-display').textContent = r.authenticated_as || username;
                 showPortal();
                 updateState(r);
+                // The input list needs a valid session token, so it can
+                // only be fetched once we are logged in.
+                loadInputs();
             } else { showLogin(); }
         } catch { showLogin(); }
     }
@@ -1004,7 +1018,11 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
         // Update the active input
         if (state.input !== undefined) {
             const sel = document.getElementById('input-select');
-            if (sel.value !== String(state.input)) sel.value = state.input;
+            // Only select once the real device list is in place — the
+            // placeholder option has no matching value.
+            if (sel.options.length > 1 && sel.value !== String(state.input)) {
+                sel.value = state.input;
+            }
         }
         // Update the freeze button label
         const freezeBtn = document.getElementById('btn-freeze');
@@ -1091,13 +1109,16 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
     document.getElementById('btn-freeze').onclick = () => run('/freeze', 'Freeze frame');
 
     // Load inputs
+    let inputsLoaded = false;
     async function loadInputs() {
         try {
             const r = await api('/inputs');
+            if (!r.ok) return;
             const sel = document.getElementById('input-select');
             sel.innerHTML = r.inputs.map(i => '<option value="'+i.index+'">'+i.name+'</option>').join('');
             if (r.active !== undefined) sel.value = r.active;
             sel.onchange = () => run('/input?index=' + sel.value, 'Input change');
+            inputsLoaded = true;
         } catch {}
     }
 
@@ -1105,13 +1126,18 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
     async function poll() {
         try {
             const r = await api('/state');
-            if (r.ok) updateState(r);
+            if (r.ok) {
+                updateState(r);
+                // A device can be plugged in while the portal is open, so
+                // the input list is refreshed until it has been fetched at
+                // least once.
+                if (!inputsLoaded) loadInputs();
+            }
         } catch {}
     }
 
     // Init
     checkAuth();
-    loadInputs();
     setInterval(poll, 1000);
     </script>
 </body>
