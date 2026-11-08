@@ -259,25 +259,33 @@ fn main() {
     ));
     // The main loop drains this once per frame; HTTP threads block on the
     // per-command oneshot for at most 500 ms.
-    let api_cmd_rx: api::ApiCommandRx = if state.cfg.api.enabled {
-        if state.cfg.api.token.as_deref().is_none_or(|t| t.is_empty()) {
-            eprintln!(
-                "[api] WARNING — no shared token configured ([api] token = \"...\"). \
-                 The REST API is open to anyone who can reach {}. \
-                 Set a token to require X-Auth-Token on every /api/v1/* call.",
-                state.cfg.api.bind
-            );
+    // Set by the API when it changes the config (a password change), so
+    // the main loop writes it to disk.
+    let config_dirty: api::ConfigDirtyFlag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let api_cmd_rx: api::ApiCommandRx = {
+        let cfg_api = state.cfg.read().unwrap_or_else(|p| p.into_inner());
+        if cfg_api.api.enabled {
+            if cfg_api.api.token.as_deref().is_none_or(|t| t.is_empty()) {
+                eprintln!(
+                    "[api] WARNING — no shared token configured ([api] token = \"...\"). \
+                     The REST API is open to anyone who can reach {}. \
+                     Set a token to require X-Auth-Token on every /api/v1/* call.",
+                    cfg_api.api.bind
+                );
+            }
+            api::serve(
+                &cfg_api.api.bind,
+                cfg_api.api.port,
+                api_snapshot.clone(),
+                state.cfg.clone(),
+                config_dirty.clone(),
+            )
+        } else {
+            eprintln!("[api] disabled by config ([api] enabled = false)");
+            let (_tx, rx) = std::sync::mpsc::sync_channel(0);
+            rx
         }
-        api::serve(
-            &state.cfg.api.bind,
-            state.cfg.api.port,
-            api_snapshot.clone(),
-            state.cfg.clone(),
-        )
-    } else {
-        eprintln!("[api] disabled by config ([api] enabled = false)");
-        let (_tx, rx) = std::sync::mpsc::sync_channel(0);
-        rx
     };
 
     // ── Capture receiver (null / black screen until picker confirms) ───────
@@ -712,10 +720,11 @@ fn main() {
                     match export::ensure_export_dir() {
                         Ok(dir) => {
                             let path = dir.join(&file);
+                            let cfg_api = state.cfg.read().unwrap_or_else(|p| p.into_inner());
                             let meta = export::ExportMeta {
-                                case_reference: state.cfg.api.case_reference.clone(),
-                                annotator: state.cfg.api.annotator.clone(),
-                                note: state.cfg.api.case_note.clone(),
+                                case_reference: cfg_api.api.case_reference.clone(),
+                                annotator: cfg_api.api.annotator.clone(),
+                                note: cfg_api.api.case_note.clone(),
                                 input: menu_bar
                                     .devices
                                     .get(menu_bar.active_idx.saturating_sub(1))
@@ -1345,6 +1354,18 @@ fn main() {
             state.last_snapshot_publish = Instant::now();
         }
 
+        // ── Persist config changes made outside the main loop ─────────────
+        // The API's password-change endpoint mutates the shared config.
+        // Write it to disk so the change survives a restart — otherwise
+        // the generated password would come back on the next boot.
+        if config_dirty.swap(false, Ordering::SeqCst) {
+            let cfg = state.cfg.read().unwrap_or_else(|p| p.into_inner());
+            if let Err(e) = config::save(&cfg) {
+                eprintln!("[annotator] could not save the config: {e}");
+            }
+            state.last_config_save = Instant::now();
+        }
+
         // No manual frame-cap here.  `present_vsync()` above already paces the
         // loop to the display refresh rate.  Adding a sleep would throttle
         // capture consumption on high-refresh-rate displays and force the
@@ -1477,13 +1498,16 @@ fn save_settings(state: &mut state::AppState) {
     let Some(s) = &state.settings else {
         return;
     };
-    state.cfg.show_time = s.show_time == Toggle::On;
-    state.cfg.hide_toolbar = s.hide_toolbar == Toggle::On;
-    state.cfg.laser_on = s.laser_on == Toggle::On;
-    state.cfg.show_fps = s.show_fps == Toggle::On;
-    state.cfg.undo_stack_limit = s.undo_limit;
-    if let Err(e) = config::save(&state.cfg) {
-        eprintln!("[annotator] could not save settings: {e}");
+    {
+        let mut cfg = state.cfg.write().unwrap_or_else(|p| p.into_inner());
+        cfg.show_time = s.show_time == Toggle::On;
+        cfg.hide_toolbar = s.hide_toolbar == Toggle::On;
+        cfg.laser_on = s.laser_on == Toggle::On;
+        cfg.show_fps = s.show_fps == Toggle::On;
+        cfg.undo_stack_limit = s.undo_limit;
+        if let Err(e) = config::save(&cfg) {
+            eprintln!("[annotator] could not save settings: {e}");
+        }
     }
 }
 

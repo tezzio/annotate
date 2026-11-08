@@ -16,7 +16,7 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::{
         Arc, RwLock, RwLockReadGuard,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
     },
     time::Duration,
@@ -35,6 +35,29 @@ use crate::{
 
 /// Simple session token -> username mapping
 type SessionStore = Arc<RwLock<HashMap<String, String>>>;
+
+/// Shared, mutable handle to the configuration.
+///
+/// The portal needs to change a user's password, and that change has to
+/// outlive the request — so the config is shared rather than cloned per
+/// connection.  The main loop persists it to disk.
+type SharedConfig = Arc<RwLock<Config>>;
+
+/// Set by the API when it changes the config, so the main loop knows to
+/// write it to disk.
+pub type ConfigDirtyFlag = Arc<AtomicBool>;
+
+/// The shared state every connection handler needs.
+///
+/// Bundled into one struct so the handler signatures stay readable.
+struct ServerState {
+    snapshot: SharedSnapshot,
+    cmd_tx: SyncSender<ApiCommand>,
+    cfg: SharedConfig,
+    sessions: SessionStore,
+    limiter: Arc<RateLimiter>,
+    config_dirty: ConfigDirtyFlag,
+}
 
 /// Snapshot handle shared between the main loop (writer) and the API threads.
 pub type SharedSnapshot = Arc<RwLock<StateSnapshot>>;
@@ -55,7 +78,14 @@ const COMMAND_QUEUE: usize = 16;
 /// Bind the listener and serve on a detached thread.  Returns the command
 /// receiver the main loop drains each frame.  Bind failure logs and disables
 /// the API — a kiosk box must keep running even without it.
-pub fn serve(bind: &str, port: u16, snapshot: SharedSnapshot, cfg: Config) -> ApiCommandRx {
+pub fn serve(
+    bind: &str,
+    port: u16,
+    snapshot: SharedSnapshot,
+    cfg: std::sync::Arc<std::sync::RwLock<Config>>,
+    config_dirty: ConfigDirtyFlag,
+) -> ApiCommandRx {
+    let cfg: SharedConfig = cfg;
     let (cmd_tx, cmd_rx) = sync_channel::<ApiCommand>(COMMAND_QUEUE);
     let addr = format!("{bind}:{port}");
     let listener = match TcpListener::bind(&addr) {
@@ -69,7 +99,17 @@ pub fn serve(bind: &str, port: u16, snapshot: SharedSnapshot, cfg: Config) -> Ap
     let limiter = Arc::new(RateLimiter::with_defaults());
     if let Err(e) = std::thread::Builder::new()
         .name("api-accept".into())
-        .spawn(move || accept_loop(listener, snapshot, cmd_tx, cfg, sessions, limiter))
+        .spawn(move || {
+            accept_loop(
+                listener,
+                snapshot,
+                cmd_tx,
+                cfg,
+                sessions,
+                limiter,
+                config_dirty,
+            )
+        })
     {
         eprintln!("[api] cannot spawn accept thread: {e} — REST API disabled");
     } else {
@@ -82,11 +122,20 @@ fn accept_loop(
     listener: TcpListener,
     snapshot: SharedSnapshot,
     cmd_tx: SyncSender<ApiCommand>,
-    cfg: Config,
+    cfg: SharedConfig,
     sessions: SessionStore,
     limiter: Arc<RateLimiter>,
+    config_dirty: ConfigDirtyFlag,
 ) {
     let in_flight = Arc::new(AtomicUsize::new(0));
+    let server_state = ServerState {
+        snapshot,
+        cmd_tx,
+        cfg,
+        sessions,
+        limiter,
+        config_dirty,
+    };
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,
@@ -108,12 +157,15 @@ fn accept_loop(
         }
 
         in_flight.fetch_add(1, Ordering::SeqCst);
-        let snap = snapshot.clone();
-        let tx = cmd_tx.clone();
         let count = in_flight.clone();
-        let cfg_clone = cfg.clone();
-        let sess_clone = sessions.clone();
-        let limiter_clone = limiter.clone();
+        let state = ServerState {
+            snapshot: server_state.snapshot.clone(),
+            cmd_tx: server_state.cmd_tx.clone(),
+            cfg: server_state.cfg.clone(),
+            sessions: server_state.sessions.clone(),
+            limiter: server_state.limiter.clone(),
+            config_dirty: server_state.config_dirty.clone(),
+        };
         // The client identity is the source IP.  `peer_addr` fails only
         // for an unconnected socket, which cannot happen here.
         let peer = stream
@@ -122,15 +174,7 @@ fn accept_loop(
             .unwrap_or_else(|_| "unknown".to_string());
         let spawned = std::thread::Builder::new().spawn(move || {
             isolate_panic(|| {
-                handle_connection(
-                    stream,
-                    &snap,
-                    &tx,
-                    &cfg_clone,
-                    &sess_clone,
-                    &limiter_clone,
-                    &peer,
-                );
+                handle_connection(stream, &state, &peer);
             });
             count.fetch_sub(1, Ordering::SeqCst);
         });
@@ -155,15 +199,7 @@ fn isolate_panic<F: FnOnce()>(f: F) -> bool {
     }
 }
 
-fn handle_connection(
-    mut stream: TcpStream,
-    snapshot: &SharedSnapshot,
-    cmd_tx: &SyncSender<ApiCommand>,
-    cfg: &Config,
-    sessions: &SessionStore,
-    limiter: &RateLimiter,
-    peer: &str,
-) {
+fn handle_connection(mut stream: TcpStream, state: &ServerState, peer: &str) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let (status, body, ctype) = match read_request(&mut stream) {
@@ -171,12 +207,19 @@ fn handle_connection(
             // Rate-limit after the path is known — reads and mutations
             // draw on separate budgets.  The portal is not limited.
             if let Some(bucket) = ratelimit::bucket_for(&req.path)
-                && let Decision::Reject(wait) = limiter.check(peer, bucket)
+                && let Decision::Reject(wait) = state.limiter.check(peer, bucket)
             {
                 let _ = write_rate_limited(&mut stream, wait);
                 return;
             }
-            route(&req, snapshot, cmd_tx, cfg, sessions)
+            route(
+                &req,
+                &state.snapshot,
+                &state.cmd_tx,
+                &state.cfg,
+                &state.sessions,
+                &state.config_dirty,
+            )
         }
         Ok(None) => return, // peer connected, sent nothing
         Err(ReadError::TooLarge) => (400, err_body("request too large"), "application/json"),
@@ -401,12 +444,19 @@ fn route(
     req: &Request,
     snapshot: &SharedSnapshot,
     cmd_tx: &SyncSender<ApiCommand>,
-    cfg: &Config,
+    shared_cfg: &SharedConfig,
     sessions: &SessionStore,
+    config_dirty: &ConfigDirtyFlag,
 ) -> (u16, String, &'static str) {
     // Plain-text mode (`?fmt=text`) — the Crestron Pro3 has no JSON parser,
     // so every response in that mode is rendered as `OK …` / `ERR …` lines.
     let text_mode = wants_text(req);
+
+    // A read lock on the shared config.  The password-change route needs
+    // a write lock, so it takes one separately — the read guard is
+    // dropped before that happens.
+    let cfg_guard = shared_cfg.read().unwrap_or_else(|p| p.into_inner());
+    let cfg = &*cfg_guard;
 
     // ── Portal routes ────────────────────────────────────────────────────────────
     match req.path.as_str() {
@@ -430,13 +480,57 @@ fn route(
                     .insert(token.clone(), user.username.clone());
                 return (
                     200,
-                    serde_json::json!({ "ok": true, "token": token, "username": user.username })
-                        .to_string(),
+                    serde_json::json!({
+                        "ok": true,
+                        "token": token,
+                        "username": user.username,
+                        // The client shows a "change your password" prompt
+                        // when this is set — it is how a first-run account
+                        // is forced off its generated password.
+                        "must_change_password": user.must_change_password,
+                    })
+                    .to_string(),
                     "application/json",
                 );
             } else {
                 return (401, err_body("invalid credentials"), "application/json");
             }
+        }
+        // Change the logged-in user's password.
+        "/portal/change_password" if req.method == "POST" => {
+            let p = params(req);
+            let token = match p.get("token") {
+                Some(t) => t.clone(),
+                None => return (401, err_body("not authenticated"), "application/json"),
+            };
+            let username = match sessions.read().unwrap().get(&token).cloned() {
+                Some(u) => u,
+                None => return (401, err_body("not authenticated"), "application/json"),
+            };
+            let new_password = p.get("password").cloned().unwrap_or_default();
+            if new_password.len() < 8 {
+                return (
+                    400,
+                    err_body("the new password must be at least 8 characters"),
+                    "application/json",
+                );
+            }
+            // The change is applied to the live config, which the main
+            // loop persists.  The read guard above must be dropped first.
+            drop(cfg_guard);
+            let mut cfg_write = shared_cfg.write().unwrap_or_else(|p| p.into_inner());
+            return match crate::config::set_password(&mut cfg_write, &username, &new_password) {
+                Ok(()) => {
+                    // The main loop persists the config; tell it to.
+                    config_dirty.store(true, Ordering::SeqCst);
+                    (
+                        200,
+                        serde_json::json!({ "ok": true }).to_string(),
+                        "application/json",
+                    )
+                }
+                Err(msg) => (400, err_body(&msg), "application/json"),
+            };
         }
         "/portal/logout" if req.method == "POST" => {
             let p = params(req);
@@ -969,6 +1063,27 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
         </div>
     </div>
 
+    <div id="change-view" class="hidden flex items-center justify-center min-h-screen">
+        <div class="bg-gray-800 p-8 rounded-lg shadow-lg w-80">
+            <h1 class="text-2xl font-bold mb-2 text-center">Change Password</h1>
+            <p class="text-sm text-gray-400 mb-6 text-center">
+                This password was generated for you. Choose a new one to continue.
+            </p>
+            <form id="change-form" class="space-y-4">
+                <div>
+                    <label class="block text-sm mb-1">New Password</label>
+                    <input type="password" id="new-password" class="w-full px-3 py-2 bg-gray-700 rounded border border-gray-600 focus:border-blue-500" minlength="8" required>
+                </div>
+                <div>
+                    <label class="block text-sm mb-1">Confirm Password</label>
+                    <input type="password" id="new-password2" class="w-full px-3 py-2 bg-gray-700 rounded border border-gray-600 focus:border-blue-500" minlength="8" required>
+                </div>
+                <p id="change-error" class="text-red-400 text-sm hidden"></p>
+                <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 py-2 rounded font-medium">Change Password</button>
+            </form>
+        </div>
+    </div>
+
     <div id="portal-view" class="hidden p-6">
         <div class="max-w-4xl mx-auto">
             <div class="flex justify-between items-center mb-6">
@@ -1122,12 +1237,21 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
 
     function showLogin() {
         document.getElementById('login-view').classList.remove('hidden');
+        document.getElementById('change-view').classList.add('hidden');
         document.getElementById('portal-view').classList.add('hidden');
     }
 
     function showPortal() {
         document.getElementById('login-view').classList.add('hidden');
+        document.getElementById('change-view').classList.add('hidden');
         document.getElementById('portal-view').classList.remove('hidden');
+    }
+
+    // Shown when the account still has its generated password.
+    function showChangePassword() {
+        document.getElementById('login-view').classList.add('hidden');
+        document.getElementById('change-view').classList.remove('hidden');
+        document.getElementById('portal-view').classList.add('hidden');
     }
 
     function logout() {
@@ -1212,7 +1336,13 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
                 localStorage.setItem('annotator_token', token);
                 localStorage.setItem('annotator_user', username);
                 err.classList.add('hidden');
-                checkAuth();
+                // A generated password must be changed before the portal
+                // can be used.
+                if (json.must_change_password) {
+                    showChangePassword();
+                } else {
+                    checkAuth();
+                }
             } else {
                 err.textContent = json.error || 'Login failed';
                 err.classList.remove('hidden');
@@ -1226,6 +1356,44 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
     document.getElementById('logout-btn').onclick = async () => {
         await fetch('/portal/logout', {method:'POST', body:'token='+encodeURIComponent(token)});
         logout();
+    };
+
+    // Change-password form
+    document.getElementById('change-form').onsubmit = async (e) => {
+        e.preventDefault();
+        const p1 = document.getElementById('new-password').value;
+        const p2 = document.getElementById('new-password2').value;
+        const err = document.getElementById('change-error');
+        if (p1 !== p2) {
+            err.textContent = 'The passwords do not match';
+            err.classList.remove('hidden');
+            return;
+        }
+        if (p1.length < 8) {
+            err.textContent = 'The password must be at least 8 characters';
+            err.classList.remove('hidden');
+            return;
+        }
+        try {
+            const r = await fetch('/portal/change_password', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: 'token=' + encodeURIComponent(token) + '&password=' + encodeURIComponent(p1)
+            });
+            const json = await r.json();
+            if (json.ok) {
+                err.classList.add('hidden');
+                document.getElementById('new-password').value = '';
+                document.getElementById('new-password2').value = '';
+                checkAuth();
+            } else {
+                err.textContent = json.error || 'Change failed';
+                err.classList.remove('hidden');
+            }
+        } catch(e) {
+            err.textContent = 'Connection error';
+            err.classList.remove('hidden');
+        }
     };
 
     // Tool select
@@ -1316,14 +1484,24 @@ mod tests {
     }
 
     /// A config whose API requires the given shared token.
-    fn cfg_with_token(token: &str) -> Config {
+    fn cfg_with_token(token: &str) -> SharedConfig {
         let mut cfg = Config::default();
         cfg.api.token = Some(token.to_string());
-        cfg
+        Arc::new(RwLock::new(cfg))
+    }
+
+    /// The default config, as a shared handle.
+    fn default_cfg() -> SharedConfig {
+        Arc::new(RwLock::new(Config::default()))
     }
 
     fn test_sessions() -> SessionStore {
         Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    /// A config-dirty flag for the tests.
+    fn dirty_flag() -> ConfigDirtyFlag {
+        Arc::new(AtomicBool::new(false))
     }
 
     #[test]
@@ -1394,22 +1572,29 @@ mod tests {
     fn route_health_404_and_method_gate() {
         let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
         let (tx, _rx) = sync_channel::<ApiCommand>(4);
-        let cfg = Config::default();
+        let cfg = default_cfg();
         let sessions: SessionStore = Arc::new(RwLock::new(HashMap::new()));
 
-        let (status, body, _) = route(&get("/api/v1/health"), &snap, &tx, &cfg, &sessions);
+        let (status, body, _) = route(
+            &get("/api/v1/health"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+            &dirty_flag(),
+        );
         assert_eq!(status, 200);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
 
-        let (status, body, _) = route(&get("/nope"), &snap, &tx, &cfg, &sessions);
+        let (status, body, _) = route(&get("/nope"), &snap, &tx, &cfg, &sessions, &dirty_flag());
         assert_eq!(status, 404);
         assert!(body.contains("\"ok\":false"));
 
         let mut post = get("/api/v1/state");
         post.method = "POST".into();
-        let (status, _, _) = route(&post, &snap, &tx, &cfg, &sessions);
+        let (status, _, _) = route(&post, &snap, &tx, &cfg, &sessions, &dirty_flag());
         assert_eq!(status, 405);
     }
 
@@ -1428,17 +1613,31 @@ mod tests {
         });
         let snap: SharedSnapshot = Arc::new(RwLock::new(s));
         let (tx, _rx) = sync_channel::<ApiCommand>(4);
-        let cfg = Config::default();
+        let cfg = default_cfg();
         let sessions: SessionStore = Arc::new(RwLock::new(HashMap::new()));
 
-        let (status, body, _) = route(&get("/api/v1/state?fmt=json"), &snap, &tx, &cfg, &sessions);
+        let (status, body, _) = route(
+            &get("/api/v1/state?fmt=json"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+            &dirty_flag(),
+        );
         assert_eq!(status, 200);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["tool"], "pen");
         assert_eq!(v["input"], 1);
 
-        let (status, body, _) = route(&get("/api/v1/inputs"), &snap, &tx, &cfg, &sessions);
+        let (status, body, _) = route(
+            &get("/api/v1/inputs"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+            &dirty_flag(),
+        );
         assert_eq!(status, 200);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["ok"], true);
@@ -1596,13 +1795,20 @@ mod tests {
         // The route must dispatch the command rather than 404.
         let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
         let (tx, rx) = sync_channel::<ApiCommand>(4);
-        let cfg = Config::default();
+        let cfg = default_cfg();
         let sessions = test_sessions();
 
         // No main loop is draining, so the command is queued and the
         // reply times out — what matters is that the route was matched and
         // the command reached the channel.
-        let (status, _, _) = route(&get("/api/v1/undo"), &snap, &tx, &cfg, &sessions);
+        let (status, _, _) = route(
+            &get("/api/v1/undo"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+            &dirty_flag(),
+        );
         assert_ne!(status, 404);
         assert_ne!(status, 405);
         assert!(rx.try_iter().count() >= 1, "command should be queued");
@@ -1628,11 +1834,17 @@ mod tests {
     fn health_endpoint_renders_plain_text() {
         let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
         let (tx, _rx) = sync_channel::<ApiCommand>(4);
-        let cfg = Config::default();
+        let cfg = default_cfg();
         let sessions = test_sessions();
 
-        let (status, body, ctype) =
-            route(&get("/api/v1/health?fmt=text"), &snap, &tx, &cfg, &sessions);
+        let (status, body, ctype) = route(
+            &get("/api/v1/health?fmt=text"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+            &dirty_flag(),
+        );
         assert_eq!(status, 200);
         assert_eq!(ctype, "text/plain");
         assert!(body.starts_with("OK "), "got: {body}");
@@ -1657,11 +1869,17 @@ mod tests {
         });
         let snap: SharedSnapshot = Arc::new(RwLock::new(s));
         let (tx, _rx) = sync_channel::<ApiCommand>(4);
-        let cfg = Config::default();
+        let cfg = default_cfg();
         let sessions = test_sessions();
 
-        let (status, body, ctype) =
-            route(&get("/api/v1/state?fmt=text"), &snap, &tx, &cfg, &sessions);
+        let (status, body, ctype) = route(
+            &get("/api/v1/state?fmt=text"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+            &dirty_flag(),
+        );
         assert_eq!(status, 200);
         assert_eq!(ctype, "text/plain");
         assert!(body.contains("tool=pen"), "got: {body}");
@@ -1676,18 +1894,31 @@ mod tests {
     fn errors_render_as_err_lines_in_text_mode() {
         let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
         let (tx, _rx) = sync_channel::<ApiCommand>(4);
-        let cfg = Config::default();
+        let cfg = default_cfg();
         let sessions = test_sessions();
 
         // A missing required param is a 400 with an `ERR …` body.
-        let (status, body, ctype) =
-            route(&get("/api/v1/tool?fmt=text"), &snap, &tx, &cfg, &sessions);
+        let (status, body, ctype) = route(
+            &get("/api/v1/tool?fmt=text"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+            &dirty_flag(),
+        );
         assert_eq!(status, 400);
         assert_eq!(ctype, "text/plain");
         assert!(body.starts_with("ERR "), "got: {body}");
 
         // Unknown paths render the same way.
-        let (status, body, _) = route(&get("/nope?fmt=text"), &snap, &tx, &cfg, &sessions);
+        let (status, body, _) = route(
+            &get("/nope?fmt=text"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+            &dirty_flag(),
+        );
         assert_eq!(status, 404);
         assert!(body.starts_with("ERR "), "got: {body}");
     }
@@ -1739,11 +1970,17 @@ mod tests {
         });
         let snap: SharedSnapshot = Arc::new(RwLock::new(s));
         let (tx, _rx) = sync_channel::<ApiCommand>(4);
-        let cfg = Config::default();
+        let cfg = default_cfg();
         let sessions = test_sessions();
 
-        let (status, body, ctype) =
-            route(&get("/api/v1/inputs?fmt=text"), &snap, &tx, &cfg, &sessions);
+        let (status, body, ctype) = route(
+            &get("/api/v1/inputs?fmt=text"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+            &dirty_flag(),
+        );
         assert_eq!(status, 200);
         assert_eq!(ctype, "text/plain");
         assert!(body.contains("active=1"), "got: {body}");
@@ -1766,7 +2003,14 @@ mod tests {
         let sessions = test_sessions();
 
         // No token at all → 401.
-        let (status, body, _) = route(&get("/api/v1/state"), &snap, &tx, &cfg, &sessions);
+        let (status, body, _) = route(
+            &get("/api/v1/state"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+            &dirty_flag(),
+        );
         assert_eq!(status, 401);
         assert!(body.contains("unauthorized"), "got: {body}");
 
@@ -1777,6 +2021,7 @@ mod tests {
             &tx,
             &cfg,
             &sessions,
+            &dirty_flag(),
         );
         assert_eq!(status, 401);
 
@@ -1787,6 +2032,7 @@ mod tests {
             &tx,
             &cfg,
             &sessions,
+            &dirty_flag(),
         );
         assert_eq!(status, 200);
 
@@ -1797,6 +2043,7 @@ mod tests {
             &tx,
             &cfg,
             &sessions,
+            &dirty_flag(),
         );
         assert_eq!(status, 200);
     }
@@ -1805,10 +2052,17 @@ mod tests {
     fn api_is_open_when_no_token_is_configured() {
         let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
         let (tx, _rx) = sync_channel::<ApiCommand>(4);
-        let cfg = Config::default(); // token: None
+        let cfg = default_cfg(); // token: None
         let sessions = test_sessions();
 
-        let (status, _, _) = route(&get("/api/v1/state"), &snap, &tx, &cfg, &sessions);
+        let (status, _, _) = route(
+            &get("/api/v1/state"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+            &dirty_flag(),
+        );
         assert_eq!(status, 200);
     }
 
@@ -1831,6 +2085,7 @@ mod tests {
             &tx,
             &cfg,
             &sessions,
+            &dirty_flag(),
         );
         assert_eq!(status, 200);
         assert!(body.contains("authenticated_as"), "got: {body}");
@@ -1843,8 +2098,14 @@ mod tests {
         let cfg = cfg_with_token("secret");
         let sessions = test_sessions();
 
-        let (status, body, ctype) =
-            route(&get("/api/v1/state?fmt=text"), &snap, &tx, &cfg, &sessions);
+        let (status, body, ctype) = route(
+            &get("/api/v1/state?fmt=text"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+            &dirty_flag(),
+        );
         assert_eq!(status, 401);
         assert_eq!(ctype, "text/plain");
         assert!(body.starts_with("ERR "), "got: {body}");
@@ -1917,10 +2178,17 @@ mod tests {
     fn the_saves_route_lists_saved_scenes() {
         let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
         let (tx, _rx) = sync_channel::<ApiCommand>(4);
-        let cfg = Config::default();
+        let cfg = default_cfg();
         let sessions = test_sessions();
 
-        let (status, body, ctype) = route(&get("/api/v1/saves"), &snap, &tx, &cfg, &sessions);
+        let (status, body, ctype) = route(
+            &get("/api/v1/saves"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+            &dirty_flag(),
+        );
         assert_eq!(status, 200);
         assert_eq!(ctype, "application/json");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -1944,10 +2212,17 @@ mod tests {
     fn the_exports_route_lists_exports() {
         let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
         let (tx, _rx) = sync_channel::<ApiCommand>(4);
-        let cfg = Config::default();
+        let cfg = default_cfg();
         let sessions = test_sessions();
 
-        let (status, body, _) = route(&get("/api/v1/exports"), &snap, &tx, &cfg, &sessions);
+        let (status, body, _) = route(
+            &get("/api/v1/exports"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+            &dirty_flag(),
+        );
         assert_eq!(status, 200);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["ok"], true);

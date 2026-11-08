@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 /// The web portal allows one administrator plus four additional users.
 pub const MAX_USERS: usize = 5;
@@ -65,6 +68,12 @@ pub struct User {
     pub username: String,
     pub password_hash: String,
     pub is_admin: bool,
+    /// The password is a generated placeholder and must be changed before
+    /// the account can be used for anything but the change itself.
+    ///
+    /// Set on first run so `admin`/`admin` never ships silently.
+    #[serde(default)]
+    pub must_change_password: bool,
 }
 
 /// REST API configuration (see ROADMAP.md).
@@ -156,6 +165,7 @@ impl Default for Config {
                 username: "admin".to_string(),
                 password_hash: hash_password("admin"),
                 is_admin: true,
+                must_change_password: false,
             }],
         }
     }
@@ -173,6 +183,64 @@ pub fn hash_password(password: &str) -> String {
     hasher.update(password.as_bytes());
     hasher.update(b"annotator-salt"); // simple static salt
     hex::encode(hasher.finalize())
+}
+
+/// Generate a random password.
+///
+/// Used on first run so the account does not ship with a well-known
+/// password.  The value is printed once, at startup, for the operator to
+/// record.
+pub fn generate_password() -> String {
+    use sha2::{Digest, Sha256};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Mix the clock with the process id so two boxes provisioned in the
+    // same second do not get the same password.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut hasher = Sha256::new();
+    hasher.update(now.to_le_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(std::time::Instant::now().elapsed().as_nanos().to_le_bytes());
+    let digest = hex::encode(hasher.finalize());
+
+    // 20 hex characters — 80 bits of entropy, typed without ambiguity.
+    digest[..20].to_string()
+}
+
+/// Replace every account's password with a freshly generated one and
+/// mark them as needing a change.
+///
+/// Returns the generated passwords so the caller can print them.
+pub fn provision_accounts(cfg: &mut Config) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for user in &mut cfg.users {
+        let password = generate_password();
+        user.password_hash = hash_password(&password);
+        user.must_change_password = true;
+        out.push((user.username.clone(), password));
+    }
+    out
+}
+
+/// Set a user's password.
+///
+/// The account is also cleared of the "must change" flag, since this is
+/// the change itself.
+pub fn set_password(cfg: &mut Config, username: &str, password: &str) -> Result<(), String> {
+    if password.len() < 8 {
+        return Err("the password must be at least 8 characters".into());
+    }
+    let user = cfg
+        .users
+        .iter_mut()
+        .find(|u| u.username == username)
+        .ok_or_else(|| format!("no such user '{username}'"))?;
+    user.password_hash = hash_password(password);
+    user.must_change_password = false;
+    Ok(())
 }
 
 fn verify_password(password: &str, hash: &str) -> bool {
@@ -209,13 +277,130 @@ impl Default for ApiConfig {
 
 // ── Loader ────────────────────────────────────────────────────────────────────
 
-/// Path to the config file in /tmp
-const CONFIG_PATH: &str = "/tmp/config.ann";
+/// The legacy config path.
+///
+/// The config used to live here.  `/tmp` is tmpfs — it is wiped on every
+/// reboot — so the API token and the password hashes were silently lost
+/// on restart, which left the REST API open to the whole LAN.  The path
+/// is kept only so an existing config can be migrated.
+pub const LEGACY_CONFIG_PATH: &str = "/tmp/config.ann";
 
-/// Load config from `/tmp/config.ann`.  If the file is absent
-/// or unreadable, write a default file and return default values.
+/// The file name used for the config in every location.
+const CONFIG_FILE_NAME: &str = "config.ann";
+
+/// The candidate config locations, in priority order.
+///
+/// The first one that exists wins.  `ANNOTATOR_CONFIG` overrides
+/// everything — it names a file, not a directory.
+pub fn config_candidates() -> Vec<PathBuf> {
+    if let Ok(p) = std::env::var("ANNOTATOR_CONFIG")
+        && !p.is_empty()
+    {
+        return vec![PathBuf::from(p)];
+    }
+
+    let mut out = Vec::new();
+
+    // The user's own configuration directory.
+    if let Ok(p) = std::env::var("XDG_CONFIG_HOME")
+        && !p.is_empty()
+    {
+        out.push(PathBuf::from(p).join("annotator").join(CONFIG_FILE_NAME));
+    } else if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        out.push(
+            PathBuf::from(home)
+                .join(".config")
+                .join("annotator")
+                .join(CONFIG_FILE_NAME),
+        );
+    }
+
+    // A system-wide location, for a shared install.
+    out.push(PathBuf::from("/etc/annotator").join(CONFIG_FILE_NAME));
+
+    // Last resort, so a fresh install on a locked-down box still starts.
+    out.push(PathBuf::from("/tmp").join(CONFIG_FILE_NAME));
+
+    out
+}
+
+/// The path the config is actually read from and written to.
+///
+/// The first candidate that exists wins, so an existing configuration is
+/// never silently moved.  Otherwise the first candidate that can be
+/// created is used.
+pub fn config_path() -> PathBuf {
+    let candidates = config_candidates();
+    for c in &candidates {
+        if c.exists() {
+            return c.clone();
+        }
+    }
+    // None exist — prefer the home directory, fall back through the list.
+    candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| PathBuf::from("/tmp").join(CONFIG_FILE_NAME))
+}
+
+/// Create the directory that holds the config, with restrictive
+/// permissions.
+///
+/// The file holds password hashes and the API token, so it must not be
+/// world-readable.
+fn ensure_config_dir(path: &Path) -> Result<(), String> {
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        // Best effort — some filesystems do not support it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        }
+    }
+    Ok(())
+}
+
+/// Move a legacy `/tmp/config.ann` to the new location.
+///
+/// Returns the new path when a migration happened.
+fn migrate_legacy(new_path: &Path) -> Option<PathBuf> {
+    let legacy = PathBuf::from(LEGACY_CONFIG_PATH);
+    if !legacy.exists() || new_path == legacy {
+        return None;
+    }
+    if let Some(parent) = new_path.parent()
+        && fs::create_dir_all(parent).is_err()
+    {
+        return None;
+    }
+    match fs::rename(&legacy, new_path) {
+        Ok(()) => Some(new_path.to_path_buf()),
+        Err(_) => {
+            // A rename across filesystems fails; fall back to a copy.
+            match fs::copy(&legacy, new_path) {
+                Ok(_) => {
+                    let _ = fs::remove_file(&legacy);
+                    Some(new_path.to_path_buf())
+                }
+                Err(_) => None,
+            }
+        }
+    }
+}
+
+/// Load the config.
+///
+/// The file is read from the first candidate location that exists.  If
+/// none exists, a legacy `/tmp/config.ann` is migrated if present, and
+/// otherwise a default config is written.
 pub fn load() -> Config {
-    let path = PathBuf::from(CONFIG_PATH);
+    let path = config_path();
+    eprintln!("Info: config path: {}", path.display());
 
     if path.exists() {
         match fs::read_to_string(&path) {
@@ -233,21 +418,50 @@ pub fn load() -> Config {
             },
             Err(e) => eprintln!("Warning: could not read config ({e}); using defaults"),
         }
+    } else if let Some(migrated) = migrate_legacy(&path) {
+        eprintln!(
+            "Info: migrated the config from {} to {}",
+            LEGACY_CONFIG_PATH,
+            migrated.display()
+        );
+        if let Ok(s) = fs::read_to_string(&migrated)
+            && let Ok(cfg) = toml::from_str::<Config>(&s)
+        {
+            return cfg;
+        }
     }
 
-    // Write default config on first run
-    let default_cfg = Config::default();
+    // First run: write a config with a generated password rather than a
+    // well-known default.  Shipping `admin`/`admin` would leave the
+    // portal wide open.
+    let mut default_cfg = Config::default();
+    let provisioned = provision_accounts(&mut default_cfg);
     if let Err(e) = save(&default_cfg) {
         eprintln!("Warning: could not write default config: {e}");
+    }
+    for (username, password) in provisioned {
+        let rule = "=".repeat(64);
+        eprintln!("{rule}");
+        eprintln!("[annotator] generated password for '{username}': {password}");
+        eprintln!("[annotator] change it after the first login.");
+        eprintln!("{rule}");
     }
     default_cfg
 }
 
-/// Save the current config to /tmp/config.ann
+/// Save the current config.
 pub fn save(cfg: &Config) -> Result<(), String> {
-    let path = PathBuf::from(CONFIG_PATH);
+    let path = config_path();
+    ensure_config_dir(&path)?;
     let s = toml::to_string_pretty(cfg).map_err(|e| format!("serialize config: {e}"))?;
     fs::write(&path, s).map_err(|e| format!("write config: {e}"))?;
+    // The file holds password hashes and the API token — keep it
+    // readable only by its owner.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
     eprintln!("Info: saved config to {}", path.display());
     Ok(())
 }
@@ -278,6 +492,7 @@ mod tests {
             username: name.to_string(),
             password_hash: hash_password(name),
             is_admin: false,
+            must_change_password: false,
         }
     }
 
@@ -315,5 +530,115 @@ mod tests {
                 .iter()
                 .all(|u| u.username != beyond.username)
         );
+    }
+
+    #[test]
+    fn the_config_path_prefers_the_home_directory() {
+        // The env override wins outright.
+        unsafe { std::env::set_var("ANNOTATOR_CONFIG", "/tmp/explicit.ann") };
+        let candidates = config_candidates();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0], PathBuf::from("/tmp/explicit.ann"));
+        unsafe { std::env::remove_var("ANNOTATOR_CONFIG") };
+
+        // Without an override, the home directory comes first and /tmp is
+        // the last resort — never the only option.
+        let candidates = config_candidates();
+        assert!(candidates.len() >= 2);
+        let first = candidates[0].display().to_string();
+        assert!(
+            first.contains(".config") || first.contains("XDG") || first.contains("annotator"),
+            "unexpected first candidate: {first}"
+        );
+        assert_eq!(
+            candidates.last().unwrap(),
+            &PathBuf::from("/tmp/config.ann"),
+            "/tmp must remain the last-resort fallback"
+        );
+    }
+
+    #[test]
+    fn a_generated_password_is_usable_and_unique() {
+        let a = generate_password();
+        let b = generate_password();
+        assert_eq!(a.len(), 20);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "two generated passwords must differ");
+        // The generated password verifies against its own hash.
+        assert!(verify_password(&a, &hash_password(&a)));
+    }
+
+    #[test]
+    fn provisioning_marks_the_accounts_for_a_password_change() {
+        let mut cfg = Config::default();
+        let provisioned = provision_accounts(&mut cfg);
+        assert_eq!(provisioned.len(), cfg.users.len());
+        assert!(cfg.users.iter().all(|u| u.must_change_password));
+        // The generated password is the one that now works.
+        let (username, password) = &provisioned[0];
+        let user = cfg.users.iter().find(|u| &u.username == username).unwrap();
+        assert!(user.verify_password(password));
+    }
+
+    #[test]
+    fn setting_a_password_clears_the_must_change_flag() {
+        let mut cfg = Config::default();
+        cfg.users[0].must_change_password = true;
+        set_password(&mut cfg, "admin", "a-new-password").expect("set");
+        let user = &cfg.users[0];
+        assert!(!user.must_change_password);
+        assert!(user.verify_password("a-new-password"));
+        assert!(!user.verify_password("admin"));
+    }
+
+    #[test]
+    fn a_short_password_is_refused() {
+        let mut cfg = Config::default();
+        assert!(set_password(&mut cfg, "admin", "short").is_err());
+        assert!(set_password(&mut cfg, "admin", "12345678").is_ok());
+    }
+
+    #[test]
+    fn setting_an_unknown_users_password_fails() {
+        let mut cfg = Config::default();
+        assert!(set_password(&mut cfg, "nobody", "a-long-password").is_err());
+    }
+
+    #[test]
+    fn the_config_round_trips_through_toml() {
+        let mut cfg = Config::default();
+        cfg.api.token = Some("secret-token".into());
+        cfg.api.case_reference = "CASE-42".into();
+        cfg.api.annotator = "T. Dixon".into();
+        cfg.users[0].must_change_password = true;
+
+        let text = toml::to_string_pretty(&cfg).expect("serialize");
+        let back: Config = toml::from_str(&text).expect("parse");
+        assert_eq!(back.api.token.as_deref(), Some("secret-token"));
+        assert_eq!(back.api.case_reference, "CASE-42");
+        assert_eq!(back.api.annotator, "T. Dixon");
+        assert!(back.users[0].must_change_password);
+    }
+
+    #[test]
+    fn a_config_without_the_new_fields_still_parses() {
+        // An older config file must keep working — the new fields have
+        // serde defaults.
+        let text = r#"
+width = 1920
+height = 1080
+tool_color = "ffffff"
+tool_size = 4
+
+[[users]]
+username = "admin"
+password_hash = "abc"
+is_admin = true
+"#;
+        let cfg: Config = toml::from_str(text).expect("parse");
+        assert_eq!(cfg.api.case_reference, "");
+        assert_eq!(cfg.api.annotator, "");
+        assert!(cfg.api.token.is_none());
+        assert!(!cfg.users[0].must_change_password);
     }
 }

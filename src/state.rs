@@ -342,7 +342,11 @@ pub struct AppState {
     pub shift_down: bool,
 
     // Config ref
-    pub cfg: config::Config,
+    ///
+    /// Shared so the API's password-change endpoint can update it and
+    /// have the change persist.  The main loop owns the authoritative
+    /// copy and writes it to disk.
+    pub cfg: std::sync::Arc<std::sync::RwLock<config::Config>>,
 
     // Overlay settings panel
     pub show_settings_overlay: bool,
@@ -358,6 +362,8 @@ pub struct AppState {
     /// Wall-clock of the last published snapshot — used to throttle
     /// periodic rebuilds of FPS-bearing fields.
     pub last_snapshot_publish: Instant,
+    /// Wall-clock of the last config write.
+    pub last_config_save: Instant,
 }
 
 impl AppState {
@@ -405,12 +411,13 @@ impl AppState {
             laser_trail: Vec::new(),
             pending_menu_click: None,
             menu_close_requested: false,
-            cfg,
+            cfg: std::sync::Arc::new(std::sync::RwLock::new(cfg)),
             show_settings_overlay: false,
             settings: None,
             settings_action: None,
             snapshot_dirty: true, // first frame always rebuilds
             last_snapshot_publish: Instant::now() - std::time::Duration::from_secs(1),
+            last_config_save: Instant::now(),
             eraser_dirty_min: (i32::MAX, i32::MAX),
             eraser_dirty_max: (i32::MIN, i32::MIN),
         }
