@@ -650,6 +650,17 @@ fn handle_keydown(
         // ── Quit ─────────────────────────────────────────────────────────────
         Keycode::Escape => return false,
 
+        // ── Save / Load ───────────────────────────────────────────────────────
+        // Ctrl+S saves to a timestamped file; Ctrl+O loads the most recent
+        // save.  These come first because the plain-letter tool shortcuts
+        // below would otherwise swallow them.
+        Keycode::S if ctrl => {
+            state.save_requested = Some(String::new());
+        }
+        Keycode::O if ctrl => {
+            state.load_requested = Some(String::new());
+        }
+
         // ── Tool selection ────────────────────────────────────────────────────
         Keycode::P => {
             commit_text(state);

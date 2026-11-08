@@ -24,6 +24,7 @@ use std::{
 
 use crate::{
     config::Config,
+    persist,
     state::{
         ApiCommand, ApiCommandKind, ApiPayload, ApiResult, StateSnapshot, parse_hex_color,
         parse_palette_index, parse_usize,
@@ -514,6 +515,32 @@ fn route(
             reply(s, payload, text_mode)
         }
 
+        // ── Save / load endpoints ─────────────────────────────────────────
+        "/api/v1/save" | "/api/v1/load" => {
+            if req.method != "GET" && req.method != "POST" {
+                return reply_err(405, "method not allowed — use GET or POST", text_mode);
+            }
+            let kind = match action_command(req) {
+                Ok(k) => k,
+                Err(msg) => return reply_err(400, &msg, text_mode),
+            };
+            let (s, payload) = dispatch(kind, cmd_tx);
+            reply(s, payload, text_mode)
+        }
+
+        // ── List saved scenes ──────────────────────────────────────────────
+        "/api/v1/saves" => {
+            let saves = persist::list_saves();
+            reply(
+                200,
+                ApiPayload::Ok(serde_json::json!({
+                    "count": saves.len(),
+                    "saves": saves,
+                })),
+                text_mode,
+            )
+        }
+
         // ── Control endpoints (GET with query string or POST with form body) ──
         "/api/v1/tool" | "/api/v1/color" | "/api/v1/brush_size" | "/api/v1/input" => {
             if req.method != "GET" && req.method != "POST" {
@@ -748,8 +775,48 @@ fn action_command(req: &Request) -> Result<ApiCommandKind, String> {
                 None => Ok(ApiCommandKind::ToggleFreeze),
             }
         }
+        "/api/v1/save" => {
+            let name = p.get("name").cloned().unwrap_or_default();
+            validate_scene_name(&name)?;
+            Ok(ApiCommandKind::SaveScene { name })
+        }
+        "/api/v1/load" => {
+            let name = p.get("name").ok_or("missing param 'name'")?.clone();
+            validate_scene_name(&name)?;
+            Ok(ApiCommandKind::LoadScene { name })
+        }
         _ => Err("unknown action endpoint".into()),
     }
+}
+
+/// Reject a scene name that would escape the save directory.
+///
+/// The name becomes a file name, so it must not contain a path
+/// separator, a parent-directory reference, or anything else that could
+/// escape the save directory.
+fn validate_scene_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Ok(()); // empty means "generate one"
+    }
+    if name.len() > 128 {
+        return Err("scene name too long (max 128 characters)".into());
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("scene name must not contain a path separator".into());
+    }
+    if name.contains("..") {
+        return Err("scene name must not reference a parent directory".into());
+    }
+    if name.starts_with('.') {
+        return Err("scene name must not start with a dot".into());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err("scene name may only contain letters, digits, '_', '-' and '.'".into());
+    }
+    Ok(())
 }
 
 /// Hand a validated command to the main loop and wait for its verdict.
@@ -1724,5 +1791,60 @@ mod tests {
         assert!(!constant_time_eq(b"secret", b"secre"));
         assert!(!constant_time_eq(b"secret", b"secrets"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    // ── Save / load endpoints ──────────────────────────────────────────
+
+    #[test]
+    fn save_endpoint_builds_a_save_command() {
+        let r = action_command(&get("/api/v1/save")).unwrap();
+        assert!(matches!(r, ApiCommandKind::SaveScene { ref name } if name.is_empty()));
+
+        let r = action_command(&get("/api/v1/save?name=case-1")).unwrap();
+        assert!(matches!(r, ApiCommandKind::SaveScene { ref name } if name == "case-1"));
+    }
+
+    #[test]
+    fn load_endpoint_requires_a_name() {
+        let r = action_command(&get("/api/v1/load?name=case-1")).unwrap();
+        assert!(matches!(r, ApiCommandKind::LoadScene { ref name } if name == "case-1"));
+
+        // Without a name the command cannot be built.
+        assert!(action_command(&get("/api/v1/load")).is_err());
+    }
+
+    #[test]
+    fn scene_names_cannot_escape_the_save_directory() {
+        // A path separator would let a name write outside the save dir.
+        assert!(validate_scene_name("ok-name_1.json").is_ok());
+        assert!(validate_scene_name("").is_ok());
+        assert!(validate_scene_name("../escape").is_err());
+        assert!(validate_scene_name("a/b").is_err());
+        assert!(validate_scene_name("a\\b").is_err());
+        assert!(validate_scene_name("..").is_err());
+        assert!(validate_scene_name(".hidden").is_err());
+        assert!(validate_scene_name("has space").is_err());
+        assert!(validate_scene_name(&"x".repeat(200)).is_err());
+    }
+
+    #[test]
+    fn a_traversing_scene_name_is_rejected_by_the_endpoint() {
+        assert!(action_command(&get("/api/v1/save?name=../escape")).is_err());
+        assert!(action_command(&get("/api/v1/load?name=../escape")).is_err());
+    }
+
+    #[test]
+    fn the_saves_route_lists_saved_scenes() {
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, _rx) = sync_channel::<ApiCommand>(4);
+        let cfg = Config::default();
+        let sessions = test_sessions();
+
+        let (status, body, ctype) = route(&get("/api/v1/saves"), &snap, &tx, &cfg, &sessions);
+        assert_eq!(status, 200);
+        assert_eq!(ctype, "application/json");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        assert!(v["count"].is_number());
     }
 }

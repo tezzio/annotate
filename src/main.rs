@@ -3,6 +3,7 @@ mod canvas;
 mod capture;
 mod config;
 mod input;
+mod persist;
 mod render_pipeline;
 mod scene;
 mod state;
@@ -10,6 +11,7 @@ mod tools;
 mod ui;
 
 use std::{
+    path::PathBuf,
     sync::{Arc, atomic::Ordering, mpsc::Receiver},
     time::{Duration, Instant},
 };
@@ -223,6 +225,30 @@ fn main() {
     // ── Menu bar ───────────────────────────────────────────────────────────
     let mut menu_bar = ui::MenuBar::new(devices);
 
+    // ── Recover the last saved session ─────────────────────────────────────
+    // A crash or power cut must not destroy the annotations.  If there is
+    // a saved scene, the most recent one is restored at startup.
+    match persist::list_saves().first() {
+        Some(info) => {
+            let path = PathBuf::from(&info.path);
+            match persist::load_from_path(&path) {
+                Ok(doc) => {
+                    persist::apply_document(&mut state.scene, &doc);
+                    eprintln!(
+                        "[annotator] recovered {} ({} objects) from {}",
+                        info.name,
+                        doc.object_count(),
+                        path.display()
+                    );
+                }
+                Err(e) => eprintln!("[annotator] could not recover {}: {e}", path.display()),
+            }
+        }
+        None => {
+            eprintln!("[annotator] no saved session to recover");
+        }
+    }
+
     // ── REST API (Crestron) ────────────────────────────────────────────────
     // The main loop publishes a fresh snapshot at the bottom of every frame;
     // API threads only ever read it, so the render loop never blocks on HTTP.
@@ -267,6 +293,9 @@ fn main() {
     // consumption on 120/144 Hz displays and force the `sync_channel(1)`
     // sender to drop frames we already paid the decode cost for.
     let mut last_video_frame: Option<Frame> = None;
+    // Object count at the last autosave — used to detect that the scene
+    // changed and an autosave is due.
+    let mut last_autosaved_objects: usize = 0;
     let debug = std::env::var("ANNOTATOR_DEBUG").is_ok();
     render_pipeline::DEBUG.store(debug, Ordering::Relaxed);
     if debug {
@@ -621,6 +650,55 @@ fn main() {
                         "freeze": state.freeze_frame,
                     }))
                 }
+                state::ApiCommandKind::SaveScene { name } => {
+                    let file = if name.is_empty() {
+                        persist::timestamped_name()
+                    } else {
+                        format!("{name}.json")
+                    };
+                    match persist::ensure_save_dir() {
+                        Ok(dir) => {
+                            match persist::save_to_path(
+                                &state.scene,
+                                canvas_w,
+                                canvas_h,
+                                &dir.join(&file),
+                            ) {
+                                Ok(bytes) => state::ApiResult::Ok(serde_json::json!({
+                                    "saved": file,
+                                    "bytes": bytes,
+                                    "objects": state.scene.objects().len(),
+                                })),
+                                Err(msg) => state::ApiResult::Rejected(msg),
+                            }
+                        }
+                        Err(e) => state::ApiResult::Rejected(format!(
+                            "cannot create the save directory: {e}"
+                        )),
+                    }
+                }
+                state::ApiCommandKind::LoadScene { name } => {
+                    let file = if name.ends_with(".json") {
+                        name.clone()
+                    } else {
+                        format!("{name}.json")
+                    };
+                    let dir = persist::save_dir();
+                    let path = dir.join(&file);
+                    match persist::load_from_path(&path) {
+                        Ok(doc) => {
+                            persist::apply_document(&mut state.scene, &doc);
+                            state.mark_snapshot_dirty();
+                            state::ApiResult::Ok(serde_json::json!({
+                                "loaded": file,
+                                "objects": state.scene.objects().len(),
+                                "canvas_width": doc.canvas_width,
+                                "canvas_height": doc.canvas_height,
+                            }))
+                        }
+                        Err(msg) => state::ApiResult::Conflict(msg),
+                    }
+                }
             };
             let _ = cmd.reply.send(result);
         }
@@ -658,6 +736,59 @@ fn main() {
                 eprintln!("[annotator] screenshot saved: {}", path);
             } else {
                 eprintln!("[annotator] screenshot failed");
+            }
+        }
+
+        // ── Save / load requests ───────────────────────────────────────────
+        if let Some(name) = state.save_requested.take() {
+            let file = if name.is_empty() {
+                persist::timestamped_name()
+            } else {
+                format!("{name}.json")
+            };
+            match persist::ensure_save_dir() {
+                Ok(dir) => {
+                    let path = dir.join(&file);
+                    match persist::save_to_path(&state.scene, canvas_w, canvas_h, &path) {
+                        Ok(bytes) => eprintln!(
+                            "[annotator] scene saved: {} ({} bytes, {} objects)",
+                            path.display(),
+                            bytes,
+                            state.scene.objects().len()
+                        ),
+                        Err(e) => eprintln!("[annotator] save failed: {e}"),
+                    }
+                }
+                Err(e) => eprintln!("[annotator] cannot create the save directory: {e}"),
+            }
+        }
+        if let Some(name) = state.load_requested.take() {
+            // An empty name means "the most recent save".
+            let file = if name.is_empty() {
+                match persist::list_saves().first() {
+                    Some(info) => info.name.clone(),
+                    None => {
+                        eprintln!("[annotator] no saved scenes to load");
+                        continue;
+                    }
+                }
+            } else if name.ends_with(".json") {
+                name
+            } else {
+                format!("{name}.json")
+            };
+            let path = persist::save_dir().join(&file);
+            match persist::load_from_path(&path) {
+                Ok(doc) => {
+                    persist::apply_document(&mut state.scene, &doc);
+                    state.mark_snapshot_dirty();
+                    eprintln!(
+                        "[annotator] scene loaded: {} ({} objects)",
+                        path.display(),
+                        state.scene.objects().len()
+                    );
+                }
+                Err(e) => eprintln!("[annotator] load failed: {e}"),
             }
         }
 
@@ -1098,6 +1229,41 @@ fn main() {
         );
 
         sdl_canvas.present();
+
+        // ── Autosave ──────────────────────────────────────────────────────
+        // A crash or power cut must not destroy the annotations.  The
+        // scene is autosaved periodically, but only when it has actually
+        // changed — the object count is the cheap signal for that, since
+        // the scene's own `dirty` flag is cleared by the renderer and so
+        // cannot be used here.
+        const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(30);
+        let object_count = state.scene.objects().len();
+        if object_count != last_autosaved_objects {
+            state.scene_changed = true;
+        }
+        if state.scene_changed
+            && state.last_autosave.elapsed() >= AUTOSAVE_INTERVAL
+            && object_count > 0
+        {
+            state.scene_changed = false;
+            state.last_autosave = Instant::now();
+            last_autosaved_objects = object_count;
+            let file = persist::timestamped_name();
+            match persist::ensure_save_dir() {
+                Ok(dir) => {
+                    let path = dir.join(&file);
+                    match persist::save_to_path(&state.scene, canvas_w, canvas_h, &path) {
+                        Ok(_) => eprintln!(
+                            "[annotator] autosaved {} ({} objects)",
+                            path.display(),
+                            object_count
+                        ),
+                        Err(e) => eprintln!("[annotator] autosave failed: {e}"),
+                    }
+                }
+                Err(e) => eprintln!("[annotator] cannot create the save directory: {e}"),
+            }
+        }
 
         // ── Publish API snapshot (HTTP threads only ever read it) ─────────
         // Only rebuild the snapshot when something changed OR the

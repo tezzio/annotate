@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::canvas::Canvas;
 use crate::tools::{
     SliceTarget, draw_arrow, draw_circle_fill, draw_ellipse_outline, draw_highlight, draw_line,
@@ -11,14 +13,14 @@ use rayon::prelude::*;
 
 // ── Object types ──────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PenStroke {
     pub points: Vec<(i32, i32)>,
     pub color: (u8, u8, u8),
     pub size: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShapeObj {
     pub x0: i32,
     pub y0: i32,
@@ -42,7 +44,7 @@ pub struct ShapeObj {
 /// colour lives in `color`, so only the shape needs storing.  `text` and
 /// `size` are retained so the object can be re-rendered and exported as
 /// text.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextObj {
     pub text: String,
     pub x: i32,
@@ -63,7 +65,7 @@ impl TextObj {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HighlightStroke {
     pub points: Vec<(i32, i32)>,
     pub color: (u8, u8, u8),
@@ -73,7 +75,7 @@ pub struct HighlightStroke {
 /// Live (still-editable) drawing object.  Note that the eraser is *not*
 /// represented here — an erase commit "bakes" the current canvas into
 /// `Scene::baked_bg` and clears the live objects.  See [`Scene::bake_from_canvas`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum DrawObject {
     Pen(PenStroke),
     Line(ShapeObj),
@@ -768,6 +770,20 @@ impl Scene {
     /// exist (e.g. on the undo stack).
     pub fn objects_mut(&mut self) -> &mut Vec<DrawObject> {
         &mut Arc::make_mut(&mut self.inner).objects
+    }
+
+    /// Replace the entire scene payload in one go.
+    ///
+    /// Used when loading a saved scene: the objects and the baked
+    /// background are swapped in together, and the undo/redo history is
+    /// cleared — a freshly loaded scene is a new starting point, and
+    /// replaying an old history across a load would be confusing.
+    pub fn replace_contents(&mut self, inner: SceneInner) {
+        self.inner = Arc::new(inner);
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.selected.clear();
+        self.dirty = true;
     }
 
     /// Live baked background.  Returns `&mut Option<Arc<BakedLayer>>` via

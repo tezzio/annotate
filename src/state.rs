@@ -174,6 +174,11 @@ pub enum ApiCommandKind {
     ToggleFreeze,
     /// Freeze the frame explicitly (`true` = frozen, `false` = live).
     SetFreeze(bool),
+    /// Save the current scene to disk.  `name` is the file name; an empty
+    /// name means "generate a timestamped one".
+    SaveScene { name: String },
+    /// Load a scene from disk, replacing the current one.
+    LoadScene { name: String },
 }
 
 // ── Validation / parsing helpers (unit-testable, no SDL) ──────────────────────
@@ -302,6 +307,19 @@ pub struct AppState {
     pub freeze_frame: bool,
     /// Screenshot requested via UI button - consumed by main loop
     pub screenshot_requested: bool,
+    /// Save requested via the keyboard or a UI button.  Holds the file
+    /// name; empty means "generate a timestamped one".  Consumed by the
+    /// main loop.
+    pub save_requested: Option<String>,
+    /// Load requested.  Holds the file name (without the `.json`
+    /// suffix).  Consumed by the main loop.
+    pub load_requested: Option<String>,
+    /// Set whenever the scene changed in a way that should be persisted.
+    /// The main loop uses it to decide when an autosave is due.
+    pub scene_changed: bool,
+    /// When the last autosave happened.  Autosave is debounced against
+    /// this so a busy annotator does not cause a write per mouse-move.
+    pub last_autosave: Instant,
     /// Mode index (into the active device's `modes[]`) the capture thread was
     /// started with.  0 = "best" (used by menu-bar quick-switch).
     pub input_mode: usize,
@@ -376,6 +394,10 @@ impl AppState {
             draw_locked_until: None,
             freeze_frame: false,
             screenshot_requested: false,
+            save_requested: None,
+            load_requested: None,
+            scene_changed: false,
+            last_autosave: Instant::now(),
             input_mode: 0,
             laser_trail: Vec::new(),
             pending_menu_click: None,
