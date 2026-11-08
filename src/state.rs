@@ -179,6 +179,9 @@ pub enum ApiCommandKind {
     SaveScene { name: String },
     /// Load a scene from disk, replacing the current one.
     LoadScene { name: String },
+    /// Export the current annotations to a PNG.  `name` is the file
+    /// name; an empty name means "generate a timestamped one".
+    Export { name: String },
 }
 
 // ── Validation / parsing helpers (unit-testable, no SDL) ──────────────────────

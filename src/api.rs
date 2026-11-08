@@ -24,7 +24,8 @@ use std::{
 
 use crate::{
     config::Config,
-    persist,
+    export, persist,
+    ratelimit::{self, Decision, RateLimiter},
     state::{
         ApiCommand, ApiCommandKind, ApiPayload, ApiResult, StateSnapshot, parse_hex_color,
         parse_palette_index, parse_usize,
@@ -65,9 +66,10 @@ pub fn serve(bind: &str, port: u16, snapshot: SharedSnapshot, cfg: Config) -> Ap
         }
     };
     let sessions: SessionStore = Arc::new(RwLock::new(HashMap::new()));
+    let limiter = Arc::new(RateLimiter::with_defaults());
     if let Err(e) = std::thread::Builder::new()
         .name("api-accept".into())
-        .spawn(move || accept_loop(listener, snapshot, cmd_tx, cfg, sessions))
+        .spawn(move || accept_loop(listener, snapshot, cmd_tx, cfg, sessions, limiter))
     {
         eprintln!("[api] cannot spawn accept thread: {e} — REST API disabled");
     } else {
@@ -82,6 +84,7 @@ fn accept_loop(
     cmd_tx: SyncSender<ApiCommand>,
     cfg: Config,
     sessions: SessionStore,
+    limiter: Arc<RateLimiter>,
 ) {
     let in_flight = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
@@ -103,15 +106,31 @@ fn accept_loop(
             );
             continue;
         }
+
         in_flight.fetch_add(1, Ordering::SeqCst);
         let snap = snapshot.clone();
         let tx = cmd_tx.clone();
         let count = in_flight.clone();
         let cfg_clone = cfg.clone();
         let sess_clone = sessions.clone();
+        let limiter_clone = limiter.clone();
+        // The client identity is the source IP.  `peer_addr` fails only
+        // for an unconnected socket, which cannot happen here.
+        let peer = stream
+            .peer_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
         let spawned = std::thread::Builder::new().spawn(move || {
             isolate_panic(|| {
-                handle_connection(stream, &snap, &tx, &cfg_clone, &sess_clone);
+                handle_connection(
+                    stream,
+                    &snap,
+                    &tx,
+                    &cfg_clone,
+                    &sess_clone,
+                    &limiter_clone,
+                    &peer,
+                );
             });
             count.fetch_sub(1, Ordering::SeqCst);
         });
@@ -142,11 +161,23 @@ fn handle_connection(
     cmd_tx: &SyncSender<ApiCommand>,
     cfg: &Config,
     sessions: &SessionStore,
+    limiter: &RateLimiter,
+    peer: &str,
 ) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let (status, body, ctype) = match read_request(&mut stream) {
-        Ok(Some(req)) => route(&req, snapshot, cmd_tx, cfg, sessions),
+        Ok(Some(req)) => {
+            // Rate-limit after the path is known — reads and mutations
+            // draw on separate budgets.  The portal is not limited.
+            if let Some(bucket) = ratelimit::bucket_for(&req.path)
+                && let Decision::Reject(wait) = limiter.check(peer, bucket)
+            {
+                let _ = write_rate_limited(&mut stream, wait);
+                return;
+            }
+            route(&req, snapshot, cmd_tx, cfg, sessions)
+        }
         Ok(None) => return, // peer connected, sent nothing
         Err(ReadError::TooLarge) => (400, err_body("request too large"), "application/json"),
         Err(ReadError::Malformed) => (400, err_body("malformed request"), "application/json"),
@@ -167,6 +198,7 @@ fn write_response(
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        429 => "Too Many Requests",
         503 => "Service Unavailable",
         _ => "Status",
     };
@@ -177,6 +209,23 @@ fn write_response(
          Connection: close\r\n\r\n",
         content_type,
         body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()
+}
+
+/// Write a 429 with a `Retry-After` header.
+fn write_rate_limited(stream: &mut TcpStream, retry_after_secs: u64) -> std::io::Result<()> {
+    let body = err_body("too many requests");
+    let head = format!(
+        "HTTP/1.1 429 Too Many Requests\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Retry-After: {}\r\n\
+         Connection: close\r\n\r\n",
+        body.len(),
+        retry_after_secs
     );
     stream.write_all(head.as_bytes())?;
     stream.write_all(body.as_bytes())?;
@@ -528,6 +577,19 @@ fn route(
             reply(s, payload, text_mode)
         }
 
+        // ── Export endpoints ───────────────────────────────────────────────
+        "/api/v1/export" => {
+            if req.method != "GET" && req.method != "POST" {
+                return reply_err(405, "method not allowed — use GET or POST", text_mode);
+            }
+            let kind = match action_command(req) {
+                Ok(k) => k,
+                Err(msg) => return reply_err(400, &msg, text_mode),
+            };
+            let (s, payload) = dispatch(kind, cmd_tx);
+            reply(s, payload, text_mode)
+        }
+
         // ── List saved scenes ──────────────────────────────────────────────
         "/api/v1/saves" => {
             let saves = persist::list_saves();
@@ -536,6 +598,19 @@ fn route(
                 ApiPayload::Ok(serde_json::json!({
                     "count": saves.len(),
                     "saves": saves,
+                })),
+                text_mode,
+            )
+        }
+
+        // ── List exports ───────────────────────────────────────────────────
+        "/api/v1/exports" => {
+            let exports = export::list_exports();
+            reply(
+                200,
+                ApiPayload::Ok(serde_json::json!({
+                    "count": exports.len(),
+                    "exports": exports,
                 })),
                 text_mode,
             )
@@ -784,6 +859,11 @@ fn action_command(req: &Request) -> Result<ApiCommandKind, String> {
             let name = p.get("name").ok_or("missing param 'name'")?.clone();
             validate_scene_name(&name)?;
             Ok(ApiCommandKind::LoadScene { name })
+        }
+        "/api/v1/export" => {
+            let name = p.get("name").cloned().unwrap_or_default();
+            validate_scene_name(&name)?;
+            Ok(ApiCommandKind::Export { name })
         }
         _ => Err("unknown action endpoint".into()),
     }
@@ -1843,6 +1923,32 @@ mod tests {
         let (status, body, ctype) = route(&get("/api/v1/saves"), &snap, &tx, &cfg, &sessions);
         assert_eq!(status, 200);
         assert_eq!(ctype, "application/json");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        assert!(v["count"].is_number());
+    }
+
+    #[test]
+    fn the_export_endpoint_builds_an_export_command() {
+        let r = action_command(&get("/api/v1/export")).unwrap();
+        assert!(matches!(r, ApiCommandKind::Export { ref name } if name.is_empty()));
+
+        let r = action_command(&get("/api/v1/export?name=case-7")).unwrap();
+        assert!(matches!(r, ApiCommandKind::Export { ref name } if name == "case-7"));
+
+        // A traversing name is rejected.
+        assert!(action_command(&get("/api/v1/export?name=../escape")).is_err());
+    }
+
+    #[test]
+    fn the_exports_route_lists_exports() {
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, _rx) = sync_channel::<ApiCommand>(4);
+        let cfg = Config::default();
+        let sessions = test_sessions();
+
+        let (status, body, _) = route(&get("/api/v1/exports"), &snap, &tx, &cfg, &sessions);
+        assert_eq!(status, 200);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["ok"], true);
         assert!(v["count"].is_number());

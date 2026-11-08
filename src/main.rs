@@ -2,8 +2,10 @@ mod api;
 mod canvas;
 mod capture;
 mod config;
+mod export;
 mod input;
 mod persist;
+mod ratelimit;
 mod render_pipeline;
 mod scene;
 mod state;
@@ -699,6 +701,64 @@ fn main() {
                         Err(msg) => state::ApiResult::Conflict(msg),
                     }
                 }
+                state::ApiCommandKind::Export { name } => {
+                    let file = if name.is_empty() {
+                        export::timestamped_name()
+                    } else if name.ends_with(".png") {
+                        name.clone()
+                    } else {
+                        format!("{name}.png")
+                    };
+                    match export::ensure_export_dir() {
+                        Ok(dir) => {
+                            let path = dir.join(&file);
+                            let meta = export::ExportMeta {
+                                case_reference: state.cfg.api.case_reference.clone(),
+                                annotator: state.cfg.api.annotator.clone(),
+                                note: state.cfg.api.case_note.clone(),
+                                input: menu_bar
+                                    .devices
+                                    .get(menu_bar.active_idx.saturating_sub(1))
+                                    .map(|d| d.name.clone())
+                                    .unwrap_or_default(),
+                                tool: state.active_tool.name().to_string(),
+                                color: format!(
+                                    "{:02x}{:02x}{:02x}",
+                                    state.color.0, state.color.1, state.color.2
+                                ),
+                                brush_size: state.brush_size,
+                            };
+                            // The export is the annotation layer only —
+                            // no menu bar, no tool rail — composited over
+                            // the current video frame so the result is a
+                            // usable case artifact rather than an
+                            // annotation layer floating on black.
+                            let canvas =
+                                export::render_scene_to_canvas(&state.scene, canvas_w, canvas_h);
+                            let result = match export_video_frame(
+                                &canvas,
+                                last_video_frame.as_ref(),
+                                canvas_w,
+                                canvas_h,
+                            ) {
+                                Some(rgb) => export::write_rgb_png(&rgb, canvas_w, canvas_h, &path),
+                                None => export::write_png(&canvas, &meta, &path),
+                            };
+                            match result {
+                                Ok(bytes) => state::ApiResult::Ok(serde_json::json!({
+                                    "exported": file,
+                                    "path": path.display().to_string(),
+                                    "bytes": bytes,
+                                    "objects": state.scene.objects().len(),
+                                })),
+                                Err(msg) => state::ApiResult::Rejected(msg),
+                            }
+                        }
+                        Err(e) => state::ApiResult::Rejected(format!(
+                            "cannot create the export directory: {e}"
+                        )),
+                    }
+                }
             };
             let _ = cmd.reply.send(result);
         }
@@ -1307,6 +1367,101 @@ fn mode_label(devices: &[capture::DeviceInfo], index: usize, mode: usize) -> Str
         .and_then(|d| d.modes.get(mode))
         .map(|m| m.label())
         .unwrap_or_default()
+}
+
+/// Composite the annotation layer over the current video frame.
+///
+/// Returns `None` when there is no video — the caller then exports the
+/// annotation layer on its own.
+///
+/// The video is placed where it appears on screen (letterboxed, centred)
+/// so the exported image matches what the user was looking at.
+fn export_video_frame(
+    canvas: &Canvas,
+    frame: Option<&Frame>,
+    canvas_w: u32,
+    canvas_h: u32,
+) -> Option<Vec<u8>> {
+    let frame = frame?;
+    if frame.width == 0 || frame.height == 0 {
+        return None;
+    }
+
+    // Decode the frame to RGB.  YUYV is expanded in place; MJPEG has
+    // already been decoded by the capture thread.
+    let rgb: Vec<u8> = match frame.format {
+        capture::FrameFormat::Rgb24 => frame.data.as_ref().clone(),
+        capture::FrameFormat::Yuyv => yuyv_to_rgb(&frame.data, frame.width, frame.height)?,
+    };
+    if rgb.len() < (frame.width * frame.height * 3) as usize {
+        return None;
+    }
+
+    // Place the video where it sits on screen.
+    let dst = scale_rect(canvas_w, canvas_h, frame.width, frame.height);
+    let mut out = vec![0u8; (canvas_w * canvas_h * 3) as usize];
+
+    // Scale the video into the destination rectangle (nearest neighbour
+    // is fine for a case artifact and avoids a resampling dependency).
+    for dy in 0..dst.height() {
+        let sy = (dy as u64 * frame.height as u64 / dst.height().max(1) as u64) as usize;
+        for dx in 0..dst.width() {
+            let sx = (dx as u64 * frame.width as u64 / dst.width().max(1) as u64) as usize;
+            let src = (sy * frame.width as usize + sx) * 3;
+            if src + 2 >= rgb.len() {
+                continue;
+            }
+            let px = (dst.x() + dx as i32).clamp(0, canvas_w as i32 - 1) as u32;
+            let py = (dst.y() + dy as i32).clamp(0, canvas_h as i32 - 1) as u32;
+            let di = (py * canvas_w + px) as usize * 3;
+            if di + 2 < out.len() {
+                out[di] = rgb[src];
+                out[di + 1] = rgb[src + 1];
+                out[di + 2] = rgb[src + 2];
+            }
+        }
+    }
+
+    // Overlay the annotations.
+    Some(export::composite_over_video(&canvas.pixels, &out))
+}
+
+/// Expand a YUYV frame into RGB24.
+fn yuyv_to_rgb(data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    let needed = (width as usize) * (height as usize) * 2;
+    if data.len() < needed {
+        return None;
+    }
+    let mut out = Vec::with_capacity((width as usize) * (height as usize) * 3);
+    for row in 0..height as usize {
+        let base = row * width as usize * 2;
+        for col in 0..width as usize {
+            let i = base + col * 2;
+            let y0 = data[i] as u32;
+            let u = data[i + 1] as u32;
+            let y1 = data[i + 2] as u32;
+            let v = data[i + 3] as u32;
+
+            // BT.601 studio-swing to full range.
+            let c = y0.saturating_sub(16);
+            let d = u.saturating_sub(128);
+            let e = v.saturating_sub(128);
+            let clamp = |x: i32| x.clamp(0, 255) as u8;
+            out.push(clamp((298 * c as i32 + 409 * e as i32 + 128) >> 8));
+            out.push(clamp(
+                (298 * c as i32 - 100 * d as i32 - 208 * e as i32 + 128) >> 8,
+            ));
+            out.push(clamp((298 * c as i32 + 516 * d as i32 + 128) >> 8));
+
+            let c1 = y1.saturating_sub(16);
+            out.push(clamp((298 * c1 as i32 + 409 * e as i32 + 128) >> 8));
+            out.push(clamp(
+                (298 * c1 as i32 - 100 * d as i32 - 208 * e as i32 + 128) >> 8,
+            ));
+            out.push(clamp((298 * c1 as i32 + 516 * d as i32 + 128) >> 8));
+        }
+    }
+    Some(out)
 }
 
 /// Render the active stroke (pen / highlight) directly via

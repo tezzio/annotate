@@ -86,6 +86,19 @@ pub struct ApiConfig {
     /// query param).  `None` = no authentication.
     #[serde(default)]
     pub token: Option<String>,
+
+    /// Case reference written into exported images.  Makes an exported
+    /// annotation traceable without a side database.
+    #[serde(default)]
+    pub case_reference: String,
+
+    /// Who is making the annotations — written into exports.
+    #[serde(default)]
+    pub annotator: String,
+
+    /// Free-text note written into exports.
+    #[serde(default)]
+    pub case_note: String,
 }
 
 // ── serde defaults ────────────────────────────────────────────────────────────
@@ -187,6 +200,9 @@ impl Default for ApiConfig {
             bind: default_api_bind(),
             port: default_api_port(),
             token: None,
+            case_reference: String::new(),
+            annotator: String::new(),
+            case_note: String::new(),
         }
     }
 }
