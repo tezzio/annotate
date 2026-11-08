@@ -25,8 +25,8 @@ use std::{
 use crate::{
     config::Config,
     state::{
-        ApiCommand, ApiCommandKind, ApiResult, StateSnapshot, parse_hex_color, parse_palette_index,
-        parse_usize,
+        ApiCommand, ApiCommandKind, ApiPayload, ApiResult, StateSnapshot, parse_hex_color,
+        parse_palette_index, parse_usize,
     },
     tools::Tool,
 };
@@ -198,6 +198,9 @@ struct Request {
     path: String,
     /// Decoded query-string params (merged with the POSTed form on control calls).
     query: HashMap<String, String>,
+    /// Request headers, keyed by lower-cased name (`X-Auth-Token` →
+    /// `x-auth-token`).  The first occurrence of a repeated header wins.
+    headers: HashMap<String, String>,
     /// Raw request body, form-decoded by the control endpoints.
     body: Vec<u8>,
 }
@@ -240,13 +243,19 @@ fn read_request<R: Read>(r: &mut R) -> Result<Option<Request>, ReadError> {
         return Err(ReadError::Malformed);
     }
 
-    // Only header we act on (phase 2 needs the body for POSTed forms).
+    // Collect the headers we act on.  `content-length` drives the body
+    // read; the rest are kept so the shared API token can arrive in the
+    // `X-Auth-Token` header.
     let mut content_length = 0usize;
+    let mut headers: HashMap<String, String> = HashMap::new();
     for line in lines {
-        if let Some((name, value)) = line.split_once(':')
-            && name.trim().eq_ignore_ascii_case("content-length")
-        {
-            content_length = value.trim().parse().map_err(|_| ReadError::Malformed)?;
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim().to_string();
+            if name == "content-length" {
+                content_length = value.parse().map_err(|_| ReadError::Malformed)?;
+            }
+            headers.entry(name).or_insert(value);
         }
     }
     if header_len + content_length > MAX_REQUEST_BYTES {
@@ -272,6 +281,7 @@ fn read_request<R: Read>(r: &mut R) -> Result<Option<Request>, ReadError> {
         method,
         path,
         query,
+        headers,
         body: buf[header_len..header_len + content_length].to_vec(),
     }))
 }
@@ -344,6 +354,10 @@ fn route(
     cfg: &Config,
     sessions: &SessionStore,
 ) -> (u16, String, &'static str) {
+    // Plain-text mode (`?fmt=text`) — the Crestron Pro3 has no JSON parser,
+    // so every response in that mode is rendered as `OK …` / `ERR …` lines.
+    let text_mode = wants_text(req);
+
     // ── Portal routes ────────────────────────────────────────────────────────────
     match req.path.as_str() {
         "/portal/login" if req.method == "POST" => {
@@ -407,72 +421,217 @@ fn route(
         _ => {}
     }
 
-    // Check authentication for /api/v1/* routes
-    let p = &req.query;
-    let token = p.get("token").or_else(|| p.get("X-Auth-Token"));
-    let authenticated = token.and_then(|t| sessions.read().unwrap().get(t).cloned());
+    // ── Shared-token authentication for /api/v1/* ─────────────────────────
+    // Two kinds of credential are accepted on the REST API:
+    //
+    // * the shared token from `[api] token = "..."` — for machine clients
+    //   (the Crestron Pro3), sent as `X-Auth-Token` or `token=`
+    // * a portal session token — for the browser portal
+    //
+    // When no shared token is configured the API is open (and the startup
+    // log says so), which keeps single-user kiosk installs working.
+    let authenticated = session_user(req, sessions);
+
+    if req.path.starts_with("/api/v1/")
+        && let Some(expected) = cfg.api.token.as_deref().filter(|t| !t.is_empty())
+        && !authenticated.is_some()
+    {
+        let provided = req
+            .headers
+            .get("x-auth-token")
+            .map(|s| s.as_str())
+            .or_else(|| req.query.get("token").map(|s| s.as_str()));
+        let ok = provided.is_some_and(|t| constant_time_eq(t.as_bytes(), expected.as_bytes()));
+        if !ok {
+            return reply_err(401, "unauthorized", text_mode);
+        }
+    }
 
     // ── API routes ─────────────────────────────────────────────────────────
     match req.path.as_str() {
         // ── Read endpoints (GET only) ─────────────────────────────────────
-        "/api/v1/health" | "/api/v1/state" | "/api/v1/inputs" if req.method != "GET" => (
-            405,
-            err_body("method not allowed — use GET"),
-            "application/json",
-        ),
-        "/api/v1/health" => (
+        "/api/v1/health" | "/api/v1/state" | "/api/v1/inputs" if req.method != "GET" => {
+            reply_err(405, "method not allowed — use GET", text_mode)
+        }
+        "/api/v1/health" => reply(
             200,
-            serde_json::json!({
-                "ok": true,
+            ApiPayload::Ok(serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
-            })
-            .to_string(),
-            "application/json",
+            })),
+            text_mode,
         ),
         "/api/v1/state" => {
             let snap = read_snapshot(snapshot);
-            let mut v = serde_json::to_value(&*snap).unwrap_or_else(|_| serde_json::json!({}));
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert("ok".into(), true.into());
-                if let Some(ref user) = authenticated {
-                    obj.insert("authenticated_as".into(), user.clone().into());
-                }
+            if text_mode {
+                return (200, text_state(&snap), "text/plain");
             }
-            (200, v.to_string(), "application/json")
+            let mut v = serde_json::to_value(&*snap).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = v.as_object_mut()
+                && let Some(ref user) = authenticated
+            {
+                obj.insert("authenticated_as".into(), user.clone().into());
+            }
+            reply(200, ApiPayload::Ok(v), text_mode)
         }
         "/api/v1/inputs" => {
             let snap = read_snapshot(snapshot);
-            (
+            if text_mode {
+                return (200, text_inputs(&snap), "text/plain");
+            }
+            reply(
                 200,
-                serde_json::json!({
-                    "ok": true,
+                ApiPayload::Ok(serde_json::json!({
                     "active": snap.input,
+                    "input_mode": snap.input_mode,
                     "inputs": snap.inputs,
-                })
-                .to_string(),
-                "application/json",
+                })),
+                text_mode,
             )
+        }
+
+        // ── Canvas action endpoints (undo / redo / clear / freeze) ─────────
+        // These are deliberately separate routes rather than extra
+        // `/api/v1/tool?name=…` values, so a tool name stays unambiguous.
+        "/api/v1/undo" | "/api/v1/redo" | "/api/v1/clear" | "/api/v1/freeze" => {
+            if req.method != "GET" && req.method != "POST" {
+                return reply_err(405, "method not allowed — use GET or POST", text_mode);
+            }
+            let kind = match action_command(req) {
+                Ok(k) => k,
+                Err(msg) => return reply_err(400, &msg, text_mode),
+            };
+            let (s, payload) = dispatch(kind, cmd_tx);
+            reply(s, payload, text_mode)
         }
 
         // ── Control endpoints (GET with query string or POST with form body) ──
         "/api/v1/tool" | "/api/v1/color" | "/api/v1/brush_size" | "/api/v1/input" => {
             if req.method != "GET" && req.method != "POST" {
-                return (
-                    405,
-                    err_body("method not allowed — use GET or POST"),
-                    "application/json",
-                );
+                return reply_err(405, "method not allowed — use GET or POST", text_mode);
             }
             let kind = match control_command(req) {
                 Ok(k) => k,
-                Err(msg) => return (400, err_body(&msg), "application/json"),
+                Err(msg) => return reply_err(400, &msg, text_mode),
             };
-            let (s, b) = dispatch(kind, cmd_tx);
-            (s, b, "application/json")
+            let (s, payload) = dispatch(kind, cmd_tx);
+            reply(s, payload, text_mode)
         }
 
-        _ => (404, err_body("not found"), "application/json"),
+        _ => reply_err(404, "not found", text_mode),
     }
+}
+
+/// Render a payload in the wire format the caller asked for.
+fn reply(status: u16, payload: ApiPayload, text_mode: bool) -> (u16, String, &'static str) {
+    if text_mode {
+        (status, payload.to_text(), "text/plain")
+    } else {
+        (status, payload.to_json(), "application/json")
+    }
+}
+
+/// Render an error in the wire format the caller asked for.
+fn reply_err(status: u16, msg: &str, text_mode: bool) -> (u16, String, &'static str) {
+    reply(status, ApiPayload::Err(msg.to_string()), text_mode)
+}
+
+/// Plain-text rendering of `/api/v1/state`.
+///
+/// The headline fields come first on one line, so a Crestron can read the
+/// common case with a single line match; the remaining fields follow.
+fn text_state(snap: &StateSnapshot) -> String {
+    let mut out = format!(
+        "OK tool={} color={} size={} input={} input_mode={} freeze={}\n",
+        snap.tool,
+        snap.color,
+        snap.brush_size,
+        snap.input,
+        snap.input_mode,
+        u8::from(snap.freeze),
+    );
+    out.push_str(&format!(
+        "OK objects={} can_undo={} can_redo={} selected={} drawing={}\n",
+        snap.object_count,
+        u8::from(snap.can_undo),
+        u8::from(snap.can_redo),
+        snap.selected,
+        u8::from(snap.drawing),
+    ));
+    out.push_str(&format!(
+        "OK fullscreen={} laser_on={} laser_fade={} show_fps={} show_time={} hide_toolbar={}\n",
+        u8::from(snap.fullscreen),
+        u8::from(snap.laser_on),
+        snap.laser_fade,
+        u8::from(snap.show_fps),
+        u8::from(snap.show_time),
+        u8::from(snap.hide_toolbar),
+    ));
+    out.push_str(&format!(
+        "OK fps={} capture_fps={} window={}x{} undo_limit={} version={}\n",
+        snap.fps,
+        snap.capture_fps,
+        snap.window_size[0],
+        snap.window_size[1],
+        snap.undo_limit,
+        snap.version,
+    ));
+    out.push_str(&format!(
+        "OK text_input_active={} device_picker_open={}",
+        u8::from(snap.text_input_active),
+        u8::from(snap.device_picker_open),
+    ));
+    out.trim_end().to_string()
+}
+
+/// Plain-text rendering of `/api/v1/inputs`.
+///
+/// The active device is on the first line; one `input=<index>:<name>` line
+/// follows per device.
+fn text_inputs(snap: &StateSnapshot) -> String {
+    let mut out = format!(
+        "OK active={} input_mode={} count={}\n",
+        snap.input,
+        snap.input_mode,
+        snap.inputs.len()
+    );
+    for i in &snap.inputs {
+        out.push_str(&format!("input={}:{}\n", i.index, i.name));
+    }
+    out.trim_end().to_string()
+}
+
+/// Whether the caller asked for the plain-text wire format.
+///
+/// The parameter is accepted in the query string or in a POSTed form body,
+/// so a Pro3 can use either `GET /state?fmt=text` or
+/// `POST /state` with `fmt=text` in the body.
+fn wants_text(req: &Request) -> bool {
+    params(req)
+        .get("fmt")
+        .is_some_and(|v| v.eq_ignore_ascii_case("text"))
+}
+
+/// The portal session token carried by a request, if it is valid.
+fn session_user(req: &Request, sessions: &SessionStore) -> Option<String> {
+    let token = req
+        .headers
+        .get("x-auth-token")
+        .map(|s| s.as_str())
+        .or_else(|| req.query.get("token").map(|s| s.as_str()))?;
+    sessions.read().unwrap().get(token).cloned()
+}
+
+/// Compare two byte strings without an early return on the first
+/// difference — a timing side channel would otherwise leak the token.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn generate_token() -> String {
@@ -553,8 +712,38 @@ fn control_command(req: &Request) -> Result<ApiCommandKind, String> {
     }
 }
 
+/// Turn a canvas-action request into a validated command.
+///
+/// These live on their own routes (`/api/v1/undo`, `/api/v1/redo`,
+/// `/api/v1/clear`, `/api/v1/freeze`) rather than as extra values of
+/// `/api/v1/tool?name=…`, so that a tool name stays unambiguous.
+fn action_command(req: &Request) -> Result<ApiCommandKind, String> {
+    let p = params(req);
+    match req.path.as_str() {
+        "/api/v1/undo" => Ok(ApiCommandKind::Undo),
+        "/api/v1/redo" => Ok(ApiCommandKind::Redo),
+        "/api/v1/clear" => Ok(ApiCommandKind::Clear),
+        "/api/v1/freeze" => {
+            // `on=1|0` sets the flag explicitly; `toggle` flips it; the
+            // bare endpoint toggles as well.
+            match p.get("on") {
+                Some(v) if v.eq_ignore_ascii_case("toggle") => Ok(ApiCommandKind::ToggleFreeze),
+                Some(v) if v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true") => {
+                    Ok(ApiCommandKind::SetFreeze(true))
+                }
+                Some(v) if v.eq_ignore_ascii_case("0") || v.eq_ignore_ascii_case("false") => {
+                    Ok(ApiCommandKind::SetFreeze(false))
+                }
+                Some(v) => Err(format!("bad 'on' value '{v}' — expected 1, 0, or toggle")),
+                None => Ok(ApiCommandKind::ToggleFreeze),
+            }
+        }
+        _ => Err("unknown action endpoint".into()),
+    }
+}
+
 /// Hand a validated command to the main loop and wait for its verdict.
-fn dispatch(kind: ApiCommandKind, cmd_tx: &SyncSender<ApiCommand>) -> (u16, String) {
+fn dispatch(kind: ApiCommandKind, cmd_tx: &SyncSender<ApiCommand>) -> (u16, ApiPayload) {
     let (reply_tx, reply_rx) = sync_channel::<ApiResult>(1);
     if cmd_tx
         .send(ApiCommand {
@@ -563,14 +752,14 @@ fn dispatch(kind: ApiCommandKind, cmd_tx: &SyncSender<ApiCommand>) -> (u16, Stri
         })
         .is_err()
     {
-        return (503, err_body("main loop unavailable"));
+        return (503, ApiPayload::Err("main loop unavailable".into()));
     }
     let result = match reply_rx.recv_timeout(REPLY_TIMEOUT) {
         Ok(r) => r,
         Err(RecvTimeoutError::Timeout) => ApiResult::NoReply,
         Err(RecvTimeoutError::Disconnected) => ApiResult::NoReply,
     };
-    result.status_and_body()
+    result.into_payload()
 }
 
 /// Read the snapshot even if a panicking writer poisoned the lock — the data
@@ -688,6 +877,13 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
                     <button id="btn-freeze" class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded">Freeze Frame</button>
                 </div>
 
+                <p class="text-sm text-gray-400">
+                    Undo, redo, clear and freeze are also available over the
+                    REST API as <code>/api/v1/undo</code>,
+                    <code>/api/v1/redo</code>, <code>/api/v1/clear</code>
+                    and <code>/api/v1/freeze</code>.
+                </p>
+
                 <h2 class="text-xl font-semibold border-b border-gray-700 pb-2">Status</h2>
                 <div class="grid grid-cols-2 gap-4 text-sm">
                     <div class="bg-gray-700 p-3 rounded">
@@ -697,6 +893,7 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
                         <span class="text-gray-400">Resolution:</span> <span id="res-display">--</span>
                     </div>
                 </div>
+                <p id="status-line" class="text-sm hidden"></p>
             </div>
         </div>
     </div>
@@ -705,6 +902,7 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
     const API_BASE = '/api/v1';
     let token = localStorage.getItem('annotator_token') || '';
     let username = localStorage.getItem('annotator_user') || '';
+    let statusTimer = null;
 
     async function api(endpoint, opts = {}) {
         if (token) endpoint += (endpoint.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token);
@@ -712,6 +910,41 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
         const json = await res.json();
         if (!json.ok && res.status === 401) logout();
         return json;
+    }
+
+    // ── Status line ──────────────────────────────────────────────────────
+    // Every command result is surfaced here: a rejected command (e.g. an
+    // out-of-range input) must be visible, not silent.
+    function setStatus(msg, ok) {
+        const el = document.getElementById('status-line');
+        if (!el) return;
+        el.textContent = msg;
+        el.classList.remove('hidden', 'text-red-400', 'text-green-400', 'text-gray-400');
+        el.classList.add(ok ? 'text-green-400' : 'text-red-400');
+        clearTimeout(statusTimer);
+        statusTimer = setTimeout(() => {
+            el.classList.add('hidden');
+            el.textContent = '';
+        }, 4000);
+    }
+
+    // Run a command and report the outcome on the status line.
+    async function run(endpoint, label) {
+        try {
+            const r = await api(endpoint, {method:'POST'});
+            if (r.ok) {
+                setStatus(label + ' OK', true);
+                // Reflect the change immediately instead of waiting for
+                // the next poll tick.
+                await poll();
+            } else {
+                setStatus(label + ' failed: ' + (r.error || 'unknown error'), false);
+            }
+            return r;
+        } catch (e) {
+            setStatus(label + ' failed: ' + e.message, false);
+            return {ok:false, error:String(e)};
+        }
     }
 
     async function checkAuth() {
@@ -744,13 +977,54 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
         showLogin();
     }
 
+    // Refresh the controls from the server's state, so a change made from
+    // the Crestron shows up here within a second.
     function updateState(state) {
         // Update tool
-        if (state.tool) document.getElementById('tool-select').value = state.tool;
+        if (state.tool) {
+            const sel = document.getElementById('tool-select');
+            if (sel.value !== state.tool) sel.value = state.tool;
+        }
         // Update brush size
         if (state.brush_size) {
-            document.getElementById('brush-size').value = state.brush_size;
+            const slider = document.getElementById('brush-size');
+            // Don't fight the user while they are dragging the slider.
+            if (document.activeElement !== slider && slider.value !== String(state.brush_size)) {
+                slider.value = state.brush_size;
+            }
             document.getElementById('brush-size-value').textContent = state.brush_size;
+        }
+        // Update colour
+        if (state.color) {
+            document.querySelectorAll('.color-btn').forEach(b => {
+                const on = b.dataset.color.toLowerCase() === state.color.toLowerCase();
+                b.classList.toggle('border-blue-500', on);
+            });
+        }
+        // Update the active input
+        if (state.input !== undefined) {
+            const sel = document.getElementById('input-select');
+            if (sel.value !== String(state.input)) sel.value = state.input;
+        }
+        // Update the freeze button label
+        const freezeBtn = document.getElementById('btn-freeze');
+        if (freezeBtn) {
+            freezeBtn.textContent = state.freeze ? 'Unfreeze Frame' : 'Freeze Frame';
+            freezeBtn.classList.toggle('bg-blue-600', !state.freeze);
+            freezeBtn.classList.toggle('bg-green-600', !!state.freeze);
+            freezeBtn.classList.toggle('hover:bg-blue-700', !state.freeze);
+            freezeBtn.classList.toggle('hover:bg-green-700', !!state.freeze);
+        }
+        // Update the undo/redo button availability
+        const undoBtn = document.getElementById('btn-undo');
+        const redoBtn = document.getElementById('btn-redo');
+        if (undoBtn) {
+            undoBtn.disabled = !state.can_undo;
+            undoBtn.classList.toggle('opacity-40', !state.can_undo);
+        }
+        if (redoBtn) {
+            redoBtn.disabled = !state.can_redo;
+            redoBtn.classList.toggle('opacity-40', !state.can_redo);
         }
     }
 
@@ -791,15 +1065,13 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
 
     // Tool select
     document.getElementById('tool-select').onchange = async (e) => {
-        await api('/tool?name=' + encodeURIComponent(e.target.value), {method:'POST'});
+        await run('/tool?name=' + encodeURIComponent(e.target.value), 'Tool change');
     };
 
     // Color buttons
     document.querySelectorAll('.color-btn').forEach(btn => {
         btn.onclick = async () => {
-            document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('border-blue-500'));
-            btn.classList.add('border-blue-500');
-            await api('/color?hex=' + btn.dataset.color, {method:'POST'});
+            await run('/color?hex=' + btn.dataset.color, 'Color change');
         };
     });
 
@@ -808,14 +1080,15 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
         document.getElementById('brush-size-value').textContent = e.target.value;
     };
     document.getElementById('brush-size').onchange = async (e) => {
-        await api('/brush_size?px=' + e.target.value, {method:'POST'});
+        await run('/brush_size?px=' + e.target.value, 'Brush size');
     };
 
-    // Canvas actions
-    document.getElementById('btn-undo').onclick = () => api('/tool?name=undo', {method:'POST'});
-    document.getElementById('btn-redo').onclick = () => api('/tool?name=redo', {method:'POST'});
-    document.getElementById('btn-clear').onclick = () => api('/tool?name=clear', {method:'POST'});
-    document.getElementById('btn-freeze').onclick = () => api('/tool?name=freeze', {method:'POST'});
+    // Canvas actions — each has its own endpoint now; `/tool?name=undo`
+    // was never a valid tool and returned 400.
+    document.getElementById('btn-undo').onclick = () => run('/undo', 'Undo');
+    document.getElementById('btn-redo').onclick = () => run('/redo', 'Redo');
+    document.getElementById('btn-clear').onclick = () => run('/clear', 'Clear canvas');
+    document.getElementById('btn-freeze').onclick = () => run('/freeze', 'Freeze frame');
 
     // Load inputs
     async function loadInputs() {
@@ -824,11 +1097,11 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
             const sel = document.getElementById('input-select');
             sel.innerHTML = r.inputs.map(i => '<option value="'+i.index+'">'+i.name+'</option>').join('');
             if (r.active !== undefined) sel.value = r.active;
-            sel.onchange = () => api('/input?index=' + sel.value, {method:'POST'});
+            sel.onchange = () => run('/input?index=' + sel.value, 'Input change');
         } catch {}
     }
 
-    // Poll state
+    // Poll state — ~1 s so a Crestron command shows up almost immediately.
     async function poll() {
         try {
             const r = await api('/state');
@@ -839,7 +1112,7 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
     // Init
     checkAuth();
     loadInputs();
-    setInterval(poll, 2000);
+    setInterval(poll, 1000);
     </script>
 </body>
 </html>"#;
@@ -856,8 +1129,28 @@ mod tests {
             method: "GET".into(),
             path,
             query,
+            headers: HashMap::new(),
             body: Vec::new(),
         }
+    }
+
+    /// A request with an extra header (e.g. `X-Auth-Token`).
+    fn get_with_header(target: &str, name: &str, value: &str) -> Request {
+        let mut r = get(target);
+        r.headers
+            .insert(name.to_ascii_lowercase(), value.to_string());
+        r
+    }
+
+    /// A config whose API requires the given shared token.
+    fn cfg_with_token(token: &str) -> Config {
+        let mut cfg = Config::default();
+        cfg.api.token = Some(token.to_string());
+        cfg
+    }
+
+    fn test_sessions() -> SessionStore {
+        Arc::new(RwLock::new(HashMap::new()))
     }
 
     #[test]
@@ -1047,9 +1340,9 @@ mod tests {
         // Channel exists but nobody drains and the receiver is dropped.
         let (tx, rx) = sync_channel::<ApiCommand>(1);
         drop(rx);
-        let (status, body) = dispatch(ApiCommandKind::SetTool(Tool::Pen), &tx);
+        let (status, payload) = dispatch(ApiCommandKind::SetTool(Tool::Pen), &tx);
         assert_eq!(status, 503);
-        assert!(body.contains("\"ok\":false"));
+        assert!(payload.to_json().contains("\"ok\":false"));
     }
 
     #[test]
@@ -1067,5 +1360,343 @@ mod tests {
         assert!(!ok);
 
         std::panic::set_hook(previous);
+    }
+
+    // ── P1: canvas action routes ─────────────────────────────────────────
+
+    #[test]
+    fn action_endpoints_map_to_their_commands() {
+        assert!(matches!(
+            action_command(&get("/api/v1/undo")).unwrap(),
+            ApiCommandKind::Undo
+        ));
+        assert!(matches!(
+            action_command(&get("/api/v1/redo")).unwrap(),
+            ApiCommandKind::Redo
+        ));
+        assert!(matches!(
+            action_command(&get("/api/v1/clear")).unwrap(),
+            ApiCommandKind::Clear
+        ));
+        // Bare `/freeze` toggles.
+        assert!(matches!(
+            action_command(&get("/api/v1/freeze")).unwrap(),
+            ApiCommandKind::ToggleFreeze
+        ));
+    }
+
+    #[test]
+    fn freeze_endpoint_accepts_on_values() {
+        assert!(matches!(
+            action_command(&get("/api/v1/freeze?on=1")).unwrap(),
+            ApiCommandKind::SetFreeze(true)
+        ));
+        assert!(matches!(
+            action_command(&get("/api/v1/freeze?on=0")).unwrap(),
+            ApiCommandKind::SetFreeze(false)
+        ));
+        assert!(matches!(
+            action_command(&get("/api/v1/freeze?on=true")).unwrap(),
+            ApiCommandKind::SetFreeze(true)
+        ));
+        assert!(matches!(
+            action_command(&get("/api/v1/freeze?on=toggle")).unwrap(),
+            ApiCommandKind::ToggleFreeze
+        ));
+        assert!(action_command(&get("/api/v1/freeze?on=maybe")).is_err());
+    }
+
+    #[test]
+    fn tool_endpoint_still_rejects_action_names() {
+        // The action names must not leak into the tool namespace — a tool
+        // name stays unambiguous.
+        for name in ["undo", "redo", "clear", "freeze"] {
+            assert!(
+                control_command(&get(&format!("/api/v1/tool?name={name}"))).is_err(),
+                "'{name}' must not be accepted as a tool"
+            );
+        }
+    }
+
+    #[test]
+    fn action_routes_reach_the_main_loop() {
+        // The route must dispatch the command rather than 404.
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, rx) = sync_channel::<ApiCommand>(4);
+        let cfg = Config::default();
+        let sessions = test_sessions();
+
+        // No main loop is draining, so the command is queued and the
+        // reply times out — what matters is that the route was matched and
+        // the command reached the channel.
+        let (status, _, _) = route(&get("/api/v1/undo"), &snap, &tx, &cfg, &sessions);
+        assert_ne!(status, 404);
+        assert_ne!(status, 405);
+        assert!(rx.try_iter().count() >= 1, "command should be queued");
+    }
+
+    // ── P2: plain-text format ────────────────────────────────────────────
+
+    #[test]
+    fn wants_text_reads_query_and_body() {
+        assert!(wants_text(&get("/api/v1/state?fmt=text")));
+        assert!(wants_text(&get("/api/v1/state?fmt=TEXT")));
+        assert!(!wants_text(&get("/api/v1/state")));
+        assert!(!wants_text(&get("/api/v1/state?fmt=json")));
+
+        // A POSTed form body carries the flag too.
+        let mut r = get("/api/v1/state");
+        r.method = "POST".into();
+        r.body = b"fmt=text".to_vec();
+        assert!(wants_text(&r));
+    }
+
+    #[test]
+    fn health_endpoint_renders_plain_text() {
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, _rx) = sync_channel::<ApiCommand>(4);
+        let cfg = Config::default();
+        let sessions = test_sessions();
+
+        let (status, body, ctype) =
+            route(&get("/api/v1/health?fmt=text"), &snap, &tx, &cfg, &sessions);
+        assert_eq!(status, 200);
+        assert_eq!(ctype, "text/plain");
+        assert!(body.starts_with("OK "), "got: {body}");
+        assert!(body.contains("version="));
+        assert!(!body.contains('{'), "text mode must not emit JSON: {body}");
+    }
+
+    #[test]
+    fn state_endpoint_renders_plain_text() {
+        let mut s = StateSnapshot {
+            tool: "pen",
+            color: "ff3333".into(),
+            brush_size: 8,
+            input: 1,
+            ..Default::default()
+        };
+        s.inputs.push(InputInfo {
+            index: 0,
+            name: "No input (black screen)".into(),
+            path: None,
+            modes: vec![],
+        });
+        let snap: SharedSnapshot = Arc::new(RwLock::new(s));
+        let (tx, _rx) = sync_channel::<ApiCommand>(4);
+        let cfg = Config::default();
+        let sessions = test_sessions();
+
+        let (status, body, ctype) =
+            route(&get("/api/v1/state?fmt=text"), &snap, &tx, &cfg, &sessions);
+        assert_eq!(status, 200);
+        assert_eq!(ctype, "text/plain");
+        assert!(body.contains("tool=pen"), "got: {body}");
+        assert!(body.contains("color=ff3333"), "got: {body}");
+        assert!(body.contains("size=8"), "got: {body}");
+        assert!(body.contains("input=1"), "got: {body}");
+        assert!(body.contains("freeze=0"), "got: {body}");
+        assert!(!body.contains('{'), "text mode must not emit JSON: {body}");
+    }
+
+    #[test]
+    fn errors_render_as_err_lines_in_text_mode() {
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, _rx) = sync_channel::<ApiCommand>(4);
+        let cfg = Config::default();
+        let sessions = test_sessions();
+
+        // A missing required param is a 400 with an `ERR …` body.
+        let (status, body, ctype) =
+            route(&get("/api/v1/tool?fmt=text"), &snap, &tx, &cfg, &sessions);
+        assert_eq!(status, 400);
+        assert_eq!(ctype, "text/plain");
+        assert!(body.starts_with("ERR "), "got: {body}");
+
+        // Unknown paths render the same way.
+        let (status, body, _) = route(&get("/nope?fmt=text"), &snap, &tx, &cfg, &sessions);
+        assert_eq!(status, 404);
+        assert!(body.starts_with("ERR "), "got: {body}");
+    }
+
+    #[test]
+    fn payload_text_rendering() {
+        let ok = ApiPayload::Ok(serde_json::json!({"tool": "pen", "brush_size": 4}));
+        let text = ok.to_text();
+        assert!(text.contains("tool=pen"));
+        assert!(text.contains("brush_size=4"));
+        // The "ok" marker is not a field — it is the line prefix.
+        assert!(!text.contains("ok="));
+
+        let err = ApiPayload::Err("out of range".into());
+        assert_eq!(err.to_text(), "ERR out of range");
+    }
+
+    #[test]
+    fn payload_text_flattens_nested_values() {
+        let ok = ApiPayload::Ok(serde_json::json!({
+            "active": 1,
+            "inputs": [{"index": 0, "name": "No input"}],
+        }));
+        let text = ok.to_text();
+        assert!(text.contains("active=1"), "got: {text}");
+        assert!(text.contains("inputs[0].index=0"), "got: {text}");
+        assert!(text.contains("inputs[0].name=No input"), "got: {text}");
+        assert!(!text.contains('{'), "text mode must not emit JSON: {text}");
+    }
+
+    #[test]
+    fn inputs_endpoint_renders_plain_text() {
+        let mut s = StateSnapshot {
+            input: 1,
+            input_mode: 2,
+            ..Default::default()
+        };
+        s.inputs.push(InputInfo {
+            index: 0,
+            name: "No input (black screen)".into(),
+            path: None,
+            modes: vec![],
+        });
+        s.inputs.push(InputInfo {
+            index: 1,
+            name: "USB Camera".into(),
+            path: Some("/dev/video0".into()),
+            modes: vec!["MJPEG 1920×1080 @30fps".into()],
+        });
+        let snap: SharedSnapshot = Arc::new(RwLock::new(s));
+        let (tx, _rx) = sync_channel::<ApiCommand>(4);
+        let cfg = Config::default();
+        let sessions = test_sessions();
+
+        let (status, body, ctype) =
+            route(&get("/api/v1/inputs?fmt=text"), &snap, &tx, &cfg, &sessions);
+        assert_eq!(status, 200);
+        assert_eq!(ctype, "text/plain");
+        assert!(body.contains("active=1"), "got: {body}");
+        assert!(body.contains("input_mode=2"), "got: {body}");
+        assert!(
+            body.contains("input=0:No input (black screen)"),
+            "got: {body}"
+        );
+        assert!(body.contains("input=1:USB Camera"), "got: {body}");
+        assert!(!body.contains('{'), "text mode must not emit JSON: {body}");
+    }
+
+    // ── P3: shared token authentication ──────────────────────────────────
+
+    #[test]
+    fn api_requires_the_configured_token() {
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, _rx) = sync_channel::<ApiCommand>(4);
+        let cfg = cfg_with_token("secret");
+        let sessions = test_sessions();
+
+        // No token at all → 401.
+        let (status, body, _) = route(&get("/api/v1/state"), &snap, &tx, &cfg, &sessions);
+        assert_eq!(status, 401);
+        assert!(body.contains("unauthorized"), "got: {body}");
+
+        // Wrong token → 401.
+        let (status, _, _) = route(
+            &get("/api/v1/state?token=wrong"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+        );
+        assert_eq!(status, 401);
+
+        // Correct token in the query → 200.
+        let (status, _, _) = route(
+            &get("/api/v1/state?token=secret"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+        );
+        assert_eq!(status, 200);
+
+        // Correct token in the header → 200.
+        let (status, _, _) = route(
+            &get_with_header("/api/v1/state", "X-Auth-Token", "secret"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+        );
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn api_is_open_when_no_token_is_configured() {
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, _rx) = sync_channel::<ApiCommand>(4);
+        let cfg = Config::default(); // token: None
+        let sessions = test_sessions();
+
+        let (status, _, _) = route(&get("/api/v1/state"), &snap, &tx, &cfg, &sessions);
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn a_portal_session_token_also_authorises_api_calls() {
+        // The portal's own session tokens keep working when a shared
+        // token is configured — they are a separate credential.
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, _rx) = sync_channel::<ApiCommand>(4);
+        let cfg = cfg_with_token("secret");
+        let sessions = test_sessions();
+        sessions
+            .write()
+            .unwrap()
+            .insert("sess".into(), "admin".into());
+
+        let (status, body, _) = route(
+            &get("/api/v1/state?token=sess"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+        );
+        assert_eq!(status, 200);
+        assert!(body.contains("authenticated_as"), "got: {body}");
+    }
+
+    #[test]
+    fn unauthorized_uses_the_plain_text_form_when_asked() {
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, _rx) = sync_channel::<ApiCommand>(4);
+        let cfg = cfg_with_token("secret");
+        let sessions = test_sessions();
+
+        let (status, body, ctype) =
+            route(&get("/api/v1/state?fmt=text"), &snap, &tx, &cfg, &sessions);
+        assert_eq!(status, 401);
+        assert_eq!(ctype, "text/plain");
+        assert!(body.starts_with("ERR "), "got: {body}");
+    }
+
+    #[test]
+    fn headers_are_parsed_from_the_request() {
+        let raw: &[u8] = b"GET /api/v1/state HTTP/1.1\r\n\
+                           Host: anno\r\n\
+                           X-Auth-Token: secret\r\n\r\n";
+        let mut cur = std::io::Cursor::new(raw);
+        let r = read_request(&mut cur).unwrap().unwrap();
+        assert_eq!(
+            r.headers.get("x-auth-token").map(|s| s.as_str()),
+            Some("secret")
+        );
+        assert_eq!(r.headers.get("host").map(|s| s.as_str()), Some("anno"));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_equality() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"Secret"));
+        assert!(!constant_time_eq(b"secret", b"secre"));
+        assert!(!constant_time_eq(b"secret", b"secrets"));
+        assert!(constant_time_eq(b"", b""));
     }
 }

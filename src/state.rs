@@ -43,18 +43,95 @@ pub enum ApiResult {
 }
 
 impl ApiResult {
-    pub fn status_and_body(self) -> (u16, String) {
+    /// Split into an HTTP status and a still-unserialised payload.  The
+    /// HTTP layer picks the wire format (JSON, or the plain-text
+    /// `OK …` / `ERR …` form used by `?fmt=text`), so the decision lives in
+    /// one place instead of being duplicated per endpoint.
+    pub fn into_payload(self) -> (u16, ApiPayload) {
         match self {
-            ApiResult::Ok(mut v) => {
+            ApiResult::Ok(v) => (200, ApiPayload::Ok(v)),
+            ApiResult::Rejected(msg) => (400, ApiPayload::Err(msg)),
+            ApiResult::Conflict(msg) => (409, ApiPayload::Err(msg)),
+            ApiResult::NoReply => (503, ApiPayload::Err("main loop did not respond".into())),
+        }
+    }
+}
+
+/// A response body that has not been serialised yet.
+pub enum ApiPayload {
+    /// Success — carries the result fields.
+    Ok(serde_json::Value),
+    /// Failure — carries the human-readable message.
+    Err(String),
+}
+
+impl ApiPayload {
+    /// JSON wire format.  The `ok` marker is added here so every JSON
+    /// response carries it, whichever endpoint produced it.
+    pub fn to_json(&self) -> String {
+        match self {
+            ApiPayload::Ok(v) => {
+                let mut v = v.clone();
                 if let Some(obj) = v.as_object_mut() {
                     obj.insert("ok".into(), true.into());
                 }
-                (200, v.to_string())
+                v.to_string()
             }
-            ApiResult::Rejected(msg) => (400, err_json(&msg)),
-            ApiResult::Conflict(msg) => (409, err_json(&msg)),
-            ApiResult::NoReply => (503, err_json("main loop did not respond")),
+            ApiPayload::Err(msg) => err_json(msg),
         }
+    }
+
+    /// Plain-text wire format — one `OK key=value` line per success field,
+    /// or a single `ERR <message>` line for a failure.
+    ///
+    /// Nested objects are flattened with a dotted key (`inputs[0].name=…`)
+    /// so that nothing in the text format is JSON.
+    pub fn to_text(&self) -> String {
+        match self {
+            ApiPayload::Ok(v) => {
+                let mut lines = Vec::new();
+                if let Some(obj) = v.as_object() {
+                    for (k, val) in obj {
+                        if k == "ok" {
+                            continue;
+                        }
+                        flatten(k, val, &mut lines);
+                    }
+                }
+                if lines.is_empty() {
+                    return "OK".to_string();
+                }
+                lines
+                    .into_iter()
+                    .map(|l| format!("OK {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            ApiPayload::Err(msg) => format!("ERR {msg}"),
+        }
+    }
+}
+
+/// Flatten a JSON value into `key=value` lines.
+///
+/// * a scalar becomes one line
+/// * an array becomes one line per element, keyed `key[0]`, `key[1]`, …
+/// * an object becomes one line per field, keyed `key.field`
+fn flatten(key: &str, v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                flatten(&format!("{key}[{i}]"), item, out);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (k, val) in fields {
+                flatten(&format!("{key}.{k}"), val, out);
+            }
+        }
+        serde_json::Value::String(s) => out.push(format!("{key}={s}")),
+        serde_json::Value::Null => out.push(format!("{key}=")),
+        other => out.push(format!("{key}={other}")),
     }
 }
 
@@ -84,6 +161,19 @@ pub enum ApiCommandKind {
     /// Select video input: 0 = no input, 1..=n = device index.
     /// `mode` indexes the device's mode list (0 = best).
     SetInput { index: usize, mode: usize },
+    /// Undo the last committed change.  Rejected with 409 when the undo
+    /// stack is empty.
+    Undo,
+    /// Redo the last undone change.  Rejected with 409 when the redo
+    /// stack is empty.
+    Redo,
+    /// Clear the canvas.  Always succeeds — it pushes an undo point first,
+    /// so the clear itself can be undone.
+    Clear,
+    /// Flip the freeze-frame flag.
+    ToggleFreeze,
+    /// Freeze the frame explicitly (`true` = frozen, `false` = live).
+    SetFreeze(bool),
 }
 
 // ── Validation / parsing helpers (unit-testable, no SDL) ──────────────────────

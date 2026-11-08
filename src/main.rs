@@ -232,6 +232,14 @@ fn main() {
     // The main loop drains this once per frame; HTTP threads block on the
     // per-command oneshot for at most 500 ms.
     let api_cmd_rx: api::ApiCommandRx = if state.cfg.api.enabled {
+        if state.cfg.api.token.as_deref().is_none_or(|t| t.is_empty()) {
+            eprintln!(
+                "[api] WARNING — no shared token configured ([api] token = \"...\"). \
+                 The REST API is open to anyone who can reach {}. \
+                 Set a token to require X-Auth-Token on every /api/v1/* call.",
+                state.cfg.api.bind
+            );
+        }
         api::serve(
             &state.cfg.api.bind,
             state.cfg.api.port,
@@ -436,13 +444,13 @@ fn main() {
             }
             if let ui::MenuAction::SelectDevice(idx) = action {
                 menu_bar.active_idx = idx;
-                state.input_mode = 0; // menu quick-switch always uses best mode
                 state.mark_snapshot_dirty();
                 if idx == 0 {
                     capture_stop.store(true, Ordering::Relaxed);
                     capture_rx = capture::null_receiver();
                     capture_fps_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
                     last_video_frame = None;
+                    state.input_mode = 0;
                 } else if let Some(picker) = &state.device_picker {
                     capture_stop.store(true, Ordering::Relaxed);
                     let dev = &picker.devices[idx - 1];
@@ -452,6 +460,10 @@ fn main() {
                     capture_rx = rx;
                     capture_fps_counter = fps;
                     capture_stop = stop;
+                    // `input_mode` is authoritative — it always reports the
+                    // mode index the capture thread was actually started
+                    // with (0 = the "best" mode).
+                    state.input_mode = 0;
                 }
             }
         }
@@ -554,8 +566,60 @@ fn main() {
                         state::ApiResult::Ok(serde_json::json!({
                             "input": index,
                             "input_mode": mode,
+                            "mode_label": mode_label(&menu_bar.devices, index, mode),
                         }))
                     }
+                }
+                state::ApiCommandKind::Undo => {
+                    if state.scene.undo_stack.is_empty() {
+                        state::ApiResult::Conflict("nothing to undo".into())
+                    } else {
+                        state.scene.undo();
+                        state.mark_snapshot_dirty();
+                        state::ApiResult::Ok(serde_json::json!({
+                            "can_undo": !state.scene.undo_stack.is_empty(),
+                            "can_redo": !state.scene.redo_stack.is_empty(),
+                            "object_count": state.scene.objects().len(),
+                        }))
+                    }
+                }
+                state::ApiCommandKind::Redo => {
+                    if state.scene.redo_stack.is_empty() {
+                        state::ApiResult::Conflict("nothing to redo".into())
+                    } else {
+                        state.scene.redo();
+                        state.mark_snapshot_dirty();
+                        state::ApiResult::Ok(serde_json::json!({
+                            "can_undo": !state.scene.undo_stack.is_empty(),
+                            "can_redo": !state.scene.redo_stack.is_empty(),
+                            "object_count": state.scene.objects().len(),
+                        }))
+                    }
+                }
+                state::ApiCommandKind::Clear => {
+                    // `clear` pushes an undo point of its own, so a clear
+                    // can be undone like any other edit.
+                    state.scene.clear();
+                    state.mark_snapshot_dirty();
+                    state::ApiResult::Ok(serde_json::json!({
+                        "can_undo": !state.scene.undo_stack.is_empty(),
+                        "can_redo": !state.scene.redo_stack.is_empty(),
+                        "object_count": state.scene.objects().len(),
+                    }))
+                }
+                state::ApiCommandKind::ToggleFreeze => {
+                    state.freeze_frame = !state.freeze_frame;
+                    state.mark_snapshot_dirty();
+                    state::ApiResult::Ok(serde_json::json!({
+                        "freeze": state.freeze_frame,
+                    }))
+                }
+                state::ApiCommandKind::SetFreeze(on) => {
+                    state.freeze_frame = on;
+                    state.mark_snapshot_dirty();
+                    state::ApiResult::Ok(serde_json::json!({
+                        "freeze": state.freeze_frame,
+                    }))
                 }
             };
             let _ = cmd.reply.send(result);
@@ -1059,6 +1123,21 @@ fn main() {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Human-readable label for the capture mode a device is running.
+///
+/// Returns an empty string for the "no input" entry or for a mode index
+/// that does not exist, so the caller can fall back to the raw index.
+fn mode_label(devices: &[capture::DeviceInfo], index: usize, mode: usize) -> String {
+    if index == 0 {
+        return String::new();
+    }
+    devices
+        .get(index - 1)
+        .and_then(|d| d.modes.get(mode))
+        .map(|m| m.label())
+        .unwrap_or_default()
+}
 
 /// Render the active stroke (pen / highlight) directly via
 /// SDL2 GPU draw calls on top of `committed_tex`, instead of clearing +
