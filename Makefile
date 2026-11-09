@@ -75,7 +75,8 @@ build-arm:
 
 # test: run the unit tests.  The host has no SDL2 development packages
 # installed, so the libraries from the library directory are put on the
-# link path.
+# link path — and on the runtime path, because the test binary is
+# actually executed.
 test:
 	@ARCH=$(ARCH) bash $(SCRIPTS_DIR)/test.sh
 
