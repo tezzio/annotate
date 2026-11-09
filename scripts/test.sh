@@ -5,6 +5,12 @@
 # installed, so the libraries fetched by scripts/sysroot.sh are put on
 # the link path instead.
 #
+# The test binary also needs those libraries at RUN time.  It is linked
+# without an RPATH, so the loader must be told where to look — either
+# through LD_LIBRARY_PATH or through an RPATH baked into the binary.
+# The RPATH is used, because a test binary that can only run with a
+# particular environment set is awkward to debug.
+#
 # Usage:
 #   ./scripts/test.sh
 #   ARCH=aarch64 ./scripts/test.sh
@@ -18,6 +24,7 @@ source "$SCRIPT_DIR/common.sh"
 
 LIBDIR="$SYSROOT/usr/lib/$MULTIARCH"
 RT_DIR="$SYSROOT/usr/lib/$MULTIARCH-runtime"
+SHARED_DIR="$SYSROOT/usr/lib/$MULTIARCH-shared"
 
 if [[ ! -d "$LIBDIR" ]]; then
     die "No libraries at $LIBDIR — run: ARCH=$ARCH ./scripts/sysroot.sh"
@@ -49,6 +56,30 @@ chmod +x "$WRAPPER"
 
 TARGET_UPPER="$(echo "$TARGET" | tr '[:lower:]-' '[:upper:]_')"
 export "CARGO_TARGET_${TARGET_UPPER}_LINKER=$WRAPPER"
+
+# The runtime library path.
+#
+# The test binary links against SDL2 but is built without an RPATH, so
+# the loader cannot find libSDL2 unless it is told where to look.  That
+# is why the x86_64 CI job failed with
+#
+#     error while loading shared libraries: libSDL2-2.0.so.0:
+#     cannot open shared object file: No such file or directory
+#
+# while the aarch64 job passed — it only cross-compiles and never runs
+# the binary.
+#
+# The same directories the release binary uses are searched here, so the
+# tests exercise the libraries the binary will actually run against.
+# The system's own directories come first, matching scripts/build.sh:
+# a locally installed SDL2 wins over the fetched one, and the fetched
+# one is the fallback that makes the tests work on a bare CI runner.
+RPATH="/usr/lib/$MULTIARCH:/lib/$MULTIARCH:$RT_DIR:$SHARED_DIR"
+
+# Bake the path into the test binary rather than exporting
+# LD_LIBRARY_PATH: the binary then runs the same way however it is
+# invoked, and `ldd` on it shows the answer.
+export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-rpath,$RPATH"
 
 info "Running the tests..."
 cargo test "$@"
