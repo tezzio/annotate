@@ -1,0 +1,110 @@
+# Release workflow — builds the binaries and publishes the GitHub Release.
+#
+# This is a separate file from build.yml on purpose.
+#
+# When a commit and its tag are pushed in the same operation, GitHub
+# creates ONE workflow run for the branch, and the tag does not get a run
+# of its own.  The release job in build.yml is gated on
+# `startsWith(github.ref, 'refs/tags/v')`, so on a branch ref it is
+# skipped: the binaries are built and uploaded as artifacts, but no
+# release is published and no files are attached to the tag.
+#
+# That is what happened to v0.4.3 — `git push --follow-tags` pushed the
+# branch and the tag together, GitHub deduplicated them into a single
+# branch run, and the release was silently skipped.
+#
+# A workflow file that only triggers on tags gets its own run for every
+# tag push, whether or not the tag travelled with a branch update.  That
+# makes the release independent of how the push was made.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Allows a release to be cut without pushing a tag, and lets a failed
+  # release be re-run on demand.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.4.3)"
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            artifact: annotator-linux-x86_64
+            libs: libs-x86
+            build: build
+          - arch: aarch64
+            artifact: annotator-linux-aarch64
+            libs: libs-arm
+            build: build-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # When dispatched manually, build from the tag being released;
+          # on a tag push this is the tag's own commit anyway.
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl dpkg
+
+      - name: Fetch Debian libraries
+        run: make ${{ matrix.libs }}
+
+      - name: Build binary
+        run: make ${{ matrix.build }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/${{ matrix.arch }}/annotator
+          if-no-files-found: error
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [build]
+    permissions:
+      contents: write
+    steps:
+      - name: Download x86_64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: annotator-linux-x86_64
+          path: annotator-linux-x86_64
+
+      - name: Download aarch64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: annotator-linux-aarch64
+          path: annotator-linux-aarch64
+
+      - name: Rename artifacts with version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ -n "$VERSION" ] || VERSION="${{ inputs.tag }}"
+          VERSION="${VERSION#v}"
+          cp annotator-linux-x86_64/annotator "annotator-${VERSION}-linux-x86_64"
+          cp annotator-linux-aarch64/annotator "annotator-${VERSION}-linux-aarch64"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            annotator-*-linux-x86_64
+            annotator-*-linux-aarch64
+          generate_release_notes: true

@@ -1,3 +1,12 @@
+# Build and check workflow.
+#
+# The release is built by release.yml, not here.  When a commit and its
+# tag are pushed in the same operation, GitHub creates one run for the
+# branch and no separate run for the tag — so a release job living in
+# this file would be skipped, because it sees a branch ref rather than
+# a tag ref.  A workflow that only triggers on tags always gets its own
+# run.  See release.yml.
+
 name: CI
 
 on:
@@ -85,36 +94,3 @@ jobs:
           name: annotator-linux-aarch64
           path: target/aarch64/annotator
           if-no-files-found: error
-
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    needs: [build-x86_64, build-aarch64]
-    permissions:
-      contents: write
-    steps:
-      - name: Download x86_64 binary
-        uses: actions/download-artifact@v4
-        with:
-          name: annotator-linux-x86_64
-          path: annotator-linux-x86_64
-
-      - name: Download aarch64 binary
-        uses: actions/download-artifact@v4
-        with:
-          name: annotator-linux-aarch64
-          path: annotator-linux-aarch64
-
-      - name: Rename artifacts with version
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          cp annotator-linux-x86_64/annotator "annotator-${VERSION}-linux-x86_64"
-          cp annotator-linux-aarch64/annotator "annotator-${VERSION}-linux-aarch64"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            annotator-*-linux-x86_64
-            annotator-*-linux-aarch64
-          generate_release_notes: true
