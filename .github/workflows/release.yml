@@ -94,8 +94,10 @@ jobs:
 
       - name: Rename artifacts with version
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          [ -n "$VERSION" ] || VERSION="${{ inputs.tag }}"
+          # The tag wins when the workflow was dispatched by hand: in that
+          # case GITHUB_REF_NAME is the branch, not the tag.
+          VERSION="${{ inputs.tag }}"
+          [ -n "$VERSION" ] || VERSION="${GITHUB_REF_NAME}"
           VERSION="${VERSION#v}"
           cp annotator-linux-x86_64/annotator "annotator-${VERSION}-linux-x86_64"
           cp annotator-linux-aarch64/annotator "annotator-${VERSION}-linux-aarch64"
