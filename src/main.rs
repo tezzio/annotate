@@ -4,6 +4,7 @@ mod capture;
 mod config;
 mod export;
 mod input;
+mod net;
 mod persist;
 mod ratelimit;
 mod render_pipeline;
@@ -205,6 +206,7 @@ fn main() {
 
     // ── App state ──────────────────────────────────────────────────────────
     let undo_limit = cfg.undo_stack_limit;
+    let cfg_api = cfg.api.clone();
     let mut state = AppState::new(cfg);
     state.window_size = (canvas_w, canvas_h);
 
@@ -223,6 +225,9 @@ fn main() {
         hide_toolbar: Toggle::from_bool(cfg_hide_toolbar),
         fullscreen: Toggle::from_bool(state.is_fullscreen),
         undo_limit,
+        api_enabled: Toggle::from_bool(cfg_api.enabled),
+        api_addr: format!("{}:{}", cfg_api.bind, cfg_api.port),
+        network: net::interface_addresses(),
         renderer_info,
         scroll_offset: 0,
     });
@@ -273,7 +278,11 @@ fn main() {
     // the main loop writes it to disk.
     let config_dirty: api::ConfigDirtyFlag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let api_cmd_rx: api::ApiCommandRx = {
+    // The API server is held so the settings panel can stop and start it.
+    // When it is stopped the command channel is drained by a null
+    // receiver, so the main loop's drain simply finds nothing.
+    let mut api_server: Option<api::ApiServer> = None;
+    let mut api_cmd_rx: api::ApiCommandRx = {
         let cfg_api = state.cfg.read().unwrap_or_else(|p| p.into_inner());
         if cfg_api.api.enabled {
             if cfg_api.api.token.as_deref().is_none_or(|t| t.is_empty()) {
@@ -284,13 +293,15 @@ fn main() {
                     cfg_api.api.bind
                 );
             }
-            api::serve(
+            let (server, rx) = api::serve(
                 &cfg_api.api.bind,
                 cfg_api.api.port,
                 api_snapshot.clone(),
                 state.cfg.clone(),
                 config_dirty.clone(),
-            )
+            );
+            api_server = Some(server);
+            rx
         } else {
             eprintln!("[api] disabled by config ([api] enabled = false)");
             let (_tx, rx) = std::sync::mpsc::sync_channel(0);
@@ -490,6 +501,7 @@ fn main() {
                 }
                 ui::MenuAction::OpenSettings => {
                     state.show_settings_overlay = true;
+                    refresh_settings(&mut state);
                     state.mark_snapshot_dirty();
                 }
                 _ => {}
@@ -1353,6 +1365,52 @@ fn main() {
 
         sdl_canvas.present();
 
+        // ── API enable / disable ───────────────────────────────────────────
+        // The settings panel can switch the REST API off.  The change is
+        // applied here rather than in the event handler, because stopping
+        // the server joins its thread — which must not happen while the
+        // event handler holds the borrow on the settings.
+        if let Some(s) = &state.settings {
+            let wanted = s.api_enabled == Toggle::On;
+            let running = api_server.as_ref().is_some_and(|a| a.is_running());
+            if wanted != running {
+                if wanted {
+                    // Start it.  The bind address and port come from the
+                    // config, so a token set there still applies.
+                    let cfg_api = state.cfg.read().unwrap_or_else(|p| p.into_inner());
+                    let (server, rx) = api::serve(
+                        &cfg_api.api.bind,
+                        cfg_api.api.port,
+                        api_snapshot.clone(),
+                        state.cfg.clone(),
+                        config_dirty.clone(),
+                    );
+                    api_server = Some(server);
+                    api_cmd_rx = rx;
+                    eprintln!("[api] started");
+                } else {
+                    // Stop it.  The listening socket is released, so the
+                    // API is genuinely unreachable.
+                    if let Some(mut server) = api_server.take() {
+                        server.stop();
+                    }
+                    // Drain the channel with a receiver nobody writes to.
+                    let (_tx, rx) = std::sync::mpsc::sync_channel(0);
+                    api_cmd_rx = rx;
+                    eprintln!("[api] disabled");
+                }
+                // Remember the choice so it survives a restart.
+                {
+                    let mut cfg = state.cfg.write().unwrap_or_else(|p| p.into_inner());
+                    cfg.api.enabled = wanted;
+                    if let Err(e) = config::save(&cfg) {
+                        eprintln!("[annotator] could not save the config: {e}");
+                    }
+                }
+                state.mark_snapshot_dirty();
+            }
+        }
+
         // ── Autosave ──────────────────────────────────────────────────────
         // A crash or power cut must not destroy the annotations.  The
         // scene is autosaved periodically, but only when it has actually
@@ -1546,6 +1604,21 @@ fn yuyv_to_rgb(data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
 /// `overlay_src` is the screen rect that the annotation overlay covers
 /// (i.e. below the menu bar, above the toolbar); the active stroke is
 /// clipped to this rect because that's where the user is drawing.
+/// Refresh the live values shown in the settings panel.
+///
+/// The network addresses and the API state can change while the app is
+/// running, so they are re-read each time the panel is opened rather
+/// than being frozen at startup.
+fn refresh_settings(state: &mut state::AppState) {
+    let Some(s) = &mut state.settings else {
+        return;
+    };
+    s.network = net::interface_addresses();
+    let cfg_api = state.cfg.read().unwrap_or_else(|p| p.into_inner());
+    s.api_addr = format!("{}:{}", cfg_api.api.bind, cfg_api.api.port);
+    s.api_enabled = Toggle::from_bool(cfg_api.api.enabled);
+}
+
 /// Write the settings panel's values back to the config file so that
 /// they survive a restart.
 fn save_settings(state: &mut state::AppState) {
@@ -1559,6 +1632,9 @@ fn save_settings(state: &mut state::AppState) {
         cfg.laser_on = s.laser_on == Toggle::On;
         cfg.show_fps = s.show_fps == Toggle::On;
         cfg.undo_stack_limit = s.undo_limit;
+        // The API toggle is applied by the main loop, which writes the
+        // config itself; it is not saved here so the two paths cannot
+        // disagree.
         if let Err(e) = config::save(&cfg) {
             eprintln!("[annotator] could not save settings: {e}");
         }

@@ -47,6 +47,66 @@ type SharedConfig = Arc<RwLock<Config>>;
 /// write it to disk.
 pub type ConfigDirtyFlag = Arc<AtomicBool>;
 
+/// A running API server, which can be stopped and started again.
+///
+/// The settings panel offers an enable/disable toggle for the REST API.
+/// Stopping has to release the listening socket — otherwise the port
+/// stays bound and the API is still reachable even though the panel says
+/// it is off.
+pub struct ApiServer {
+    /// The command channel the main loop drains.  Holding the sender
+    /// keeps the channel open for the server's lifetime; the receiver is
+    /// taken by the main loop.
+    #[allow(dead_code)]
+    cmd_tx: SyncSender<ApiCommand>,
+    /// Set to false to ask the accept loop to stop.
+    running: Arc<AtomicBool>,
+    /// The address the listener is bound to.
+    #[allow(dead_code)]
+    addr: String,
+    /// The listener thread, so it can be joined when stopping.
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ApiServer {
+    /// Ask the server to stop and wait for it.
+    ///
+    /// The listening socket is closed before this returns, so the port is
+    /// released immediately — the API is genuinely unreachable once
+    /// `stop` returns, not merely ignored.
+    pub fn stop(&mut self) {
+        if self.thread.is_none() {
+            return;
+        }
+        self.running.store(false, Ordering::SeqCst);
+        // The accept loop waits on the listener with a timeout, so it
+        // notices the flag within a fraction of a second.
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        eprintln!("[api] stopped");
+    }
+
+    /// Whether the server is currently accepting connections.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    /// The address the server is listening on.
+    #[allow(dead_code)]
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+}
+
+impl Drop for ApiServer {
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            self.stop();
+        }
+    }
+}
+
 /// The shared state every connection handler needs.
 ///
 /// Bundled into one struct so the handler signatures stay readable.
@@ -57,6 +117,8 @@ struct ServerState {
     sessions: SessionStore,
     limiter: Arc<RateLimiter>,
     config_dirty: ConfigDirtyFlag,
+    /// Set to false to ask the accept loop to stop.
+    running: Arc<AtomicBool>,
 }
 
 /// Snapshot handle shared between the main loop (writer) and the API threads.
@@ -84,59 +146,90 @@ pub fn serve(
     snapshot: SharedSnapshot,
     cfg: std::sync::Arc<std::sync::RwLock<Config>>,
     config_dirty: ConfigDirtyFlag,
-) -> ApiCommandRx {
+) -> (ApiServer, ApiCommandRx) {
     let cfg: SharedConfig = cfg;
     let (cmd_tx, cmd_rx) = sync_channel::<ApiCommand>(COMMAND_QUEUE);
     let addr = format!("{bind}:{port}");
+
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[api] cannot bind {addr}: {e} — REST API disabled");
-            return cmd_rx; // drained but never fed — harmless
+            // A server that never started is still a server: it reports
+            // itself as not running, and the panel shows the API as off.
+            return (
+                ApiServer {
+                    cmd_tx,
+                    running: Arc::new(AtomicBool::new(false)),
+                    addr,
+                    thread: None,
+                },
+                cmd_rx,
+            );
         }
     };
+
     let sessions: SessionStore = Arc::new(RwLock::new(HashMap::new()));
     let limiter = Arc::new(RateLimiter::with_defaults());
-    if let Err(e) = std::thread::Builder::new()
+    let running = Arc::new(AtomicBool::new(true));
+    let running_thread = Arc::clone(&running);
+    // The accept thread takes its own clone of the sender; the server
+    // keeps the original so the channel stays open.
+    let cmd_tx_thread = cmd_tx.clone();
+
+    let spawned = std::thread::Builder::new()
         .name("api-accept".into())
         .spawn(move || {
             accept_loop(
                 listener,
-                snapshot,
-                cmd_tx,
-                cfg,
-                sessions,
-                limiter,
-                config_dirty,
+                ServerState {
+                    snapshot,
+                    cmd_tx: cmd_tx_thread,
+                    cfg,
+                    sessions,
+                    limiter,
+                    config_dirty,
+                    running: running_thread,
+                },
             )
-        })
-    {
-        eprintln!("[api] cannot spawn accept thread: {e} — REST API disabled");
-    } else {
-        eprintln!("[api] listening on http://{addr}/api/v1");
+        });
+
+    match spawned {
+        Ok(t) => {
+            eprintln!("[api] listening on http://{addr}/api/v1");
+            (
+                ApiServer {
+                    cmd_tx,
+                    running,
+                    addr,
+                    thread: Some(t),
+                },
+                cmd_rx,
+            )
+        }
+        Err(e) => {
+            eprintln!("[api] cannot spawn accept thread: {e} — REST API disabled");
+            (
+                ApiServer {
+                    cmd_tx,
+                    running: Arc::new(AtomicBool::new(false)),
+                    addr,
+                    thread: None,
+                },
+                cmd_rx,
+            )
+        }
     }
-    cmd_rx
 }
 
-fn accept_loop(
-    listener: TcpListener,
-    snapshot: SharedSnapshot,
-    cmd_tx: SyncSender<ApiCommand>,
-    cfg: SharedConfig,
-    sessions: SessionStore,
-    limiter: Arc<RateLimiter>,
-    config_dirty: ConfigDirtyFlag,
-) {
+fn accept_loop(listener: TcpListener, server_state: ServerState) {
     let in_flight = Arc::new(AtomicUsize::new(0));
-    let server_state = ServerState {
-        snapshot,
-        cmd_tx,
-        cfg,
-        sessions,
-        limiter,
-        config_dirty,
-    };
-    for stream in listener.incoming() {
+    let running = Arc::clone(&server_state.running);
+    // The listener is polled with a timeout so the loop notices a stop
+    // request promptly.  Without it, `accept()` blocks forever and the
+    // port is never released.
+    let _ = listener.set_nonblocking(true);
+    for stream in incoming_until_stopped(&listener, &running) {
         let mut stream = match stream {
             Ok(s) => s,
             Err(e) => {
@@ -165,6 +258,7 @@ fn accept_loop(
             sessions: server_state.sessions.clone(),
             limiter: server_state.limiter.clone(),
             config_dirty: server_state.config_dirty.clone(),
+            running: Arc::clone(&server_state.running),
         };
         // The client identity is the source IP.  `peer_addr` fails only
         // for an unconnected socket, which cannot happen here.
@@ -182,6 +276,44 @@ fn accept_loop(
             in_flight.fetch_sub(1, Ordering::SeqCst);
         }
     }
+}
+
+/// Accept connections until the server is asked to stop.
+///
+/// The listener is non-blocking with a short sleep between polls, so the
+/// stop flag is noticed within a fraction of a second and the socket is
+/// released — the API becomes genuinely unreachable rather than merely
+/// being ignored.
+fn incoming_until_stopped<'a>(
+    listener: &'a TcpListener,
+    running: &'a AtomicBool,
+) -> impl Iterator<Item = std::io::Result<TcpStream>> + 'a {
+    std::iter::from_fn(move || {
+        // Accept one connection, waiting for one to arrive.  The stop
+        // flag is checked on every pass, so the socket is released
+        // promptly when the server is asked to stop.
+        loop {
+            if !running.load(Ordering::SeqCst) {
+                return None;
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // The stream came from a non-blocking listener, so put
+                    // it back into blocking mode — the connection handler
+                    // expects a normal stream.
+                    let _ = stream.set_nonblocking(false);
+                    return Some(Ok(stream));
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Nothing waiting right now.  Sleep briefly and try
+                    // again — returning here would end the iteration and
+                    // the server would stop accepting.
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    })
 }
 
 /// Run `f`, containing any panic it raises.
@@ -2143,6 +2275,45 @@ mod tests {
         assert!(!constant_time_eq(b"secret", b"secre"));
         assert!(!constant_time_eq(b"secret", b"secrets"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    // ── The API server can be stopped and started ──────────────────────
+
+    #[test]
+    fn a_stopped_api_server_releases_the_port() {
+        // Pick a port that is free.
+        let port = 18_099u16;
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let cfg = Arc::new(RwLock::new(Config::default()));
+        let dirty: ConfigDirtyFlag = Arc::new(AtomicBool::new(false));
+
+        let (mut server, _rx) = serve("127.0.0.1", port, snap.clone(), cfg.clone(), dirty.clone());
+        assert!(server.is_running(), "the server should be running");
+
+        // The port must be bound while the server runs.
+        assert!(
+            TcpStream::connect(("127.0.0.1", port)).is_ok(),
+            "the API should be reachable while it is running"
+        );
+
+        // Stopping it must release the port.
+        server.stop();
+        assert!(!server.is_running());
+
+        // Give the OS a moment to release the socket.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            TcpStream::connect(("127.0.0.1", port)).is_err(),
+            "the API must be unreachable once it has been stopped"
+        );
+
+        // And it can be started again on the same port.
+        let (server2, _rx2) = serve("127.0.0.1", port, snap, cfg, dirty.clone());
+        assert!(server2.is_running());
+        assert!(
+            TcpStream::connect(("127.0.0.1", port)).is_ok(),
+            "the API should come back when it is restarted"
+        );
     }
 
     // ── Save / load endpoints ──────────────────────────────────────────
