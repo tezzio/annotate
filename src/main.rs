@@ -97,9 +97,16 @@ fn main() {
     // Create a window we can fall back on if hardware rendering fails.
     // (When CanvasBuilder::build() fails, the window it holds is already consumed,
     // so we need a second window to attempt the software renderer.)
-    let win2 = video
+    //
+    // It is created HIDDEN.  SDL windows are shown by default, so without
+    // this the fallback window appeared as a second, blank window next to
+    // the real one — even though it was only ever used on the machines
+    // where the hardware renderer fails.  It is shown explicitly below, if
+    // it actually has to be used.
+    let mut win2 = video
         .window("Court Annotator", win_w, win_h)
         .position_centered()
+        .hidden()
         .build()
         .expect("fallback window");
 
@@ -116,6 +123,9 @@ fn main() {
                 eprintln!(
                     "[annotator] hardware canvas failed ({reason}), falling back to software"
                 );
+                // This window is the one the user will actually see, so
+                // it has to be shown — it was created hidden.
+                win2.show();
                 let c = win2
                     .into_canvas()
                     .software()
