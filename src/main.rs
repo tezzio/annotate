@@ -292,6 +292,9 @@ fn main() {
     let mut capture_rx: Receiver<Option<Frame>> = capture::null_receiver();
     let mut capture_fps_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let mut capture_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Carries device health events from the capture thread — a device
+    // being unplugged is noticed here.
+    let mut capture_status_rx: Receiver<capture::CaptureStatus> = capture::null_status_receiver();
 
     // ── UI: V2 side-rail layout ──────────────────────────────────────────────
     let mut v2_layout = ui::v2::V2Layout::build(canvas_w as i32, canvas_h as i32);
@@ -495,10 +498,11 @@ fn main() {
                     let dev = &picker.devices[idx - 1];
                     // Use first (best) mode for menu bar quick-switch
                     let mode = dev.modes.first().cloned();
-                    let (rx, fps, stop) = capture::start_capture(dev.path.clone(), mode);
+                    let (rx, fps, stop, status) = capture::start_capture(dev.path.clone(), mode);
                     capture_rx = rx;
                     capture_fps_counter = fps;
                     capture_stop = stop;
+                    capture_status_rx = status;
                     // `input_mode` is authoritative — it always reports the
                     // mode index the capture thread was actually started
                     // with (0 = the "best" mode).
@@ -527,10 +531,11 @@ fn main() {
                 capture_stop.store(true, Ordering::Relaxed);
                 let dev = &picker.devices[dev_idx - 1];
                 let mode = dev.modes.get(mode_idx).cloned();
-                let (rx, fps, stop) = capture::start_capture(dev.path.clone(), mode);
+                let (rx, fps, stop, status) = capture::start_capture(dev.path.clone(), mode);
                 capture_rx = rx;
                 capture_fps_counter = fps;
                 capture_stop = stop;
+                capture_status_rx = status;
             }
             state.input_mode = if dev_idx == 0 { 0 } else { mode_idx };
             menu_bar.active_idx = dev_idx;
@@ -591,13 +596,14 @@ fn main() {
                             last_video_frame = None;
                         } else {
                             let dev = &menu_bar.devices[index - 1];
-                            let (rx, fps, stop) = capture::start_capture(
+                            let (rx, fps, stop, status) = capture::start_capture(
                                 dev.path.clone(),
                                 dev.modes.get(mode).cloned(),
                             );
                             capture_rx = rx;
                             capture_fps_counter = fps;
                             capture_stop = stop;
+                            capture_status_rx = status;
                         }
                         menu_bar.active_idx = index;
                         state.input_mode = mode;
@@ -781,6 +787,44 @@ fn main() {
                     new_video_frame = true;
                 }
             }
+        }
+
+        // ── Capture device health ──────────────────────────────────────────
+        // The capture thread reports when a device is unplugged.  The
+        // device list is re-enumerated so the UI reflects what is
+        // actually plugged in, and the state is published so the API and
+        // the portal can say so too.
+        let mut device_lost = false;
+        while let Ok(status) = capture_status_rx.try_recv() {
+            match status {
+                capture::CaptureStatus::DeviceLost => {
+                    device_lost = true;
+                    eprintln!("[annotator] the capture device was unplugged");
+                }
+                capture::CaptureStatus::Streaming => {
+                    eprintln!("[annotator] the capture device is streaming again");
+                    state.capture_device_present = true;
+                    state.mark_snapshot_dirty();
+                }
+            }
+        }
+        if device_lost {
+            state.capture_device_present = false;
+            // Re-enumerate: the device is gone, and something else may
+            // have been plugged in at the same time.
+            let devices = capture::enumerate_devices();
+            menu_bar.devices = devices.clone();
+            if let Some(picker) = &mut state.device_picker {
+                picker.devices = devices;
+                picker.device_cursor = picker
+                    .device_cursor
+                    .min(picker.devices.len().saturating_sub(1));
+            }
+            // The active index may now point past the end of the list.
+            if menu_bar.active_idx > menu_bar.devices.len() {
+                menu_bar.active_idx = 0;
+            }
+            state.mark_snapshot_dirty();
         }
 
         // ── Fullscreen toggle ──────────────────────────────────────────────
@@ -1780,6 +1824,23 @@ fn make_text_obj(
 mod tests {
     use super::*;
 
+    /// Initialise SDL TTF once for the whole test binary.
+    ///
+    /// `TTF_Init` is not safe to call from several threads at once, and
+    /// the test harness runs tests in parallel — calling it per test
+    /// caused an intermittent SIGSEGV.  A `OnceLock` makes the
+    /// initialisation happen exactly once, and the mutex serialises the
+    /// font loading that follows.
+    fn ttf_context() -> Option<&'static sdl2::ttf::Sdl2TtfContext> {
+        static CONTEXT: std::sync::OnceLock<Option<sdl2::ttf::Sdl2TtfContext>> =
+            std::sync::OnceLock::new();
+        CONTEXT.get_or_init(|| sdl2::ttf::init().ok()).as_ref()
+    }
+
+    /// Serialises the font work — SDL TTF's font objects are not safe to
+    /// create concurrently even once the library is initialised.
+    static FONT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Rasterize a string with the real bundled font.
     ///
     /// SDL TTF needs no window for surface rendering, so this works
@@ -1787,7 +1848,8 @@ mod tests {
     /// than failed — a missing bundled font is an environment problem, not
     /// a logic error.
     fn rasterize(text: &str) -> Option<scene::TextObj> {
-        let ttf = sdl2::ttf::init().ok()?;
+        let ttf = ttf_context()?;
+        let _guard = FONT_LOCK.lock().ok()?;
         let rwops = sdl2::rwops::RWops::from_bytes(FONT_BYTES).ok()?;
         let font = ttf.load_font_from_rwops(rwops, 20).ok()?;
         make_text_obj(text, (10, 20), (255, 0, 0), 20, &font)
@@ -1843,10 +1905,11 @@ mod tests {
         // If the bundled font lost those codepoints the toolbar would
         // render blank boxes — so check that each one resolves to a real
         // glyph with an outline.
-        let Ok(ttf) = sdl2::ttf::init() else {
+        let Some(ttf) = ttf_context() else {
             eprintln!("skipping: SDL TTF unavailable in this environment");
             return;
         };
+        let _guard = FONT_LOCK.lock().ok();
         let Ok(rwops) = sdl2::rwops::RWops::from_bytes(ICON_FONT_BYTES) else {
             eprintln!("skipping: the icon font could not be loaded");
             return;

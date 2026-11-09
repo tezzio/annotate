@@ -326,6 +326,12 @@ pub struct AppState {
     /// Mode index (into the active device's `modes[]`) the capture thread was
     /// started with.  0 = "best" (used by menu-bar quick-switch).
     pub input_mode: usize,
+    /// Whether the capture device is currently plugged in.
+    ///
+    /// Cleared when the capture thread reports the device was lost and
+    /// set again once it streams once more.  Published in the snapshot so
+    /// the API and the portal can tell the user the camera is unplugged.
+    pub capture_device_present: bool,
 
     // Menu bar
     pub pending_menu_click: Option<(i32, i32)>,
@@ -408,6 +414,7 @@ impl AppState {
             scene_changed: false,
             last_autosave: Instant::now(),
             input_mode: 0,
+            capture_device_present: true,
             laser_trail: Vec::new(),
             pending_menu_click: None,
             menu_close_requested: false,
@@ -486,6 +493,7 @@ impl AppState {
             tool_sizes: self.tool_sizes,
             input: active_input,
             input_mode: self.input_mode,
+            capture_device_present: self.capture_device_present,
             inputs,
             freeze: self.freeze_frame,
             fullscreen: self.is_fullscreen,
@@ -549,6 +557,8 @@ pub struct StateSnapshot {
     pub tool_sizes: [u32; 10],
     pub input: usize,
     pub input_mode: usize,
+    /// Whether the capture device is plugged in and streaming.
+    pub capture_device_present: bool,
     pub inputs: Vec<InputInfo>,
     pub freeze: bool,
     pub fullscreen: bool,

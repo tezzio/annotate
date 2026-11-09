@@ -89,16 +89,26 @@ pub struct DeviceInfo {
     pub caps_summary: String,
 }
 
+/// What the capture thread reports back to the main loop.
+///
+/// The capture thread runs on its own, so the main loop cannot see a
+/// device being unplugged until the thread says so.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaptureStatus {
+    /// The device is streaming normally.
+    Streaming,
+    /// The device went away — unplugged, or the driver released it.
+    /// The capture thread keeps retrying and will report `Streaming`
+    /// again once the device comes back.
+    DeviceLost,
+}
+
 // ── Device enumeration ────────────────────────────────────────────────────────
 
 /// List all `/dev/video*` devices that can be opened and queried.
 pub fn enumerate_devices() -> Vec<DeviceInfo> {
     let mut devices = Vec::new();
-    for i in 0..16 {
-        let path = PathBuf::from(format!("/dev/video{i}"));
-        if !path.exists() {
-            continue;
-        }
+    for path in video_device_paths() {
         if let Ok(dev) = Device::with_path(&path)
             && let Ok(caps) = dev.query_caps()
         {
@@ -123,6 +133,35 @@ pub fn enumerate_devices() -> Vec<DeviceInfo> {
         }
     }
     devices
+}
+
+/// Every `/dev/video*` node that currently exists.
+///
+/// The directory is scanned rather than probing a fixed range: a device
+/// plugged in after startup often gets a higher number than any that was
+/// present at boot, so a fixed range would miss it.  The results are
+/// sorted by number so the device order is stable.
+fn video_device_paths() -> Vec<PathBuf> {
+    let mut paths: Vec<(u32, PathBuf)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/dev") else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(number) = name.strip_prefix("video") else {
+            continue;
+        };
+        let Ok(number) = number.parse::<u32>() else {
+            continue;
+        };
+        let path = PathBuf::from("/dev").join(name);
+        if path.exists() {
+            paths.push((number, path));
+        }
+    }
+    paths.sort_by_key(|(n, _)| *n);
+    paths.into_iter().map(|(_, p)| p).collect()
 }
 
 /// Query all usable capture modes for a device without starting a stream.
@@ -236,20 +275,42 @@ fn estimate_fps(is_mjpeg: bool, w: u32, h: u32) -> u32 {
 ///
 /// Returns a `Receiver` plus an `Arc<AtomicU32>` that the capture thread updates
 /// every second with the current capture fps (stored as fps × 10, e.g. 299 = 29.9 fps).
+/// Start a capture thread and report device health back to the caller.
+///
+/// The fourth return value carries [`CaptureStatus`] events: the main
+/// loop watches it to learn that a device was unplugged, so it can tell
+/// the user and refresh the device list.
 pub fn start_capture(
     device_path: PathBuf,
     mode: Option<CapMode>,
-) -> (Receiver<Option<Frame>>, Arc<AtomicU32>, Arc<AtomicBool>) {
+) -> (
+    Receiver<Option<Frame>>,
+    Arc<AtomicU32>,
+    Arc<AtomicBool>,
+    Receiver<CaptureStatus>,
+) {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
     let (tx, rx): (SyncSender<Option<Frame>>, Receiver<Option<Frame>>) = sync_channel(1);
     let fps_counter = Arc::new(AtomicU32::new(0));
     let fps_counter_thread = Arc::clone(&fps_counter);
+    // The status channel is lossy on purpose: only the *latest* status
+    // matters, and a full channel must never block the capture thread.
+    let (status_tx, status_rx) = sync_channel(1);
     // Named thread for `htop` / `top` / crash diagnostics.
     let _ = thread::Builder::new()
         .name("v4l-capture".into())
-        .spawn(move || capture_loop(device_path, mode, tx, fps_counter_thread, stop_thread));
-    (rx, fps_counter, stop)
+        .spawn(move || {
+            capture_loop(
+                device_path,
+                mode,
+                tx,
+                fps_counter_thread,
+                stop_thread,
+                status_tx,
+            )
+        });
+    (rx, fps_counter, stop, status_rx)
 }
 
 /// Returns a null receiver that always yields `None` (black screen mode).
@@ -257,6 +318,15 @@ pub fn null_receiver() -> Receiver<Option<Frame>> {
     let (tx, rx) = sync_channel(1);
     // Send one None so the first recv() doesn't block
     let _ = tx.send(None);
+    rx
+}
+
+/// A status receiver that never reports anything.
+///
+/// Used when no capture thread is running — the "no input" black-screen
+/// mode has no device to lose.
+pub fn null_status_receiver() -> Receiver<CaptureStatus> {
+    let (_tx, rx) = sync_channel(1);
     rx
 }
 
@@ -388,6 +458,7 @@ fn capture_loop(
     tx: SyncSender<Option<Frame>>,
     fps_out: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
+    status_tx: SyncSender<CaptureStatus>,
 ) {
     let debug = std::env::var("ANNOTATOR_DEBUG").is_ok();
 
@@ -404,6 +475,20 @@ fn capture_loop(
     let mut prefer_yuyv = user_mode.as_ref().map(|m| !m.is_mjpeg).unwrap_or(false);
     let mut first_attempt = true;
 
+    // Whether the device was streaming the last time we looked.  Used to
+    // report each transition exactly once, so the main loop does not see a
+    // stream of identical "lost" events while a device stays unplugged.
+    let mut was_streaming = false;
+
+    // Consecutive open failures — used to throttle the log so a device
+    // that stays unplugged does not flood the console.
+    let mut open_failures: u32 = 0;
+
+    // Whether the "device is not there" condition has already been
+    // reported.  Reset once the device streams, so a device that is
+    // unplugged again reports the loss afresh.
+    let mut loss_reported = false;
+
     'restart: loop {
         // Re-open the device on each attempt.  If the previous capture thread is still
         // releasing its V4L2 streaming session, VIDIOC_S_FMT or VIDIOC_STREAMON will
@@ -415,11 +500,38 @@ fn capture_loop(
         let dev = match Device::with_path(&path) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("capture: open {}: {e}, retrying...", path.display());
+                // The device cannot be opened.  Either it was streaming
+                // a moment ago and has just been unplugged, or it was
+                // never there — both are "the device is not there", and
+                // both are worth telling the main loop about, but only
+                // once each.
+                if is_device_gone(&e) {
+                    if was_streaming {
+                        eprintln!("capture: device lost: {} ({e})", path.display());
+                        was_streaming = false;
+                        loss_reported = false;
+                    }
+                    if !loss_reported {
+                        eprintln!("capture: no such device: {} ({e})", path.display());
+                        loss_reported = true;
+                        let _ = status_tx.try_send(CaptureStatus::DeviceLost);
+                    }
+                }
+                // Only log the first failure and then once every few
+                // seconds — a device that stays unplugged would
+                // otherwise flood the console at 6 lines a second.
+                if open_failures == 0 || open_failures.is_multiple_of(20) {
+                    eprintln!("capture: open {}: {e}, retrying...", path.display());
+                }
+                open_failures += 1;
                 thread::sleep(Duration::from_millis(150));
                 continue 'restart;
             }
         };
+
+        if open_failures > 0 {
+            open_failures = 0;
+        }
 
         let fmt = match negotiate_format(
             &dev,
@@ -468,12 +580,28 @@ fn capture_loop(
         let mut stream = match MmapStream::with_buffers(&dev, Type::VideoCapture, 8) {
             Ok(s) => s,
             Err(e) => {
+                // The device opened but streaming failed.  That is usually
+                // a busy device (the previous session is still being
+                // released) — but it is also what a device that was
+                // unplugged mid-session looks like.
+                if was_streaming && is_device_gone(&e) {
+                    was_streaming = false;
+                    eprintln!("capture: device lost: {} ({e})", path.display());
+                    let _ = status_tx.try_send(CaptureStatus::DeviceLost);
+                }
                 eprintln!("capture: stream start failed (device busy?): {e}, retrying...");
                 thread::sleep(Duration::from_millis(150));
                 continue 'restart;
             }
         };
         first_attempt = false;
+
+        // The device is streaming again.
+        if !was_streaming {
+            was_streaming = true;
+            loss_reported = false;
+            let _ = status_tx.try_send(CaptureStatus::Streaming);
+        }
 
         // ── Buffer ring ─────────────────────────────────────────────────────
         // Per-frame `Vec<u8>` allocation is a measurable cost at high
@@ -502,6 +630,17 @@ fn capture_loop(
                     // If the receiver is gone, stop
                     if tx.try_send(None).is_err() {
                         return;
+                    }
+                    // A device that was unplugged mid-session makes the
+                    // stream fail.  Report the loss once and restart the
+                    // device, so it comes back by itself when replugged.
+                    if was_streaming && is_device_gone(&e) {
+                        was_streaming = false;
+                        eprintln!("capture: device lost mid-stream: {} ({e})", path.display());
+                        let _ = status_tx.try_send(CaptureStatus::DeviceLost);
+                        drop(stream);
+                        thread::sleep(Duration::from_millis(150));
+                        continue 'restart;
                     }
                     thread::sleep(Duration::from_millis(100));
                     continue;
@@ -568,6 +707,36 @@ fn capture_loop(
             }
         } // inner loop
     } // 'restart loop
+}
+
+/// True when an error means "the device is gone" rather than "the device
+/// is busy".
+///
+/// A USB capture device that is unplugged can surface in several ways:
+///
+/// * `ENOENT` — the device node was removed.  This is the common case:
+///   udev removes `/dev/videoN` when the hardware goes away.
+/// * `ENODEV` — the node is there but the driver has no device behind it.
+/// * `ENXIO` — the node is there but the hardware is not responding.
+///
+/// A device that is merely busy — because the previous session is still
+/// being released — returns `EBUSY`, and retrying in a moment fixes it.
+///
+/// Distinguishing the two matters: a gone device means the user unplugged
+/// something and the UI should say so, while `EBUSY` is a transient that
+/// should be ridden out silently.
+fn is_device_gone(e: &std::io::Error) -> bool {
+    if let Some(code) = e.raw_os_error()
+        && (code == libc::ENOENT || code == libc::ENODEV || code == libc::ENXIO)
+    {
+        return true;
+    }
+    // Some drivers report the loss through the V4L2 layer instead, which
+    // surfaces as a plain message rather than an errno.
+    let text = e.to_string().to_ascii_lowercase();
+    text.contains("no such device")
+        || text.contains("enodev")
+        || text.contains("no such file or directory")
 }
 
 // ── MJPEG decode (pure Rust, no libjpeg) ─────────────────────────────────────
@@ -658,4 +827,105 @@ pub fn save_screenshot(
         return Some("/tmp/annotator_screenshot.png".to_string());
     }
     None
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_device_is_recognised() {
+        // The errno the kernel returns when a USB device is unplugged.
+        // udev removes the device node, so ENOENT is the common case.
+        let e = std::io::Error::from_raw_os_error(libc::ENOENT);
+        assert!(is_device_gone(&e));
+
+        // The node is there but the driver has no device behind it.
+        let e = std::io::Error::from_raw_os_error(libc::ENODEV);
+        assert!(is_device_gone(&e));
+
+        // The node is there but the hardware is not responding.
+        let e = std::io::Error::from_raw_os_error(libc::ENXIO);
+        assert!(is_device_gone(&e));
+    }
+
+    #[test]
+    fn a_busy_device_is_not_treated_as_gone() {
+        // EBUSY means the previous session is still being released — a
+        // transient that a retry fixes, not a lost device.
+        let e = std::io::Error::from_raw_os_error(libc::EBUSY);
+        assert!(!is_device_gone(&e));
+
+        let e = std::io::Error::from_raw_os_error(libc::EAGAIN);
+        assert!(!is_device_gone(&e));
+
+        let e = std::io::Error::from_raw_os_error(libc::EINVAL);
+        assert!(!is_device_gone(&e));
+
+        let e = std::io::Error::from_raw_os_error(libc::EIO);
+        assert!(!is_device_gone(&e));
+    }
+
+    #[test]
+    fn other_io_errors_are_not_treated_as_gone() {
+        assert!(!is_device_gone(&std::io::Error::other("something else")));
+        assert!(!is_device_gone(&std::io::Error::other(
+            "the device is busy"
+        )));
+    }
+
+    #[test]
+    fn the_null_status_receiver_never_reports() {
+        let rx = null_status_receiver();
+        // Nothing to report — the receiver is empty and stays that way.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_capture_status_distinguishes_the_two_states() {
+        assert_ne!(CaptureStatus::Streaming, CaptureStatus::DeviceLost);
+        assert_eq!(CaptureStatus::Streaming, CaptureStatus::Streaming);
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    /// A capture thread on a device that does not exist must report the
+    /// device as lost once, and keep retrying rather than giving up.
+    ///
+    /// This is the hot-plug path: the device is unplugged, the thread
+    /// notices, tells the main loop, and stays alive so the device comes
+    /// back when it is replugged.
+    #[test]
+    fn a_missing_device_is_reported_once_and_the_thread_keeps_retrying() {
+        // A path that cannot exist as a V4L2 device.
+        let missing = PathBuf::from("/dev/annotator-no-such-video-device");
+
+        let (rx, _fps, stop, status) = start_capture(missing.clone(), None);
+
+        // The thread should report the loss.
+        let reported = status
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the capture thread must report the lost device");
+        assert_eq!(reported, CaptureStatus::DeviceLost);
+
+        // It must not then keep spamming the status channel.
+        assert!(
+            status
+                .recv_timeout(std::time::Duration::from_millis(400))
+                .is_err(),
+            "the loss must be reported once, not repeatedly"
+        );
+
+        // And it must still be running, so a replugged device reconnects.
+        assert!(!stop.load(Ordering::Relaxed));
+        drop(rx);
+
+        // Shut it down.
+        stop.store(true, Ordering::Relaxed);
+    }
 }

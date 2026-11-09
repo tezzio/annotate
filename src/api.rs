@@ -631,6 +631,7 @@ fn route(
                 ApiPayload::Ok(serde_json::json!({
                     "active": snap.input,
                     "input_mode": snap.input_mode,
+                    "device_present": snap.capture_device_present,
                     "mode_label": snap
                         .inputs
                         .get(snap.input)
@@ -747,13 +748,14 @@ fn reply_err(status: u16, msg: &str, text_mode: bool) -> (u16, String, &'static 
 /// common case with a single line match; the remaining fields follow.
 fn text_state(snap: &StateSnapshot) -> String {
     let mut out = format!(
-        "OK tool={} color={} size={} input={} input_mode={} freeze={}\n",
+        "OK tool={} color={} size={} input={} input_mode={} freeze={} device_present={}\n",
         snap.tool,
         snap.color,
         snap.brush_size,
         snap.input,
         snap.input_mode,
         u8::from(snap.freeze),
+        u8::from(snap.capture_device_present),
     );
     out.push_str(&format!(
         "OK objects={} can_undo={} can_redo={} selected={} drawing={}\n",
@@ -795,10 +797,11 @@ fn text_state(snap: &StateSnapshot) -> String {
 /// follows per device.
 fn text_inputs(snap: &StateSnapshot) -> String {
     let mut out = format!(
-        "OK active={} input_mode={} count={}\n",
+        "OK active={} input_mode={} count={} device_present={}\n",
         snap.input,
         snap.input_mode,
-        snap.inputs.len()
+        snap.inputs.len(),
+        u8::from(snap.capture_device_present),
     );
     for i in &snap.inputs {
         out.push_str(&format!("input={}:{}\n", i.index, i.name));
@@ -1157,6 +1160,9 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
                 </p>
 
                 <h2 class="text-xl font-semibold border-b border-gray-700 pb-2">Status</h2>
+                <p id="device-warning" class="hidden bg-yellow-600 text-gray-900 px-3 py-2 rounded text-sm font-medium">
+                    The capture device is unplugged. Plug it back in and it will reconnect automatically.
+                </p>
                 <div class="grid grid-cols-2 gap-4 text-sm">
                     <div class="bg-gray-700 p-3 rounded">
                         <span class="text-gray-400">FPS:</span> <span id="fps-display">--</span>
@@ -1303,6 +1309,11 @@ const PORTAL_HTML: &str = r#"<!DOCTYPE html>
             freezeBtn.classList.toggle('bg-green-600', !!state.freeze);
             freezeBtn.classList.toggle('hover:bg-blue-700', !state.freeze);
             freezeBtn.classList.toggle('hover:bg-green-700', !!state.freeze);
+        }
+        // Warn when the capture device has been unplugged.
+        const warn = document.getElementById('device-warning');
+        if (warn) {
+            warn.classList.toggle('hidden', state.capture_device_present !== false);
         }
         // Update the undo/redo button availability
         const undoBtn = document.getElementById('btn-undo');
