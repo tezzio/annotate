@@ -41,7 +41,7 @@ use ui::{
 // ── Embedded fonts ────────────────────────────────────────────────────────────
 
 const FONT_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/DejaVuSans.ttf"));
-const ICON_FONT_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa-solid.otf"));
+const ICON_FONT_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fa-solid.ttf"));
 
 // ── Per-thread scratch buffers ─────────────────────────────────────────────────
 // `Vec<Point>` allocations inside the render loop (eraser preview,
@@ -1835,6 +1835,54 @@ mod tests {
         assert_eq!(bh as u32, obj.bitmap_height);
         assert_eq!(bx, obj.x);
         assert_eq!(by, obj.y);
+    }
+
+    #[test]
+    fn the_icon_font_renders_the_toolbar_glyphs() {
+        // The toolbar draws Font Awesome icons from the Private Use Area.
+        // If the bundled font lost those codepoints the toolbar would
+        // render blank boxes — so check that each one resolves to a real
+        // glyph with an outline.
+        let Ok(ttf) = sdl2::ttf::init() else {
+            eprintln!("skipping: SDL TTF unavailable in this environment");
+            return;
+        };
+        let Ok(rwops) = sdl2::rwops::RWops::from_bytes(ICON_FONT_BYTES) else {
+            eprintln!("skipping: the icon font could not be loaded");
+            return;
+        };
+        let Ok(font) = ttf.load_font_from_rwops(rwops, 22) else {
+            eprintln!("skipping: the icon font could not be loaded");
+            return;
+        };
+
+        // Every codepoint the toolbar and the V2 rail use.
+        let codepoints = [
+            0xF04B, // freeze: pause
+            0xF04C, // freeze: play
+            0xF03D, // camera
+            0xF030, // screenshot
+            0xF040, // pen / highlight
+            0xF068, // line
+            0xF03C, // rectangle
+            0xF111, // circle
+            0xF061, // arrow
+            0xF031, // text
+            0xF0C9, // select
+            0xF12A, // eraser
+            0xF0FB, // laser
+        ];
+        for cp in codepoints {
+            let ch = char::from_u32(cp).expect("valid codepoint");
+            let surface = font
+                .render(&ch.to_string())
+                .blended(sdl2::pixels::Color::RGB(255, 255, 255))
+                .expect("the codepoint must resolve to a glyph");
+            assert!(
+                surface.width() > 0 && surface.height() > 0,
+                "U+{cp:04X} rendered as an empty box — the icon font is missing it"
+            );
+        }
     }
 
     #[test]
