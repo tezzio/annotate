@@ -1055,6 +1055,7 @@ impl Toggle {
 }
 
 pub struct OverlaySettings {
+    /// Index of the selected row within [`OverlaySettings::ROWS`].
     pub cursor: usize,
     pub laser_fade: f32,
     pub laser_on: Toggle,
@@ -1063,12 +1064,85 @@ pub struct OverlaySettings {
     pub hide_toolbar: Toggle,
     pub fullscreen: Toggle,
     pub undo_limit: usize,
+    /// Whether the REST API is enabled.  Toggling this stops or starts
+    /// the server, so it takes effect immediately.
+    pub api_enabled: Toggle,
+    /// The API's bind address and port, shown alongside the toggle.
+    pub api_addr: String,
+    /// The network addresses of this machine, with how each was
+    /// obtained.  Refreshed when the panel is opened.
+    pub network: Vec<crate::net::InterfaceAddr>,
     /// Renderer name (e.g. "hardware (accelerated)" / "software (fallback)").
     /// Populated at startup for diagnostics; not currently rendered in
     /// the settings panel but kept so operators can `grep` it from logs.
     #[allow(dead_code)]
     pub renderer_info: String,
     pub scroll_offset: usize,
+}
+
+/// One line in the settings panel.
+///
+/// The panel is a flat list of rows so the keyboard navigation, the
+/// scrolling and the hit-testing stay simple, but each row knows which
+/// section it belongs to so the panel can draw the headings.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SettingsRow {
+    /// A section heading — not selectable.
+    Section(SettingsSection),
+    /// Laser fade duration.
+    LaserFade,
+    /// Laser pointer on/off.
+    LaserOn,
+    /// Show the FPS counter.
+    ShowFps,
+    /// Show the clock.
+    ShowTime,
+    /// Hide the tool rail.
+    HideToolbar,
+    /// Undo stack depth.
+    UndoLimit,
+    /// Fullscreen toggle.
+    Fullscreen,
+    /// Enable or disable the REST API.
+    ApiEnabled,
+    /// A read-only line showing the network addresses.
+    Network,
+}
+
+/// The sections of the settings panel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SettingsSection {
+    Display,
+    Annotation,
+    Network,
+}
+
+impl SettingsSection {
+    pub fn title(self) -> &'static str {
+        match self {
+            SettingsSection::Display => "DISPLAY",
+            SettingsSection::Annotation => "ANNOTATION",
+            SettingsSection::Network => "NETWORK",
+        }
+    }
+}
+
+impl OverlaySettings {
+    /// The rows of the panel, in order.
+    pub const ROWS: &'static [SettingsRow] = &[
+        SettingsRow::Section(SettingsSection::Display),
+        SettingsRow::ShowFps,
+        SettingsRow::ShowTime,
+        SettingsRow::HideToolbar,
+        SettingsRow::Fullscreen,
+        SettingsRow::Section(SettingsSection::Annotation),
+        SettingsRow::LaserOn,
+        SettingsRow::LaserFade,
+        SettingsRow::UndoLimit,
+        SettingsRow::Section(SettingsSection::Network),
+        SettingsRow::ApiEnabled,
+        SettingsRow::Network,
+    ];
 }
 
 impl OverlaySettings {
@@ -1080,12 +1154,11 @@ impl OverlaySettings {
     const SLIDER_MAX: f32 = 3.0;
     const UNDO_MIN: usize = 5;
     const UNDO_MAX: usize = 100;
-    const COUNT: usize = 7;
 
     fn visible_rows(&self, canvas_h: i32) -> usize {
         let avail_h = canvas_h - 40;
         let max_vis = ((avail_h - Self::HEADER_H - Self::FOOTER_H) / Self::ROW_H).max(1) as usize;
-        Self::COUNT.min(max_vis)
+        Self::ROWS.len().min(max_vis)
     }
 
     fn panel_h(&self, canvas_h: i32) -> i32 {
@@ -1110,17 +1183,27 @@ impl OverlaySettings {
     }
 
     pub fn move_down(&mut self, canvas_h: i32) {
-        if self.cursor + 1 < Self::COUNT {
-            self.cursor += 1;
+        // Section headings are not selectable, so the cursor skips them.
+        let mut next = self.cursor + 1;
+        while next < Self::ROWS.len() && matches!(Self::ROWS[next], SettingsRow::Section(_)) {
+            next += 1;
+        }
+        if next < Self::ROWS.len() {
+            self.cursor = next;
             self.scroll_to_cursor(canvas_h);
         }
     }
 
     pub fn move_up(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-            if self.cursor < self.scroll_offset {
-                self.scroll_offset = self.cursor;
+        let mut prev = self.cursor;
+        while prev > 0 {
+            prev -= 1;
+            if !matches!(Self::ROWS[prev], SettingsRow::Section(_)) {
+                self.cursor = prev;
+                if self.cursor < self.scroll_offset {
+                    self.scroll_offset = self.cursor;
+                }
+                return;
             }
         }
     }
@@ -1133,8 +1216,8 @@ impl OverlaySettings {
     }
 
     pub fn adjust(&mut self, right: bool) -> bool {
-        match self.cursor {
-            0 => {
+        match Self::ROWS[self.cursor] {
+            SettingsRow::LaserFade => {
                 let step = 0.1;
                 if right {
                     self.laser_fade = (self.laser_fade + step).min(Self::SLIDER_MAX);
@@ -1144,23 +1227,23 @@ impl OverlaySettings {
                 self.laser_fade = (self.laser_fade * 10.0).round() / 10.0;
                 true
             }
-            1 => {
+            SettingsRow::LaserOn => {
                 self.laser_on.next();
                 true
             }
-            2 => {
+            SettingsRow::ShowFps => {
                 self.show_fps.next();
                 true
             }
-            3 => {
+            SettingsRow::ShowTime => {
                 self.show_time.next();
                 true
             }
-            4 => {
+            SettingsRow::HideToolbar => {
                 self.hide_toolbar.next();
                 true
             }
-            5 => {
+            SettingsRow::UndoLimit => {
                 let step = 5;
                 if right {
                     self.undo_limit = self.undo_limit.saturating_add(step).min(Self::UNDO_MAX);
@@ -1169,17 +1252,22 @@ impl OverlaySettings {
                 }
                 true
             }
-            6 => {
+            SettingsRow::Fullscreen => {
                 self.fullscreen.next();
                 true
             }
-            _ => false,
+            SettingsRow::ApiEnabled => {
+                self.api_enabled.next();
+                true
+            }
+            // The network line is read-only.
+            SettingsRow::Section(_) | SettingsRow::Network => false,
         }
     }
 
     pub fn enter(&mut self) -> OverlayAction {
-        match self.cursor {
-            6 => OverlayAction::ToggleFullscreen,
+        match Self::ROWS[self.cursor] {
+            SettingsRow::Fullscreen => OverlayAction::ToggleFullscreen,
             _ => OverlayAction::None,
         }
     }
@@ -1205,7 +1293,12 @@ impl OverlaySettings {
 
         let rel_y = my - (pr.y + Self::HEADER_H);
         let clicked_row = (rel_y / Self::ROW_H) as usize + self.scroll_offset;
-        if clicked_row >= Self::COUNT {
+        if clicked_row >= Self::ROWS.len() {
+            return OverlayAction::None;
+        }
+
+        // A section heading is not a row that can be selected.
+        if matches!(Self::ROWS[clicked_row], SettingsRow::Section(_)) {
             return OverlayAction::None;
         }
 
@@ -1222,6 +1315,12 @@ impl OverlaySettings {
         OverlayAction::None
     }
 
+    /// Draw the settings panel.
+    ///
+    /// The rows come from [`OverlaySettings::ROWS`], so the drawing and
+    /// the navigation cannot drift apart.  Each row knows whether it is
+    /// a section heading, a toggle, a slider, or the read-only network
+    /// listing.
     pub fn draw(
         &self,
         sdl: &mut SdlCanvas<Window>,
@@ -1247,7 +1346,7 @@ impl OverlaySettings {
 
         let tc = sdl.texture_creator();
 
-        // Header
+        // ── Header ────────────────────────────────────────────────────────
         render_text(
             sdl,
             font,
@@ -1277,296 +1376,430 @@ impl OverlaySettings {
             cr,
         );
 
-        // Rows
+        // ── Rows ──────────────────────────────────────────────────────────
+        let label_x = px + 16;
+        let val_x = px + 220;
+        let val_w = pw - 220 - 16;
+
         for vi in 0..vis {
             let i = self.scroll_offset + vi;
+            let Some(&row) = Self::ROWS.get(i) else {
+                break;
+            };
             let ry = self.row_y(canvas_h, vi);
-            let is_sel = i == self.cursor;
-            let row_rect = Rect::new(px + 8, ry, (pw - 16) as u32, (Self::ROW_H - 4) as u32);
 
-            if is_sel {
-                sdl.set_draw_color(Color::RGB(0x2a, 0x3a, 0x5a));
-                sdl.fill_rect(row_rect).ok();
-                sdl.set_draw_color(Color::RGB(0x4a, 0x9e, 0xff));
-                sdl.draw_rect(row_rect).ok();
-            }
+            match row {
+                SettingsRow::Section(section) => {
+                    // A heading — a dimmed label with a rule under it.
+                    render_text(
+                        sdl,
+                        font,
+                        &tc,
+                        cache,
+                        section.title(),
+                        Color::RGB(0x70, 0x90, 0xb0),
+                        Rect::new(label_x, ry + 10, 300, 20),
+                    );
+                    sdl.set_draw_color(Color::RGB(0x2c, 0x2c, 0x2c));
+                    sdl.draw_line(
+                        (label_x, ry + Self::ROW_H - 14),
+                        (px + pw - 16, ry + Self::ROW_H - 14),
+                    )
+                    .ok();
+                }
+                _ => {
+                    let is_sel = i == self.cursor;
+                    let row_rect =
+                        Rect::new(px + 8, ry, (pw - 16) as u32, (Self::ROW_H - 4) as u32);
 
-            let label_col = if is_sel {
-                Color::RGB(255, 255, 255)
-            } else {
-                Color::RGB(170, 170, 170)
-            };
-            let val_col = if is_sel {
-                Color::RGB(140, 210, 255)
-            } else {
-                Color::RGB(120, 120, 120)
-            };
-            let label_x = px + 16;
-            let val_x = px + 220;
-            let val_w = pw - 220 - 16;
+                    if is_sel {
+                        sdl.set_draw_color(Color::RGB(0x2a, 0x3a, 0x5a));
+                        sdl.fill_rect(row_rect).ok();
+                        sdl.set_draw_color(Color::RGB(0x4a, 0x9e, 0xff));
+                        sdl.draw_rect(row_rect).ok();
+                    }
 
-            match i {
-                0 => {
-                    render_text(
-                        sdl,
-                        font,
-                        &tc,
-                        cache,
-                        "Laser fade",
-                        label_col,
-                        Rect::new(label_x, ry + 4, 200, 24),
-                    );
-                    let bar_x = val_x;
-                    let bar_y = ry + 24;
-                    let bar_w = val_w - 80;
-                    let bar_h = 16;
-                    let t = (self.laser_fade - Self::SLIDER_MIN)
-                        / (Self::SLIDER_MAX - Self::SLIDER_MIN);
-                    let fill_w = (t * bar_w as f32) as i32;
-                    sdl.set_draw_color(Color::RGB(0x33, 0x33, 0x33));
-                    sdl.fill_rect(Rect::new(bar_x, bar_y, bar_w as u32, bar_h as u32))
-                        .ok();
-                    sdl.set_draw_color(if is_sel {
-                        Color::RGB(0x4a, 0x9e, 0xff)
+                    let label_col = if is_sel {
+                        Color::RGB(255, 255, 255)
                     } else {
-                        Color::RGB(0x55, 0x55, 0x55)
-                    });
-                    sdl.fill_rect(Rect::new(bar_x, bar_y, fill_w as u32, bar_h as u32))
-                        .ok();
-                    let val_str = format!("{:.1}s", self.laser_fade);
-                    render_text(
-                        sdl,
-                        font,
-                        &tc,
-                        cache,
-                        &val_str,
-                        val_col,
-                        Rect::new(bar_x + bar_w + 4, bar_y - 4, 72, bar_h as u32 + 8),
+                        Color::RGB(170, 170, 170)
+                    };
+                    let val_col = if is_sel {
+                        Color::RGB(140, 210, 255)
+                    } else {
+                        Color::RGB(120, 120, 120)
+                    };
+
+                    self.draw_row(
+                        sdl, font, &tc, cache, row, label_x, val_x, val_w, ry, label_col, val_col,
+                        is_sel,
                     );
                 }
-                1 => {
-                    render_text(
-                        sdl,
-                        font,
-                        &tc,
-                        cache,
-                        "Laser pointer",
-                        label_col,
-                        Rect::new(label_x, ry + 4, 200, 24),
-                    );
-                    let on_str = if self.laser_on == Toggle::On {
-                        "ON"
-                    } else {
-                        "OFF"
-                    };
-                    let on_col = if self.laser_on == Toggle::On {
-                        Color::RGB(80, 220, 80)
-                    } else {
-                        Color::RGB(180, 80, 80)
-                    };
-                    render_text(
-                        sdl,
-                        font,
-                        &tc,
-                        cache,
-                        on_str,
-                        on_col,
-                        Rect::new(val_x, ry + 4, 80, 24),
-                    );
-                    render_text(
-                        sdl,
-                        font,
-                        &tc,
-                        cache,
-                        "use L key",
-                        Color::RGB(90, 90, 90),
-                        Rect::new(val_x, ry + 28, 200, 18),
-                    );
-                }
-                2 => {
-                    render_text(
-                        sdl,
-                        font,
-                        &tc,
-                        cache,
-                        "Show FPS",
-                        label_col,
-                        Rect::new(label_x, ry + 4, 200, 24),
-                    );
-                    let on_str = if self.show_fps == Toggle::On {
-                        "ON"
-                    } else {
-                        "OFF"
-                    };
-                    let on_col = if self.show_fps == Toggle::On {
-                        Color::RGB(80, 220, 80)
-                    } else {
-                        Color::RGB(180, 80, 80)
-                    };
-                    render_text(
-                        sdl,
-                        font,
-                        &tc,
-                        cache,
-                        on_str,
-                        on_col,
-                        Rect::new(val_x, ry + 4, 80, 24),
-                    );
-                }
-                3 => {
-                    render_text(
-                        sdl,
-                        font,
-                        &tc,
-                        cache,
-                        "Show time",
-                        label_col,
-                        Rect::new(label_x, ry + 4, 200, 24),
-                    );
-                    let on_str = if self.show_time == Toggle::On {
-                        "ON"
-                    } else {
-                        "OFF"
-                    };
-                    let on_col = if self.show_time == Toggle::On {
-                        Color::RGB(80, 220, 80)
-                    } else {
-                        Color::RGB(180, 80, 80)
-                    };
-                    render_text(
-                        sdl,
-                        font,
-                        &tc,
-                        cache,
-                        on_str,
-                        on_col,
-                        Rect::new(val_x, ry + 4, 80, 24),
-                    );
-                }
-                4 => {
-                    render_text(
-                        sdl,
-                        font,
-                        &tc,
-                        cache,
-                        "Hide toolbar",
-                        label_col,
-                        Rect::new(label_x, ry + 4, 200, 24),
-                    );
-                    let on_str = if self.hide_toolbar == Toggle::On {
-                        "ON"
-                    } else {
-                        "OFF"
-                    };
-                    let on_col = if self.hide_toolbar == Toggle::On {
-                        Color::RGB(80, 220, 80)
-                    } else {
-                        Color::RGB(180, 80, 80)
-                    };
-                    render_text(
-                        sdl,
-                        font,
-                        &tc,
-                        cache,
-                        on_str,
-                        on_col,
-                        Rect::new(val_x, ry + 4, 80, 24),
-                    );
-                }
-                5 => {
-                    render_text(
-                        sdl,
-                        font,
-                        &tc,
-                        cache,
-                        "Undo depth",
-                        label_col,
-                        Rect::new(label_x, ry + 4, 200, 24),
-                    );
-                    let bar_x = val_x;
-                    let bar_y = ry + 24;
-                    let bar_w = val_w - 80;
-                    let bar_h = 16;
-                    let t = (self.undo_limit as f32 - Self::UNDO_MIN as f32)
-                        / (Self::UNDO_MAX as f32 - Self::UNDO_MIN as f32);
-                    let fill_w = (t * bar_w as f32) as i32;
-                    sdl.set_draw_color(Color::RGB(0x33, 0x33, 0x33));
-                    sdl.fill_rect(Rect::new(bar_x, bar_y, bar_w as u32, bar_h as u32))
-                        .ok();
-                    sdl.set_draw_color(if is_sel {
-                        Color::RGB(0x4a, 0x9e, 0xff)
-                    } else {
-                        Color::RGB(0x55, 0x55, 0x55)
-                    });
-                    sdl.fill_rect(Rect::new(bar_x, bar_y, fill_w as u32, bar_h as u32))
-                        .ok();
-                    let val_str = self.undo_limit.to_string();
-                    render_text(
-                        sdl,
-                        font,
-                        &tc,
-                        cache,
-                        &val_str,
-                        val_col,
-                        Rect::new(bar_x + bar_w + 4, bar_y - 4, 72, bar_h as u32 + 8),
-                    );
-                }
-                6 => {
-                    render_text(
-                        sdl,
-                        font,
-                        &tc,
-                        cache,
-                        "Fullscreen",
-                        label_col,
-                        Rect::new(label_x, ry + 4, 200, 24),
-                    );
-                    let on_str = if self.fullscreen == Toggle::On {
-                        "ON"
-                    } else {
-                        "OFF"
-                    };
-                    let on_col = if self.fullscreen == Toggle::On {
-                        Color::RGB(80, 220, 80)
-                    } else {
-                        Color::RGB(180, 80, 80)
-                    };
-                    render_text(
-                        sdl,
-                        font,
-                        &tc,
-                        cache,
-                        on_str,
-                        on_col,
-                        Rect::new(val_x, ry + 4, 80, 24),
-                    );
-                    render_text(
-                        sdl,
-                        font,
-                        &tc,
-                        cache,
-                        "or press F",
-                        Color::RGB(90, 90, 90),
-                        Rect::new(val_x, ry + 28, 200, 18),
-                    );
-                }
-                _ => {}
             }
         }
 
-        // Footer
+        // ── Footer ────────────────────────────────────────────────────────
+        let fy = py + pr.height() as i32 - Self::FOOTER_H;
         sdl.set_draw_color(Color::RGB(0x33, 0x33, 0x33));
-        let footer_y = py + pr.height() as i32 - Self::FOOTER_H;
-        sdl.draw_line((px, footer_y), (px + pw, footer_y)).ok();
+        sdl.draw_line((px, fy), (px + pw, fy)).ok();
         render_text(
             sdl,
             font,
             &tc,
             cache,
-            "\u{2191}\u{2193} navigate   \u{2190}\u{2192} adjust   Enter confirm   Esc close",
+            "\u{2191}\u{2193} select   \u{2190}\u{2192} change   Enter apply   Esc close",
             Color::RGB(90, 90, 90),
-            Rect::new(px + 16, footer_y + 8, (pw - 32) as u32, 20),
+            Rect::new(px + 16, fy + 6, (pw - 32) as u32, 24),
         );
+    }
+
+    /// Draw a single selectable row.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_row(
+        &self,
+        sdl: &mut SdlCanvas<Window>,
+        font: &Font,
+        tc: &TextureCreator<WindowContext>,
+        cache: &mut TextCache,
+        row: SettingsRow,
+        label_x: i32,
+        val_x: i32,
+        val_w: i32,
+        ry: i32,
+        label_col: Color,
+        val_col: Color,
+        is_sel: bool,
+    ) {
+        match row {
+            SettingsRow::Section(_) => {}
+
+            SettingsRow::LaserFade => {
+                render_text(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    "Laser fade",
+                    label_col,
+                    Rect::new(label_x, ry + 4, 200, 24),
+                );
+                let bar_x = val_x;
+                let bar_y = ry + 20;
+                let bar_w = val_w - 80;
+                let bar_h = 16;
+                let t =
+                    (self.laser_fade - Self::SLIDER_MIN) / (Self::SLIDER_MAX - Self::SLIDER_MIN);
+                let fill_w = (t * bar_w as f32) as i32;
+                sdl.set_draw_color(Color::RGB(0x33, 0x33, 0x33));
+                sdl.fill_rect(Rect::new(bar_x, bar_y, bar_w as u32, bar_h as u32))
+                    .ok();
+                sdl.set_draw_color(if is_sel {
+                    Color::RGB(0x4a, 0x9e, 0xff)
+                } else {
+                    Color::RGB(0x55, 0x55, 0x55)
+                });
+                sdl.fill_rect(Rect::new(bar_x, bar_y, fill_w as u32, bar_h as u32))
+                    .ok();
+                let val_str = format!("{:.1}s", self.laser_fade);
+                render_text(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    &val_str,
+                    val_col,
+                    Rect::new(bar_x + bar_w + 4, bar_y - 4, 72, bar_h as u32 + 8),
+                );
+            }
+
+            SettingsRow::LaserOn => {
+                render_text(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    "Laser pointer",
+                    label_col,
+                    Rect::new(label_x, ry + 4, 200, 24),
+                );
+                self.draw_toggle(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    self.laser_on,
+                    val_x,
+                    ry,
+                    val_col,
+                    is_sel,
+                    Some("use L key"),
+                );
+            }
+
+            SettingsRow::ShowFps => {
+                render_text(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    "Show FPS",
+                    label_col,
+                    Rect::new(label_x, ry + 4, 200, 24),
+                );
+                self.draw_toggle(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    self.show_fps,
+                    val_x,
+                    ry,
+                    val_col,
+                    is_sel,
+                    None,
+                );
+            }
+
+            SettingsRow::ShowTime => {
+                render_text(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    "Show time",
+                    label_col,
+                    Rect::new(label_x, ry + 4, 200, 24),
+                );
+                self.draw_toggle(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    self.show_time,
+                    val_x,
+                    ry,
+                    val_col,
+                    is_sel,
+                    None,
+                );
+            }
+
+            SettingsRow::HideToolbar => {
+                render_text(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    "Hide toolbar",
+                    label_col,
+                    Rect::new(label_x, ry + 4, 200, 24),
+                );
+                self.draw_toggle(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    self.hide_toolbar,
+                    val_x,
+                    ry,
+                    val_col,
+                    is_sel,
+                    None,
+                );
+            }
+
+            SettingsRow::Fullscreen => {
+                render_text(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    "Fullscreen",
+                    label_col,
+                    Rect::new(label_x, ry + 4, 200, 24),
+                );
+                self.draw_toggle(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    self.fullscreen,
+                    val_x,
+                    ry,
+                    val_col,
+                    is_sel,
+                    None,
+                );
+            }
+
+            SettingsRow::UndoLimit => {
+                render_text(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    "Undo steps",
+                    label_col,
+                    Rect::new(label_x, ry + 4, 200, 24),
+                );
+                let val_str = format!("{}", self.undo_limit);
+                render_text(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    &val_str,
+                    val_col,
+                    Rect::new(val_x, ry + 4, 80, 24),
+                );
+                render_text(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    "5 - 100",
+                    Color::RGB(90, 90, 90),
+                    Rect::new(val_x, ry + 28, 200, 18),
+                );
+            }
+
+            SettingsRow::ApiEnabled => {
+                render_text(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    "REST API",
+                    label_col,
+                    Rect::new(label_x, ry + 4, 200, 24),
+                );
+                self.draw_toggle(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    self.api_enabled,
+                    val_x,
+                    ry,
+                    val_col,
+                    is_sel,
+                    None,
+                );
+                if !self.api_addr.is_empty() {
+                    render_text(
+                        sdl,
+                        font,
+                        tc,
+                        cache,
+                        &self.api_addr,
+                        Color::RGB(110, 110, 110),
+                        Rect::new(val_x + 70, ry + 4, (val_w - 70).max(0) as u32, 24),
+                    );
+                }
+            }
+
+            SettingsRow::Network => {
+                render_text(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    "IP address",
+                    label_col,
+                    Rect::new(label_x, ry + 4, 200, 24),
+                );
+                if self.network.is_empty() {
+                    render_text(
+                        sdl,
+                        font,
+                        tc,
+                        cache,
+                        "not assigned",
+                        Color::RGB(110, 110, 110),
+                        Rect::new(val_x, ry + 4, val_w as u32, 24),
+                    );
+                } else {
+                    // The first line is the address the box is reachable
+                    // at; the rest are listed below it.
+                    for (line, a) in self.network.iter().take(2).enumerate() {
+                        let text = format!(
+                            "{} {}({}){}",
+                            a.name,
+                            a.with_prefix(),
+                            a.source.label(),
+                            if a.has_default_route { " *" } else { "" }
+                        );
+                        render_text(
+                            sdl,
+                            font,
+                            tc,
+                            cache,
+                            &text,
+                            if a.has_default_route {
+                                Color::RGB(140, 210, 255)
+                            } else {
+                                Color::RGB(120, 120, 120)
+                            },
+                            Rect::new(val_x, ry + 4 + line as i32 * 18, val_w as u32, 20),
+                        );
+                    }
+                    if self.network.len() > 2 {
+                        render_text(
+                            sdl,
+                            font,
+                            tc,
+                            cache,
+                            &format!("+{} more", self.network.len() - 2),
+                            Color::RGB(100, 100, 100),
+                            Rect::new(val_x, ry + 4 + 2 * 18, val_w as u32, 20),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Draw an ON/OFF value.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_toggle(
+        &self,
+        sdl: &mut SdlCanvas<Window>,
+        font: &Font,
+        tc: &TextureCreator<WindowContext>,
+        cache: &mut TextCache,
+        value: Toggle,
+        val_x: i32,
+        ry: i32,
+        _val_col: Color,
+        _is_sel: bool,
+        hint: Option<&str>,
+    ) {
+        let on_str = if value == Toggle::On { "ON" } else { "OFF" };
+        let on_col = if value == Toggle::On {
+            Color::RGB(80, 220, 80)
+        } else {
+            Color::RGB(180, 80, 80)
+        };
+        render_text(
+            sdl,
+            font,
+            tc,
+            cache,
+            on_str,
+            on_col,
+            Rect::new(val_x, ry + 4, 80, 24),
+        );
+        if let Some(hint) = hint {
+            render_text(
+                sdl,
+                font,
+                tc,
+                cache,
+                hint,
+                Color::RGB(90, 90, 90),
+                Rect::new(val_x, ry + 28, 200, 18),
+            );
+        }
     }
 }
 
