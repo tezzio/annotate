@@ -605,6 +605,24 @@ fn route(
                 .find(|u| u.username == username && u.verify_password(&password))
                 .cloned();
             if let Some(user) = user {
+                // An account still on the old unsalted hash is upgraded
+                // now that the password has been proven — so the weak
+                // scheme disappears the first time it is used.
+                if user.needs_upgrade() {
+                    // The read guard must be dropped before taking the
+                    // write lock.
+                    drop(cfg_guard);
+                    let mut cfg_write = shared_cfg.write().unwrap_or_else(|p| p.into_inner());
+                    if let Some(u) = cfg_write
+                        .users
+                        .iter_mut()
+                        .find(|u| u.username == user.username)
+                    {
+                        u.password_hash = crate::config::hash_password(&password);
+                    }
+                    let _ = crate::config::save(&cfg_write);
+                    config_dirty.store(true, Ordering::SeqCst);
+                }
                 let token = generate_token();
                 sessions
                     .write()

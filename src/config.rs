@@ -175,14 +175,162 @@ impl User {
     pub fn verify_password(&self, password: &str) -> bool {
         verify_password(password, &self.password_hash)
     }
+
+    /// True when the stored hash uses the old, unsalted scheme and
+    /// should be replaced after a successful login.
+    pub fn needs_upgrade(&self) -> bool {
+        !self.password_hash.starts_with("pbkdf2-sha256$")
+    }
 }
 
+/// The number of PBKDF2 iterations used for new hashes.
+///
+/// 600,000 is the OWASP recommendation for PBKDF2-HMAC-SHA256.  It costs
+/// roughly a fifth of a second per login on the target hardware — slow
+/// enough to make an offline attack expensive, fast enough that an
+/// operator does not notice.
+pub const PBKDF2_ITERATIONS: u32 = 600_000;
+
+/// The iteration count used when hashing is not performance-sensitive.
+///
+/// The tests hash passwords many times over; at the production iteration
+/// count the suite would take minutes.  The tests are checking the
+/// *construction*, not the work factor, so they use a cheap one.
+#[cfg(test)]
+const TEST_ITERATIONS: u32 = 1_000;
+
+/// The iteration count to use.
+#[cfg(not(test))]
+const ACTIVE_ITERATIONS: u32 = PBKDF2_ITERATIONS;
+
+#[cfg(test)]
+const ACTIVE_ITERATIONS: u32 = TEST_ITERATIONS;
+
+/// The length of the derived key, in bytes.
+const PBKDF2_KEY_LEN: usize = 32;
+
+/// The length of the per-user salt, in bytes.
+const SALT_LEN: usize = 16;
+
+/// Hash a password with PBKDF2-HMAC-SHA256 and a random per-user salt.
+///
+/// The result is self-describing:
+///
+///     pbkdf2-sha256$<iterations>$<salt-hex>$<key-hex>
+///
+/// so an old `sha256(password + "annotator-salt")` hash can still be
+/// verified — and is transparently upgraded to this scheme the first
+/// time the password is used.
+///
+/// A random per-user salt means two users with the same password have
+/// different hashes, and a stolen config cannot be attacked with one
+/// precomputed table.  The iteration count makes each guess expensive.
 pub fn hash_password(password: &str) -> String {
+    let salt = random_bytes(SALT_LEN);
+    hash_password_with_salt(password, &salt, ACTIVE_ITERATIONS)
+}
+
+/// Hash a password with an existing salt and iteration count.
+fn hash_password_with_salt(password: &str, salt: &[u8], iterations: u32) -> String {
+    // PBKDF2-HMAC-SHA256, written out because neither PBKDF2 nor HMAC is
+    // provided by the `sha2` crate and the `hmac` crate is not a
+    // dependency.  This is the standard construction:
+    // U1 = HMAC(password, salt || counter), U(i+1) = HMAC(password, U(i)),
+    // and the output is the XOR of all of them.
+    let mut block = [0u8; PBKDF2_KEY_LEN];
+    // PBKDF2 derives the key in 32-byte blocks; each uses a different
+    // counter.  For a 32-byte key there is exactly one block.
+    for (i, chunk) in block.as_chunks_mut::<32>().0.iter_mut().enumerate() {
+        let mut u = hmac_sha256(password.as_bytes(), &hmac_input(salt, i as u32 + 1));
+        let mut acc = u;
+        for _ in 1..iterations {
+            u = hmac_sha256(password.as_bytes(), &u);
+            for (a, b) in acc.iter_mut().zip(u.iter()) {
+                *a ^= b;
+            }
+        }
+        chunk.copy_from_slice(&acc);
+    }
+
+    format!(
+        "pbkdf2-sha256${}${}${}",
+        iterations,
+        hex::encode(salt),
+        hex::encode(block)
+    )
+}
+
+/// HMAC-SHA256, as described in RFC 2104.
+///
+/// `H((K ^ opad) || H((K ^ ipad) || message))`, where the key is padded
+/// or hashed to the block size and `opad`/`ipad` are the usual constants.
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(password.as_bytes());
-    hasher.update(b"annotator-salt"); // simple static salt
-    hex::encode(hasher.finalize())
+
+    const BLOCK_SIZE: usize = 64;
+
+    // A key longer than the block size is replaced by its hash.
+    let mut k = [0u8; BLOCK_SIZE];
+    if key.len() > BLOCK_SIZE {
+        let digest = Sha256::digest(key);
+        k[..digest.len()].copy_from_slice(&digest);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; BLOCK_SIZE];
+    let mut opad = [0x5cu8; BLOCK_SIZE];
+    for i in 0..BLOCK_SIZE {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_digest);
+    outer.finalize().into()
+}
+
+/// The PBKDF2 first-block input: the salt followed by a big-endian
+/// block counter.
+fn hmac_input(salt: &[u8], counter: u32) -> Vec<u8> {
+    let mut input = Vec::with_capacity(salt.len() + 4);
+    input.extend_from_slice(salt);
+    input.extend_from_slice(&counter.to_be_bytes());
+    input
+}
+
+/// Random bytes, from the operating system.
+fn random_bytes(n: usize) -> Vec<u8> {
+    // `getrandom` is the modern source; fall back to /dev/urandom on
+    // kernels that predate it.
+    let mut buf = vec![0u8; n];
+    #[cfg(target_os = "linux")]
+    {
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_getrandom,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                0,
+            )
+        };
+        if ret == buf.len() as libc::c_long {
+            return buf;
+        }
+    }
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        if f.read_exact(&mut buf).is_ok() {
+            return buf;
+        }
+    }
+    panic!("no source of randomness available");
 }
 
 /// Generate a random password.
@@ -243,8 +391,68 @@ pub fn set_password(cfg: &mut Config, username: &str, password: &str) -> Result<
     Ok(())
 }
 
+/// Verify a password against a stored hash.
+///
+/// Two formats are accepted:
+///
+/// * `pbkdf2-sha256$...` — the current scheme.
+/// * a bare 64-character hex string — the original
+///   `sha256(password + "annotator-salt")` scheme, so a config written
+///   before the upgrade keeps working.
+///
+/// The comparison is constant-time, so it does not leak how much of the
+/// hash matched.
 fn verify_password(password: &str, hash: &str) -> bool {
-    hash_password(password) == hash
+    if let Some(rest) = hash.strip_prefix("pbkdf2-sha256$") {
+        let mut parts = rest.split('$');
+        let (Some(iterations), Some(salt_hex), Some(key_hex)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        let Ok(iterations) = iterations.parse::<u32>() else {
+            return false;
+        };
+        let (Ok(salt), Ok(_expected)) = (hex::decode(salt_hex), hex::decode(key_hex)) else {
+            return false;
+        };
+        let actual = hash_password_with_salt(password, &salt, iterations);
+        // Compare the derived key, not the whole string, so the format
+        // prefix does not affect the timing.
+        let actual_key = actual.rsplit('$').next().unwrap_or_default();
+        constant_time_eq(actual_key.as_bytes(), key_hex.as_bytes())
+    } else if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        // The old scheme.  It has no salt and no iteration count, so it
+        // can only be checked directly.
+        constant_time_eq(old_hash_password(password).as_bytes(), hash.as_bytes())
+    } else {
+        false
+    }
+}
+
+/// The original hashing scheme, kept so old hashes still verify.
+///
+/// New passwords use PBKDF2 with a random per-user salt; this is only
+/// here for backwards compatibility.
+fn old_hash_password(password: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    hasher.update(b"annotator-salt");
+    hex::encode(hasher.finalize())
+}
+
+/// Compare two byte strings without an early return on the first
+/// difference, so the comparison does not leak how much matched.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 impl Config {
@@ -640,5 +848,109 @@ is_admin = true
         assert_eq!(cfg.api.annotator, "");
         assert!(cfg.api.token.is_none());
         assert!(!cfg.users[0].must_change_password);
+    }
+}
+
+// ── Password hashing tests ───────────────────────────────────────────────────
+
+#[cfg(test)]
+mod password_tests {
+    use super::*;
+
+    /// RFC 4231 test case 1 for HMAC-SHA256.
+    #[test]
+    fn hmac_sha256_matches_the_rfc_vector() {
+        let key = [0x0bu8; 20];
+        let mac = hmac_sha256(&key, b"Hi There");
+        // The expected value from RFC 4231, case 1.
+        let expected = "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7";
+        assert_eq!(hex::encode(mac), expected);
+    }
+
+    /// RFC 4231 test case 2 for HMAC-SHA256.
+    #[test]
+    fn hmac_sha256_handles_a_short_key() {
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        let expected = "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843";
+        assert_eq!(hex::encode(mac), expected);
+    }
+
+    /// A key longer than the block size is hashed first (RFC 4231 case 6
+    /// exercises exactly this).
+    #[test]
+    fn hmac_sha256_hashes_a_long_key() {
+        let key = [0xaau8; 131];
+        let mac = hmac_sha256(
+            &key,
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+        );
+        let expected = "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54";
+        assert_eq!(hex::encode(mac), expected);
+    }
+
+    /// The classic PBKDF2-HMAC-SHA256 vector.
+    #[test]
+    fn pbkdf2_matches_the_standard_vector() {
+        // "password", "salt", 1 iteration, 32-byte output.
+        let out = hash_password_with_salt("password", b"salt", 1);
+        let key = out.rsplit('$').next().unwrap();
+        let expected = "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b";
+        assert_eq!(key, expected);
+    }
+
+    /// The same vector with 2 iterations.
+    #[test]
+    fn pbkdf2_matches_the_two_iteration_vector() {
+        let out = hash_password_with_salt("password", b"salt", 2);
+        let key = out.rsplit('$').next().unwrap();
+        let expected = "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43";
+        assert_eq!(key, expected);
+    }
+
+    #[test]
+    fn a_hashed_password_verifies() {
+        let hash = hash_password("correct horse battery staple");
+        assert!(verify_password("correct horse battery staple", &hash));
+        assert!(!verify_password("wrong", &hash));
+    }
+
+    #[test]
+    fn two_users_with_the_same_password_get_different_hashes() {
+        // The salt is random, so the hashes must differ.
+        let a = hash_password("same");
+        let b = hash_password("same");
+        assert_ne!(a, b);
+        assert!(verify_password("same", &a));
+        assert!(verify_password("same", &b));
+    }
+
+    #[test]
+    fn the_hash_records_its_own_parameters() {
+        let hash = hash_password("x");
+        let parts: Vec<&str> = hash.split('$').collect();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0], "pbkdf2-sha256");
+        // The iteration count is recorded so it can be raised later
+        // without invalidating existing hashes.
+        assert_eq!(parts[1].parse::<u32>().unwrap(), ACTIVE_ITERATIONS);
+        assert_eq!(parts[2].len(), SALT_LEN * 2);
+        assert_eq!(parts[3].len(), PBKDF2_KEY_LEN * 2);
+    }
+
+    #[test]
+    fn the_production_iteration_count_is_the_owasp_recommendation() {
+        // Guard against the test build's cheap count leaking into
+        // production.
+        assert_eq!(PBKDF2_ITERATIONS, 600_000);
+        #[cfg(not(test))]
+        assert_eq!(ACTIVE_ITERATIONS, PBKDF2_ITERATIONS);
+    }
+
+    #[test]
+    fn an_old_sha256_hash_still_verifies() {
+        // A config written before the upgrade must keep working.
+        let old = old_hash_password("admin");
+        assert!(verify_password("admin", &old));
+        assert!(!verify_password("wrong", &old));
     }
 }
