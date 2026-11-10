@@ -5,6 +5,7 @@ mod config;
 mod export;
 mod input;
 mod net;
+mod password_cli;
 mod persist;
 mod ratelimit;
 mod render_pipeline;
@@ -55,6 +56,20 @@ std::thread_local! {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
+    // The password mode runs before the window is created, so it works
+    // even when the app itself cannot start.
+    let args: Vec<String> = std::env::args().collect();
+    match password_cli::parse(&args) {
+        Ok(Some(action)) => {
+            std::process::exit(password_cli::run(action));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    }
+
     let cfg = config::load();
     // Captured before `cfg` is moved into the state.
     let cfg_show_time = cfg.show_time;
