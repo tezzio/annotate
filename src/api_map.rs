@@ -98,7 +98,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     // ── Drawing ────────────────────────────────────────────────────────
     Endpoint {
         path: "/api/v1/tool",
-        methods: &["GET", "POST"],
+        methods: &["POST"],
         summary: "Select the active tool.",
         params: &["name (required: the tool to switch to)"],
         values: &[
@@ -112,7 +112,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     },
     Endpoint {
         path: "/api/v1/color",
-        methods: &["GET", "POST"],
+        methods: &["POST"],
         summary: "Set the drawing colour.",
         params: &[
             "hex (required unless 'palette' is given: the colour as rrggbb)",
@@ -123,7 +123,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     },
     Endpoint {
         path: "/api/v1/brush_size",
-        methods: &["GET", "POST"],
+        methods: &["POST"],
         summary: "Set the brush size, or change it by a relative amount.",
         params: &[
             "px (optional: the new size in pixels, 1-200)",
@@ -137,7 +137,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     },
     Endpoint {
         path: "/api/v1/input",
-        methods: &["GET", "POST"],
+        methods: &["POST"],
         summary: "Select the video input and the capture mode.",
         params: &[
             "index (required: 0 for no input, 1..n for a device)",
@@ -152,7 +152,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     // ── Canvas actions ──────────────────────────────────────────────────
     Endpoint {
         path: "/api/v1/undo",
-        methods: &["GET", "POST"],
+        methods: &["POST"],
         summary: "Undo the last annotation.",
         params: &[],
         values: &[],
@@ -160,7 +160,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     },
     Endpoint {
         path: "/api/v1/redo",
-        methods: &["GET", "POST"],
+        methods: &["POST"],
         summary: "Redo the last undone annotation.",
         params: &[],
         values: &[],
@@ -168,7 +168,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     },
     Endpoint {
         path: "/api/v1/clear",
-        methods: &["GET", "POST"],
+        methods: &["POST"],
         summary: "Clear the canvas.  The clear can itself be undone.",
         params: &[],
         values: &[],
@@ -176,7 +176,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     },
     Endpoint {
         path: "/api/v1/freeze",
-        methods: &["GET", "POST"],
+        methods: &["POST"],
         summary: "Freeze or unfreeze the video.  Without a parameter it toggles.",
         params: &["on (optional: '1' to freeze, '0' to unfreeze, 'toggle' to flip)"],
         values: &["on=1 | on=0 | on=toggle"],
@@ -185,7 +185,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     // ── Persistence ─────────────────────────────────────────────────────
     Endpoint {
         path: "/api/v1/save",
-        methods: &["GET", "POST"],
+        methods: &["POST"],
         summary: "Save the current annotations to disk.",
         params: &["name (optional: the file name; a timestamped one is generated if absent)"],
         values: &["name=case-42"],
@@ -196,7 +196,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     },
     Endpoint {
         path: "/api/v1/load",
-        methods: &["GET", "POST"],
+        methods: &["POST"],
         summary: "Load a saved scene, replacing the current one.",
         params: &["name (required: the file to load, without the .json suffix)"],
         values: &["name=case-42"],
@@ -207,7 +207,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     },
     Endpoint {
         path: "/api/v1/export",
-        methods: &["GET", "POST"],
+        methods: &["POST"],
         summary: "Export the annotations as a PNG, with the case metadata \
                   embedded in the file.",
         params: &["name (optional: the file name; a timestamped one is generated if absent)"],
@@ -240,6 +240,13 @@ pub fn to_json() -> serde_json::Value {
             "text": "Add fmt=text to any endpoint for plain 'OK key=value' \
                      and 'ERR message' lines, for a client with no JSON \
                      parser.",
+        },
+        "methods": {
+            "reads": "The endpoints that only report state are GET.",
+            "changes": "The endpoints that change something are POST only. \
+                        A GET on one of them is refused with 405, so a \
+                        stray <img> tag or a link prefetch cannot clear \
+                        the canvas or undo an annotation.",
         },
         "errors": {
             "400": "The request was malformed or a parameter was invalid.",
@@ -341,6 +348,35 @@ mod tests {
         paths.sort_unstable();
         paths.dedup();
         assert_eq!(paths.len(), count, "the map lists a path twice");
+    }
+
+    #[test]
+    fn the_map_agrees_with_the_routing_on_the_method() {
+        // A map that claims the wrong method is worse than no map, so the
+        // methods it lists are checked against what the router accepts.
+        //
+        // The mutating endpoints are POST-only; the read-only ones are
+        // GET-only.
+        let read_only = [
+            "/api/v1/",
+            "/api/v1/health",
+            "/api/v1/state",
+            "/api/v1/inputs",
+            "/api/v1/saves",
+            "/api/v1/exports",
+        ];
+        for e in ENDPOINTS {
+            let expected: &[&str] = if read_only.contains(&e.path) {
+                &["GET"]
+            } else {
+                &["POST"]
+            };
+            assert_eq!(
+                e.methods, expected,
+                "the map says {:?} for '{}' but the router accepts {:?}",
+                e.methods, e.path, expected
+            );
+        }
     }
 
     #[test]

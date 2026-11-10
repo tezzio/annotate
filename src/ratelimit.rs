@@ -191,6 +191,13 @@ impl RateLimiter {
 /// Decide which bucket a request path draws from.
 ///
 /// Anything under `/api/v1/` that is not a read endpoint is a mutation.
+///
+/// The bucket is chosen by path, not by method, so a mutation endpoint
+/// draws on the write budget however it is called.  That matters now
+/// that the mutations are POST-only: a GET on one of them is refused
+/// with 405 before it can reach the limiter, and a GET that somehow
+/// slipped through would still not be given the read budget.
+///
 /// The portal routes are not limited at all — they are browser traffic
 /// and the portal polls gently.
 pub fn bucket_for(path: &str) -> Option<Bucket> {

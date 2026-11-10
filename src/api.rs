@@ -865,8 +865,8 @@ fn route(
         // These are deliberately separate routes rather than extra
         // `/api/v1/tool?name=…` values, so a tool name stays unambiguous.
         "/api/v1/undo" | "/api/v1/redo" | "/api/v1/clear" | "/api/v1/freeze" => {
-            if req.method != "GET" && req.method != "POST" {
-                return reply_err(405, "method not allowed — use GET or POST", text_mode);
+            if req.method != "POST" {
+                return reply_err(405, "method not allowed — use POST", text_mode);
             }
             let kind = match action_command(req) {
                 Ok(k) => k,
@@ -878,8 +878,8 @@ fn route(
 
         // ── Save / load endpoints ─────────────────────────────────────────
         "/api/v1/save" | "/api/v1/load" => {
-            if req.method != "GET" && req.method != "POST" {
-                return reply_err(405, "method not allowed — use GET or POST", text_mode);
+            if req.method != "POST" {
+                return reply_err(405, "method not allowed — use POST", text_mode);
             }
             let kind = match action_command(req) {
                 Ok(k) => k,
@@ -891,8 +891,8 @@ fn route(
 
         // ── Export endpoints ───────────────────────────────────────────────
         "/api/v1/export" => {
-            if req.method != "GET" && req.method != "POST" {
-                return reply_err(405, "method not allowed — use GET or POST", text_mode);
+            if req.method != "POST" {
+                return reply_err(405, "method not allowed — use POST", text_mode);
             }
             let kind = match action_command(req) {
                 Ok(k) => k,
@@ -930,8 +930,8 @@ fn route(
 
         // ── Control endpoints (GET with query string or POST with form body) ──
         "/api/v1/tool" | "/api/v1/color" | "/api/v1/brush_size" | "/api/v1/input" => {
-            if req.method != "GET" && req.method != "POST" {
-                return reply_err(405, "method not allowed — use GET or POST", text_mode);
+            if req.method != "POST" {
+                return reply_err(405, "method not allowed — use POST", text_mode);
             }
             let kind = match control_command(req) {
                 Ok(k) => k,
@@ -2029,14 +2029,9 @@ mod tests {
         // No main loop is draining, so the command is queued and the
         // reply times out — what matters is that the route was matched and
         // the command reached the channel.
-        let (status, _, _) = route(
-            &get("/api/v1/undo"),
-            &snap,
-            &tx,
-            &cfg,
-            &sessions,
-            &dirty_flag(),
-        );
+        let mut req = get("/api/v1/undo");
+        req.method = "POST".into();
+        let (status, _, _) = route(&req, &snap, &tx, &cfg, &sessions, &dirty_flag());
         assert_ne!(status, 404);
         assert_ne!(status, 405);
         assert!(rx.try_iter().count() >= 1, "command should be queued");
@@ -2126,14 +2121,9 @@ mod tests {
         let sessions = test_sessions();
 
         // A missing required param is a 400 with an `ERR …` body.
-        let (status, body, ctype) = route(
-            &get("/api/v1/tool?fmt=text"),
-            &snap,
-            &tx,
-            &cfg,
-            &sessions,
-            &dirty_flag(),
-        );
+        let mut req = get("/api/v1/tool?fmt=text");
+        req.method = "POST".into();
+        let (status, body, ctype) = route(&req, &snap, &tx, &cfg, &sessions, &dirty_flag());
         assert_eq!(status, 400);
         assert_eq!(ctype, "text/plain");
         assert!(body.starts_with("ERR "), "got: {body}");
@@ -2399,6 +2389,79 @@ mod tests {
             TcpStream::connect(("127.0.0.1", port)).is_ok(),
             "the API should come back when it is restarted"
         );
+    }
+
+    // ── The method policy ───────────────────────────────────────────────
+
+    /// Every endpoint that changes something must refuse GET.
+    ///
+    /// A GET on a mutation endpoint is a hazard: a stray `<img>` tag, a
+    /// link prefetch or a crawler could clear the canvas or undo an
+    /// annotation without anyone intending it.
+    #[test]
+    fn mutating_endpoints_refuse_get() {
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, _rx) = sync_channel::<ApiCommand>(16);
+        let cfg = default_cfg();
+        let sessions = test_sessions();
+
+        for path in [
+            "/api/v1/tool?name=pen",
+            "/api/v1/color?hex=ff0000",
+            "/api/v1/brush_size?px=8",
+            "/api/v1/input?index=0",
+            "/api/v1/undo",
+            "/api/v1/redo",
+            "/api/v1/clear",
+            "/api/v1/freeze",
+            "/api/v1/save",
+            "/api/v1/load?name=x",
+            "/api/v1/export",
+        ] {
+            let (status, body, _) = route(&get(path), &snap, &tx, &cfg, &sessions, &dirty_flag());
+            assert_eq!(status, 405, "GET {path} should be refused");
+            assert!(
+                body.contains("use POST"),
+                "GET {path} should say to use POST, got: {body}"
+            );
+        }
+    }
+
+    /// The read-only endpoints must still answer GET.
+    #[test]
+    fn read_endpoints_still_answer_get() {
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, _rx) = sync_channel::<ApiCommand>(16);
+        let cfg = default_cfg();
+        let sessions = test_sessions();
+
+        for path in [
+            "/api/v1/",
+            "/api/v1/health",
+            "/api/v1/state",
+            "/api/v1/inputs",
+            "/api/v1/saves",
+            "/api/v1/exports",
+        ] {
+            let (status, _, _) = route(&get(path), &snap, &tx, &cfg, &sessions, &dirty_flag());
+            assert_eq!(status, 200, "GET {path} should work");
+        }
+    }
+
+    /// A POST on a read-only endpoint is refused.
+    #[test]
+    fn read_endpoints_refuse_post() {
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, _rx) = sync_channel::<ApiCommand>(16);
+        let cfg = default_cfg();
+        let sessions = test_sessions();
+
+        for path in ["/api/v1/health", "/api/v1/state", "/api/v1/inputs"] {
+            let mut req = get(path);
+            req.method = "POST".into();
+            let (status, _, _) = route(&req, &snap, &tx, &cfg, &sessions, &dirty_flag());
+            assert_eq!(status, 405, "POST {path} should be refused");
+        }
     }
 
     // ── Save / load endpoints ──────────────────────────────────────────
