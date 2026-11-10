@@ -647,6 +647,60 @@ fn route(
             }
         }
         // Change the logged-in user's password.
+        // An administrator resetting another account's password.  This is
+        // how a second operator's password is recovered without the
+        // command line, and how a forgotten password is dealt with by
+        // someone who is still logged in.
+        "/portal/admin_reset_password" if req.method == "POST" => {
+            let p = params(req);
+            let token = match p.get("token") {
+                Some(t) => t.clone(),
+                None => return (401, err_body("not authenticated"), "application/json"),
+            };
+            let username = match sessions.read().unwrap().get(&token).cloned() {
+                Some(u) => u,
+                None => return (401, err_body("not authenticated"), "application/json"),
+            };
+            // Only an administrator may reset somebody else's password.
+            let is_admin = cfg
+                .active_users()
+                .iter()
+                .any(|u| u.username == username && u.is_admin);
+            if !is_admin {
+                return (
+                    403,
+                    err_body("only an administrator can reset another user's password"),
+                    "application/json",
+                );
+            }
+            let target = match p.get("user") {
+                Some(u) => u.clone(),
+                None => {
+                    return (400, err_body("missing param 'user'"), "application/json");
+                }
+            };
+            let new_password = p.get("password").cloned().unwrap_or_default();
+            if new_password.len() < 8 {
+                return (
+                    400,
+                    err_body("the new password must be at least 8 characters"),
+                    "application/json",
+                );
+            }
+            drop(cfg_guard);
+            let mut cfg_write = shared_cfg.write().unwrap_or_else(|p| p.into_inner());
+            return match crate::config::set_password(&mut cfg_write, &target, &new_password) {
+                Ok(()) => {
+                    config_dirty.store(true, Ordering::SeqCst);
+                    (
+                        200,
+                        serde_json::json!({ "ok": true, "user": target }).to_string(),
+                        "application/json",
+                    )
+                }
+                Err(msg) => (400, err_body(&msg), "application/json"),
+            };
+        }
         "/portal/change_password" if req.method == "POST" => {
             let p = params(req);
             let token = match p.get("token") {
@@ -2372,6 +2426,79 @@ mod tests {
     fn a_traversing_scene_name_is_rejected_by_the_endpoint() {
         assert!(action_command(&get("/api/v1/save?name=../escape")).is_err());
         assert!(action_command(&get("/api/v1/load?name=../escape")).is_err());
+    }
+
+    #[test]
+    fn only_an_admin_may_reset_another_users_password() {
+        // A config with an admin and a plain user.
+        let mut cfg = Config::default();
+        cfg.users.clear();
+        for (name, is_admin) in [("boss", true), ("worker", false)] {
+            cfg.users.push(crate::config::User {
+                username: name.into(),
+                password_hash: crate::config::hash_password("x"),
+                is_admin,
+                must_change_password: false,
+            });
+        }
+        let cfg = Arc::new(RwLock::new(cfg));
+
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, _rx) = sync_channel::<ApiCommand>(4);
+        let sessions = test_sessions();
+
+        // Log in as the plain user.
+        let plain_token = "plain-token";
+        sessions
+            .write()
+            .unwrap()
+            .insert(plain_token.into(), "worker".into());
+
+        let mut req = get("/portal/admin_reset_password?user=boss&password=newpassword123");
+        req.method = "POST".into();
+        req.query.insert("token".into(), plain_token.into());
+
+        let (status, body, _) = route(&req, &snap, &tx, &cfg, &sessions, &dirty_flag());
+        assert_eq!(status, 403, "a non-admin must not reset passwords");
+        assert!(body.contains("administrator"), "got: {body}");
+    }
+
+    #[test]
+    fn an_admin_may_reset_another_users_password() {
+        let mut cfg = Config::default();
+        cfg.users.clear();
+        for (name, is_admin) in [("boss", true), ("worker", false)] {
+            cfg.users.push(crate::config::User {
+                username: name.into(),
+                password_hash: crate::config::hash_password("x"),
+                is_admin,
+                must_change_password: false,
+            });
+        }
+        let cfg = Arc::new(RwLock::new(cfg));
+
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, _rx) = sync_channel::<ApiCommand>(4);
+        let sessions = test_sessions();
+
+        let admin_token = "admin-token";
+        sessions
+            .write()
+            .unwrap()
+            .insert(admin_token.into(), "boss".into());
+
+        let mut req = get("/portal/admin_reset_password?user=worker&password=newpassword123");
+        req.method = "POST".into();
+        req.query.insert("token".into(), admin_token.into());
+
+        let (status, body, _) = route(&req, &snap, &tx, &cfg, &sessions, &dirty_flag());
+        assert_eq!(status, 200, "got: {body}");
+
+        // The new password must now work.
+        let guard = cfg.read().unwrap();
+        let worker = guard.users.iter().find(|u| u.username == "worker").unwrap();
+        assert!(worker.verify_password("newpassword123"));
+        assert!(!worker.verify_password("x"));
     }
 
     #[test]
