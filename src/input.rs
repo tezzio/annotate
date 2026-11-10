@@ -469,6 +469,11 @@ fn handle_release(x1: i32, y1: i32, state: &mut AppState, canvas: &mut Canvas) {
                     _ => 0,
                 };
                 let obj_count_before = state.scene.objects().len();
+                // Keep drawing the stroke as a GPU overlay until the
+                // pipeline publishes a frame that contains it — otherwise
+                // it vanishes between mouse-up and rasterization, which
+                // reads as a gap between fast successive strokes.
+                state.in_flight.push(stroke.clone());
                 state.scene.add(stroke);
                 if DEBUG.load(Ordering::Relaxed) {
                     eprintln!(

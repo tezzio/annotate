@@ -140,6 +140,11 @@ COMMON_DEVS=(
     # Misc
     libbsd0 libbsd-dev
     libmd0 libmd-dev
+    # OpenSSL — the REST API serves HTTPS via the `openssl` crate.  Like
+    # every library here it is linked, not compiled, so no cross C
+    # toolchain is needed.  The -dev package provides the libssl.so
+    # symlink the linker resolves and the headers openssl-sys parses.
+    libssl3 libssl-dev
     # Text shaping, needed by SDL2_ttf >= 2.20
     libharfbuzz0b libharfbuzz-dev
     # Transitive dependencies of the libraries above (wayland-server,
@@ -646,9 +651,24 @@ else
     warn "patchelf unavailable — libraries with absolute RUNPATHs may not resolve"
 fi
 
+# ── OpenSSL header merge ──────────────────────────────────────────────────
+# Debian splits the OpenSSL headers: most live in
+# usr/include/openssl/, but opensslconf.h and configuration.h are
+# architecture-specific and live in usr/include/$DEB_MULTIARCH/openssl/.
+# openssl-sys locates headers through ONE include directory and its
+# header-expansion step (#include <openssl/opensslv.h> pulls in
+# <openssl/configuration.h>) fails when the arch-specific half is not
+# next to the rest.  Merge them, like the pkg-config fixups above.
+ARCH_OPENSSL_DIR="$SYSROOT/usr/include/$DEB_MULTIARCH/openssl"
+MAIN_OPENSSL_DIR="$SYSROOT/usr/include/openssl"
+if [[ -d "$ARCH_OPENSSL_DIR" && -d "$MAIN_OPENSSL_DIR" ]]; then
+    cp -a "$ARCH_OPENSSL_DIR/." "$MAIN_OPENSSL_DIR/"
+    info "  merged arch-specific OpenSSL headers into usr/include/openssl"
+fi
+
 # ── Sanity check ──────────────────────────────────────────────────────────
 missing=()
-for lib in libSDL2.so libSDL2_ttf.so libfreetype.so libX11.so libxcb.so; do
+for lib in libSDL2.so libSDL2_ttf.so libfreetype.so libX11.so libxcb.so libssl.so; do
     if ! find "$SYSROOT" -name "$lib*" -print -quit | grep -q .; then
         missing+=("$lib")
     fi

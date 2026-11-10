@@ -1,6 +1,6 @@
 [package]
 name = "annotator"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2024"
 
 [dependencies]
@@ -23,6 +23,10 @@ sha2         = "0.10"
 hex          = "0.4"
 png          = "0.17"
 url          = "2"
+# HTTPS for the REST API.  `openssl-sys` is pure FFI — it compiles no C,
+# it links the prebuilt libssl from the per-arch sysroot (scripts/sysroot.sh),
+# so the aarch64 cross build still needs no C toolchain.
+openssl      = "0.10"
 
 [build-dependencies]
 ureq    = "2"

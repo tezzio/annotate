@@ -12,6 +12,7 @@ mod ratelimit;
 mod render_pipeline;
 mod scene;
 mod state;
+mod tls;
 mod tools;
 mod ui;
 
@@ -39,7 +40,7 @@ use ui::{
 
 // ── Application state ─────────────────────────────────────────────────────────
 // `AppState` lives in `state.rs` — one definition shared by the UI, the
-// render loop, and the REST API (ROADMAP.md).
+// render loop, and the REST API.
 
 // ── Embedded fonts ────────────────────────────────────────────────────────────
 
@@ -56,7 +57,75 @@ std::thread_local! {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// Install a panic hook that appends every panic to a log file next to
+/// the config, in addition to the default stderr output.  A headless
+/// kiosk is rarely attached to a terminal, so without this a crash in
+/// the field leaves no diagnostics at all.
+fn install_panic_log() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>").to_string();
+        let line = format!(
+            "[{}] panic on thread '{name}': {info}\n",
+            panic_log_timestamp()
+        );
+        let path = config::config_path()
+            .parent()
+            .map(|d| d.join("annotator-panic.log"))
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/annotator-panic.log"));
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            use std::io::Write;
+            let _ = f.write_all(line.as_bytes());
+        }
+        default_hook(info);
+    }));
+}
+
+/// Map a top-row or keypad digit key to its character, if it is one.
+/// Used by the settings panel's port editor.
+fn digit_key(k: sdl2::keyboard::Keycode) -> Option<char> {
+    use sdl2::keyboard::Keycode as K;
+    match k {
+        K::Num0 | K::Kp0 => Some('0'),
+        K::Num1 | K::Kp1 => Some('1'),
+        K::Num2 | K::Kp2 => Some('2'),
+        K::Num3 | K::Kp3 => Some('3'),
+        K::Num4 | K::Kp4 => Some('4'),
+        K::Num5 | K::Kp5 => Some('5'),
+        K::Num6 | K::Kp6 => Some('6'),
+        K::Num7 | K::Kp7 => Some('7'),
+        K::Num8 | K::Kp8 => Some('8'),
+        K::Num9 | K::Kp9 => Some('9'),
+        _ => None,
+    }
+}
+
+/// Wall-clock timestamp for the panic log, via libc like [`format_clock`].
+fn panic_log_timestamp() -> String {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    if now == -1 || unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
+        return "unknown time".to_string();
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
+}
+
 fn main() {
+    install_panic_log();
+
     // The password mode runs before the window is created, so it works
     // even when the app itself cannot start.
     let args: Vec<String> = std::env::args().collect();
@@ -242,7 +311,10 @@ fn main() {
         fullscreen: Toggle::from_bool(state.is_fullscreen),
         undo_limit,
         api_enabled: Toggle::from_bool(cfg_api.enabled),
-        api_addr: format!("{}:{}", cfg_api.bind, cfg_api.port),
+        api_port: cfg_api.port,
+        port_editing: false,
+        port_buffer: String::new(),
+        api_addr: format!("https://{}:{}", cfg_api.bind, cfg_api.port),
         network: net::interface_addresses(),
         renderer_info,
         scroll_offset: 0,
@@ -294,6 +366,17 @@ fn main() {
     // the main loop writes it to disk.
     let config_dirty: api::ConfigDirtyFlag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // The TLS certificate is loaded (or generated on first run) once and
+    // shared by every server start — including settings-panel restarts.
+    // If it cannot be set up, the API stays off and the toggle is inert.
+    let tls_acceptor = match tls::acceptor_from_config_dir() {
+        Ok(a) => Some(a),
+        Err(e) => {
+            eprintln!("[api] TLS setup failed: {e} — REST API disabled");
+            None
+        }
+    };
+
     // The API server is held so the settings panel can stop and start it.
     // When it is stopped the command channel is drained by a null
     // receiver, so the main loop's drain simply finds nothing.
@@ -301,23 +384,29 @@ fn main() {
     let mut api_cmd_rx: api::ApiCommandRx = {
         let cfg_api = state.cfg.read().unwrap_or_else(|p| p.into_inner());
         if cfg_api.api.enabled {
-            if cfg_api.api.token.as_deref().is_none_or(|t| t.is_empty()) {
-                eprintln!(
-                    "[api] WARNING — no shared token configured ([api] token = \"...\"). \
-                     The REST API is open to anyone who can reach {}. \
-                     Set a token to require X-Auth-Token on every /api/v1/* call.",
-                    cfg_api.api.bind
+            if let Some(ref tls) = tls_acceptor {
+                if cfg_api.api.token.as_deref().is_none_or(|t| t.is_empty()) {
+                    eprintln!(
+                        "[api] WARNING — no shared token configured ([api] token = \"...\"). \
+                         The REST API is open to anyone who can reach {}. \
+                         Set a token to require X-Auth-Token on every /api/v1/* call.",
+                        cfg_api.api.bind
+                    );
+                }
+                let (server, rx) = api::serve(
+                    &cfg_api.api.bind,
+                    cfg_api.api.port,
+                    tls,
+                    api_snapshot.clone(),
+                    state.cfg.clone(),
+                    config_dirty.clone(),
                 );
+                api_server = Some(server);
+                rx
+            } else {
+                let (_tx, rx) = std::sync::mpsc::sync_channel(0);
+                rx
             }
-            let (server, rx) = api::serve(
-                &cfg_api.api.bind,
-                cfg_api.api.port,
-                api_snapshot.clone(),
-                state.cfg.clone(),
-                config_dirty.clone(),
-            );
-            api_server = Some(server);
-            rx
         } else {
             eprintln!("[api] disabled by config ([api] enabled = false)");
             let (_tx, rx) = std::sync::mpsc::sync_channel(0);
@@ -396,45 +485,77 @@ fn main() {
                 match &event {
                     sdl2::event::Event::KeyDown {
                         keycode: Some(k), ..
-                    } => match *k {
-                        sdl2::keyboard::Keycode::Escape => {
-                            state.show_settings_overlay = false;
-                            save_settings(&mut state);
-                            state.mark_snapshot_dirty();
-                        }
-                        sdl2::keyboard::Keycode::Up => {
+                    } => {
+                        let port_editing = state.settings.as_ref().is_some_and(|s| s.port_editing);
+                        if port_editing {
+                            // The port row is taking typed digits: every
+                            // key goes to the editor until Enter commits
+                            // or Escape cancels.
                             if let Some(s) = &mut state.settings {
-                                s.move_up();
+                                match *k {
+                                    sdl2::keyboard::Keycode::Escape => s.cancel_port_edit(),
+                                    sdl2::keyboard::Keycode::Return
+                                    | sdl2::keyboard::Keycode::KpEnter => {
+                                        s.commit_port_edit();
+                                    }
+                                    sdl2::keyboard::Keycode::Backspace => s.port_edit_backspace(),
+                                    _ => {
+                                        if let Some(d) = digit_key(*k) {
+                                            s.port_edit_input(d);
+                                        }
+                                    }
+                                }
                             }
-                        }
-                        sdl2::keyboard::Keycode::Down => {
-                            if let Some(s) = &mut state.settings {
-                                s.move_down(canvas_h as i32);
-                            }
-                        }
-                        sdl2::keyboard::Keycode::Left => {
-                            if let Some(s) = &mut state.settings {
-                                s.adjust(false);
-                            }
-                        }
-                        sdl2::keyboard::Keycode::Right => {
-                            if let Some(s) = &mut state.settings {
-                                s.adjust(true);
-                            }
-                        }
-                        sdl2::keyboard::Keycode::Return | sdl2::keyboard::Keycode::KpEnter => {
-                            if let Some(s) = &mut state.settings {
-                                let action = s.enter();
-                                if action == OverlayAction::ToggleFullscreen {
-                                    state.toggle_fullscreen = true;
+                        } else {
+                            match *k {
+                                sdl2::keyboard::Keycode::Escape => {
                                     state.show_settings_overlay = false;
                                     save_settings(&mut state);
                                     state.mark_snapshot_dirty();
                                 }
+                                sdl2::keyboard::Keycode::Up => {
+                                    if let Some(s) = &mut state.settings {
+                                        s.move_up();
+                                    }
+                                }
+                                sdl2::keyboard::Keycode::Down => {
+                                    if let Some(s) = &mut state.settings {
+                                        s.move_down(canvas_h as i32);
+                                    }
+                                }
+                                sdl2::keyboard::Keycode::Left => {
+                                    if let Some(s) = &mut state.settings {
+                                        s.adjust(false);
+                                    }
+                                }
+                                sdl2::keyboard::Keycode::Right => {
+                                    if let Some(s) = &mut state.settings {
+                                        s.adjust(true);
+                                    }
+                                }
+                                sdl2::keyboard::Keycode::Return
+                                | sdl2::keyboard::Keycode::KpEnter => {
+                                    if let Some(s) = &mut state.settings {
+                                        let action = s.enter();
+                                        if action == OverlayAction::ToggleFullscreen {
+                                            state.toggle_fullscreen = true;
+                                            state.show_settings_overlay = false;
+                                            save_settings(&mut state);
+                                            state.mark_snapshot_dirty();
+                                        }
+                                    }
+                                }
+                                // A digit on the port row opens the
+                                // editor with that digit already in it.
+                                _ => {
+                                    if let (Some(s), Some(d)) = (&mut state.settings, digit_key(*k))
+                                    {
+                                        s.start_port_edit(Some(d));
+                                    }
+                                }
                             }
                         }
-                        _ => {}
-                    },
+                    }
                     sdl2::event::Event::MouseButtonDown { x, y, .. } => {
                         if let Some(s) = &mut state.settings {
                             let canvas_w_i = canvas_w as i32;
@@ -442,6 +563,7 @@ fn main() {
                             let action = s.click(*x, *y, canvas_w_i, canvas_h_i);
                             match action {
                                 OverlayAction::Close => {
+                                    s.cancel_port_edit();
                                     state.show_settings_overlay = false;
                                     save_settings(&mut state);
                                     state.mark_snapshot_dirty();
@@ -494,6 +616,12 @@ fn main() {
             video_tex_w = canvas_w;
             video_tex_h = canvas_h;
             committed_canvas.dirty = true;
+            // Mark the scene dirty so the re-render below (and the
+            // submit it triggers) actually repaints the annotations at
+            // the new size.  `render_to_par` no-ops on a clean scene,
+            // which would publish a blank frame — the overlay appeared
+            // to vanish on every resize until the next edit.
+            state.scene.dirty = true;
             pipeline.render_into(&committed_canvas, &state.scene);
             pipeline_seq = 0; // reset so the next upload is detected
             v2_layout = ui::v2::V2Layout::build(canvas_w as i32, canvas_h as i32);
@@ -1097,8 +1225,8 @@ fn main() {
         //
         // On release, `committed_canvas` retains the wipe, `erase_path`
         // sets `scene.dirty`, and the pipeline takes over on the next
-        // frame — `submit_scene` copies the wiped canvas into the back
-        // buffer and the worker bakes the trimmed scene on top.
+        // frame — `submit_scene` hands the wiped canvas to the worker as
+        // the base layer and it bakes the trimmed scene on top.
         let erasing_now = state.eraser_drag.is_some();
         if erasing_now {
             let (min_x, min_y) = state.eraser_dirty_min;
@@ -1130,14 +1258,20 @@ fn main() {
                         state.scene.objects().len(),
                     );
                 }
-                // Copy the input canvas into the pipeline's back buffer so the
-                // worker can use it as the base layer, then submit the scene.
-                // The worker rasterizes `scene` into the back buffer, then
+                // Hand the scene (and the current input-canvas base layer)
+                // to the pipeline.  The worker rasterizes off-thread and
                 // atomically swaps front/back; the next `poll()` here will
                 // see the new front and call `upload_to()` to push it to GPU.
-                pipeline.submit_scene(&committed_canvas, &state.scene);
+                let submit_id = pipeline.submit_scene(&committed_canvas, &state.scene);
                 committed_canvas.dirty = false;
                 state.scene.dirty = false;
+                // Every submitted snapshot contains the whole committed
+                // scene, so this submit covers every in-flight stroke to
+                // date.  Strokes committed after this point extend the
+                // vec and are covered by a later submit.
+                if !state.in_flight.is_empty() {
+                    state.in_flight_cover = Some((submit_id, state.in_flight.len()));
+                }
             }
 
             // Drain any completed worker frames into the GPU texture.
@@ -1151,6 +1285,16 @@ fn main() {
                 if debug {
                     eprintln!("[dbg] render: texture upload complete");
                 }
+                // The texture now contains every stroke covered by the
+                // rendered submit — retire that prefix of the in-flight
+                // overlay so it isn't drawn twice.
+                if let Some((cover_id, covered)) = state.in_flight_cover
+                    && pipeline.rendered_submit() >= cover_id
+                {
+                    let n = covered.min(state.in_flight.len());
+                    state.in_flight.drain(..n);
+                    state.in_flight_cover = None;
+                }
             }
         }
 
@@ -1161,6 +1305,16 @@ fn main() {
         // Layer 2: active stroke — direct GPU primitives.
         if let Some(ref active) = state.active_stroke {
             draw_active_stroke(&mut sdl_canvas, active, overlay_src);
+        }
+        // Just-committed strokes waiting on the pipeline — keeps fast
+        // successive strokes visually seamless between mouse-up and the
+        // worker's rasterization reaching the texture.  Suppressed
+        // while erasing: the live wipe preview couldn't clear overlay
+        // pixels, so the stroke would appear to resist the eraser.
+        if state.eraser_drag.is_none() {
+            for obj in &state.in_flight {
+                draw_active_stroke(&mut sdl_canvas, obj, overlay_src);
+            }
         }
 
         // Shape tool preview — draw directly via SDL2 GPU calls (no CPU canvas work)
@@ -1381,29 +1535,58 @@ fn main() {
 
         sdl_canvas.present();
 
-        // ── API enable / disable ───────────────────────────────────────────
-        // The settings panel can switch the REST API off.  The change is
-        // applied here rather than in the event handler, because stopping
-        // the server joins its thread — which must not happen while the
-        // event handler holds the borrow on the settings.
+        // ── API enable / disable / rebind ──────────────────────────────────
+        // The settings panel can switch the REST API off and change its
+        // port.  The change is applied here rather than in the event
+        // handler, because stopping the server joins its thread — which
+        // must not happen while the event handler holds the borrow on
+        // the settings.
         if let Some(s) = &state.settings {
             let wanted = s.api_enabled == Toggle::On;
+            let wanted_port = s.api_port;
             let running = api_server.as_ref().is_some_and(|a| a.is_running());
-            if wanted != running {
-                if wanted {
-                    // Start it.  The bind address and port come from the
-                    // config, so a token set there still applies.
-                    let cfg_api = state.cfg.read().unwrap_or_else(|p| p.into_inner());
-                    let (server, rx) = api::serve(
-                        &cfg_api.api.bind,
-                        cfg_api.api.port,
-                        api_snapshot.clone(),
-                        state.cfg.clone(),
-                        config_dirty.clone(),
-                    );
-                    api_server = Some(server);
+
+            // A port edit rebinds a running server; it is written to the
+            // config either way so the next start uses it.
+            let cfg_port = state.cfg.read().unwrap_or_else(|p| p.into_inner()).api.port;
+            if wanted_port != cfg_port {
+                if let Some(mut server) = api_server.take() {
+                    server.stop();
+                    let (_tx, rx) = std::sync::mpsc::sync_channel(0);
                     api_cmd_rx = rx;
-                    eprintln!("[api] started");
+                }
+                {
+                    let mut cfg = state.cfg.write().unwrap_or_else(|p| p.into_inner());
+                    cfg.api.port = wanted_port;
+                    if let Err(e) = config::save(&cfg) {
+                        eprintln!("[annotator] could not save the config: {e}");
+                    }
+                }
+                state.mark_snapshot_dirty();
+            }
+
+            // Without TLS there is no way to reach "wanted on, running
+            // off" — skip rather than retrying (and re-saving the
+            // config) every frame.
+            if wanted != running && (tls_acceptor.is_some() || !wanted) {
+                if wanted {
+                    // Start it — only possible once TLS is set up; the
+                    // bind address and port come from the config, so a
+                    // token set there still applies.
+                    if let Some(ref tls) = tls_acceptor {
+                        let cfg_api = state.cfg.read().unwrap_or_else(|p| p.into_inner());
+                        let (server, rx) = api::serve(
+                            &cfg_api.api.bind,
+                            cfg_api.api.port,
+                            tls,
+                            api_snapshot.clone(),
+                            state.cfg.clone(),
+                            config_dirty.clone(),
+                        );
+                        api_server = Some(server);
+                        api_cmd_rx = rx;
+                        eprintln!("[api] started");
+                    }
                 } else {
                     // Stop it.  The listening socket is released, so the
                     // API is genuinely unreachable.
@@ -1424,6 +1607,15 @@ fn main() {
                     }
                 }
                 state.mark_snapshot_dirty();
+            }
+
+            // Keep the address shown in the panel in step with the port.
+            if let Some(s) = &mut state.settings {
+                let cfg_api = state.cfg.read().unwrap_or_else(|p| p.into_inner());
+                let addr = format!("https://{}:{}", cfg_api.api.bind, cfg_api.api.port);
+                if s.api_addr != addr {
+                    s.api_addr = addr;
+                }
             }
         }
 
@@ -1631,8 +1823,9 @@ fn refresh_settings(state: &mut state::AppState) {
     };
     s.network = net::interface_addresses();
     let cfg_api = state.cfg.read().unwrap_or_else(|p| p.into_inner());
-    s.api_addr = format!("{}:{}", cfg_api.api.bind, cfg_api.api.port);
+    s.api_addr = format!("https://{}:{}", cfg_api.api.bind, cfg_api.api.port);
     s.api_enabled = Toggle::from_bool(cfg_api.api.enabled);
+    s.api_port = cfg_api.api.port;
 }
 
 /// Write the settings panel's values back to the config file so that
@@ -1648,9 +1841,9 @@ fn save_settings(state: &mut state::AppState) {
         cfg.laser_on = s.laser_on == Toggle::On;
         cfg.show_fps = s.show_fps == Toggle::On;
         cfg.undo_stack_limit = s.undo_limit;
-        // The API toggle is applied by the main loop, which writes the
-        // config itself; it is not saved here so the two paths cannot
-        // disagree.
+        // The API toggle and port are applied by the main loop, which
+        // writes the config itself; they are not saved here so the two
+        // paths cannot disagree.
         if let Err(e) = config::save(&cfg) {
             eprintln!("[annotator] could not save settings: {e}");
         }

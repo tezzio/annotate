@@ -34,6 +34,15 @@ export PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
 export PKG_CONFIG_PATH="$LIBDIR/pkgconfig:$SYSROOT/usr/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 export C_INCLUDE_PATH="$SYSROOT/usr/include:$SYSROOT/usr/$MULTIARCH/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
 
+# OpenSSL comes from the sysroot — see scripts/build.sh for why these
+# are set explicitly instead of through pkg-config.
+export OPENSSL_LIB_DIR="$LIBDIR"
+export OPENSSL_INCLUDE_DIR="$SYSROOT/usr/include"
+export OPENSSL_NO_PKG_CONFIG=1
+if [[ "$ARCH" == "aarch64" ]]; then
+    export CC_aarch64_unknown_linux_gnu=cc
+fi
+
 # The library search paths have to come before the `-lSDL2` that
 # sdl2-sys emits: GNU ld resolves `-lfoo` at the point where it sees it.
 # Cargo appends `-C link-arg=` values at the very end of the link line,

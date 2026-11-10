@@ -143,6 +143,23 @@ export C_INCLUDE_PATH="$SYSROOT/usr/include:$SYSROOT/usr/$MULTIARCH/include${C_I
 export PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
 export PKG_CONFIG_PATH="$LIBDIR/pkgconfig:$SYSROOT/usr/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 
+# OpenSSL (HTTPS for the REST API) is linked from the sysroot like every
+# other library.  Point openssl-sys at it explicitly instead of relying
+# on pkg-config: the build host may not have pkg-config installed, and
+# the explicit paths are identical on every machine.  openssl-sys is
+# pure FFI — its only build-time C step is a header EXPANSION (cc -E,
+# preprocessing only), so even the cross build needs nothing more than
+# the host's cc, hence the CC override below.
+export OPENSSL_LIB_DIR="$LIBDIR"
+export OPENSSL_INCLUDE_DIR="$SYSROOT/usr/include"
+export OPENSSL_NO_PKG_CONFIG=1
+if [[ "$ARCH" == "aarch64" ]]; then
+    # The cc crate would otherwise demand a cross gcc for the header
+    # expansion.  Preprocessing the target headers with the host cc is
+    # fine — no code is compiled.
+    export CC_aarch64_unknown_linux_gnu=cc
+fi
+
 # sdl2-sys 0.37 no longer honours SDL2_LIB_DIR; the include and library
 # paths are supplied through RUSTFLAGS instead.
 #

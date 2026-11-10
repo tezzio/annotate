@@ -94,3 +94,21 @@ jobs:
           name: annotator-linux-aarch64
           path: target/aarch64/annotator
           if-no-files-found: error
+
+  # Dependency vulnerability scan.  Advisory only (`continue-on-error`):
+  # a newly published CVE must never block binaries from being built —
+  # the finding shows up as a failing (but non-gating) check so it gets
+  # triaged, not silently ignored.
+  audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

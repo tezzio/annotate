@@ -76,7 +76,7 @@ pub struct User {
     pub must_change_password: bool,
 }
 
-/// REST API configuration (see ROADMAP.md).
+/// REST API configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
     /// Serve the API at all (kiosk deployments can turn it off)
@@ -87,7 +87,7 @@ pub struct ApiConfig {
     #[serde(default = "default_api_bind")]
     pub bind: String,
 
-    /// TCP port for the plain-HTTP API
+    /// TCP port for the HTTPS API
     #[serde(default = "default_api_port")]
     pub port: u16,
 
@@ -140,7 +140,7 @@ fn default_api_bind() -> String {
     "0.0.0.0".to_string()
 }
 fn default_api_port() -> u16 {
-    8080
+    8443
 }
 
 // ── Default impl ──────────────────────────────────────────────────────────────

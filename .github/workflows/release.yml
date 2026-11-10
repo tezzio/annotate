@@ -102,6 +102,15 @@ jobs:
           cp annotator-linux-x86_64/annotator "annotator-${VERSION}-linux-x86_64"
           cp annotator-linux-aarch64/annotator "annotator-${VERSION}-linux-aarch64"
 
+      - name: Checksums
+        run: |
+          # One .sha256 per binary so a download can be verified with
+          # `sha256sum -c annotator-VERSION-linux-ARCH.sha256` from the
+          # directory the files were saved to.
+          for f in annotator-*-linux-x86_64 annotator-*-linux-aarch64; do
+            sha256sum "$f" > "$f.sha256"
+          done
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -109,4 +118,6 @@ jobs:
           files: |
             annotator-*-linux-x86_64
             annotator-*-linux-aarch64
+            annotator-*-linux-x86_64.sha256
+            annotator-*-linux-aarch64.sha256
           generate_release_notes: true

@@ -1067,6 +1067,15 @@ pub struct OverlaySettings {
     /// Whether the REST API is enabled.  Toggling this stops or starts
     /// the server, so it takes effect immediately.
     pub api_enabled: Toggle,
+    /// The port the API listens on.  Editable; a change rebinds the
+    /// server immediately and is written back to the config.
+    pub api_port: u16,
+    /// Direct-entry state for the port row.  While `port_editing` is
+    /// set, digit keys append to `port_buffer` and Return commits —
+    /// nudging a port one at a time with the arrows is useless, so the
+    /// row takes typed digits instead.
+    pub port_editing: bool,
+    pub port_buffer: String,
     /// The API's bind address and port, shown alongside the toggle.
     pub api_addr: String,
     /// The network addresses of this machine, with how each was
@@ -1105,6 +1114,8 @@ pub enum SettingsRow {
     Fullscreen,
     /// Enable or disable the REST API.
     ApiEnabled,
+    /// The port the API listens on.
+    ApiPort,
     /// A read-only line showing the network addresses.
     Network,
 }
@@ -1141,6 +1152,7 @@ impl OverlaySettings {
         SettingsRow::UndoLimit,
         SettingsRow::Section(SettingsSection::Network),
         SettingsRow::ApiEnabled,
+        SettingsRow::ApiPort,
         SettingsRow::Network,
     ];
 }
@@ -1260,6 +1272,9 @@ impl OverlaySettings {
                 self.api_enabled.next();
                 true
             }
+            // The port row takes typed digits instead of arrow nudges
+            // (see start_port_edit) — Left/Right does nothing here.
+            SettingsRow::ApiPort => false,
             // The network line is read-only.
             SettingsRow::Section(_) | SettingsRow::Network => false,
         }
@@ -1268,8 +1283,60 @@ impl OverlaySettings {
     pub fn enter(&mut self) -> OverlayAction {
         match Self::ROWS[self.cursor] {
             SettingsRow::Fullscreen => OverlayAction::ToggleFullscreen,
+            SettingsRow::ApiPort => {
+                self.start_port_edit(None);
+                OverlayAction::None
+            }
             _ => OverlayAction::None,
         }
+    }
+
+    // ── Port direct entry ────────────────────────────────────────────────
+
+    /// Open the port editor, but only when the cursor is on the port
+    /// row.  The buffer starts empty so a typed number replaces the
+    /// current port outright; `first` is the digit that opened the
+    /// editor, if one did.
+    pub fn start_port_edit(&mut self, first: Option<char>) {
+        if Self::ROWS[self.cursor] != SettingsRow::ApiPort {
+            return;
+        }
+        self.port_editing = true;
+        self.port_buffer.clear();
+        if let Some(d) = first {
+            self.port_buffer.push(d);
+        }
+    }
+
+    /// Append a digit while editing.  Ports are at most five digits.
+    pub fn port_edit_input(&mut self, digit: char) {
+        if self.port_buffer.len() < 5 {
+            self.port_buffer.push(digit);
+        }
+    }
+
+    pub fn port_edit_backspace(&mut self) {
+        self.port_buffer.pop();
+    }
+
+    /// Apply the typed port when it is a real one.  Returns whether the
+    /// port actually changed — the main loop notices and rebinds.
+    pub fn commit_port_edit(&mut self) -> bool {
+        self.port_editing = false;
+        match self.port_buffer.parse::<u16>() {
+            Ok(p) if p != 0 => {
+                let changed = p != self.api_port;
+                self.api_port = p;
+                changed
+            }
+            _ => false,
+        }
+    }
+
+    /// Drop the typed text without touching the current port.
+    pub fn cancel_port_edit(&mut self) {
+        self.port_editing = false;
+        self.port_buffer.clear();
     }
 
     /// Top-right close button in the panel header.
@@ -1698,6 +1765,44 @@ impl OverlaySettings {
                 }
             }
 
+            SettingsRow::ApiPort => {
+                render_text(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    "API port",
+                    label_col,
+                    Rect::new(label_x, ry + 4, 200, 24),
+                );
+                let (val_str, hint) = if self.port_editing {
+                    (
+                        format!("{}_", self.port_buffer),
+                        "Enter to set, Esc to cancel",
+                    )
+                } else {
+                    (format!("{}", self.api_port), "https — type a new port")
+                };
+                render_text(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    &val_str,
+                    val_col,
+                    Rect::new(val_x, ry + 4, 120, 24),
+                );
+                render_text(
+                    sdl,
+                    font,
+                    tc,
+                    cache,
+                    hint,
+                    Color::RGB(90, 90, 90),
+                    Rect::new(val_x, ry + 28, 240, 18),
+                );
+            }
+
             SettingsRow::Network => {
                 render_text(
                     sdl,
@@ -1876,3 +1981,106 @@ pub fn render_text_centered(
 
 /// Menu bar height — shared by all UI variants.
 pub const MENU_HEIGHT: i32 = 52;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal settings panel with the cursor on the port row.
+    fn settings_on_port_row() -> OverlaySettings {
+        let mut s = OverlaySettings {
+            cursor: 0,
+            laser_fade: 1.2,
+            laser_on: Toggle::On,
+            show_fps: Toggle::On,
+            show_time: Toggle::On,
+            hide_toolbar: Toggle::Off,
+            fullscreen: Toggle::On,
+            undo_limit: 20,
+            api_enabled: Toggle::On,
+            api_port: 8443,
+            port_editing: false,
+            port_buffer: String::new(),
+            api_addr: String::new(),
+            network: Vec::new(),
+            renderer_info: String::new(),
+            scroll_offset: 0,
+        };
+        while OverlaySettings::ROWS[s.cursor] != SettingsRow::ApiPort {
+            s.cursor += 1;
+        }
+        s
+    }
+
+    #[test]
+    fn typing_a_port_and_committing_sets_it() {
+        let mut s = settings_on_port_row();
+        s.start_port_edit(Some('9'));
+        assert!(s.port_editing);
+        assert_eq!(s.port_buffer, "9");
+        for d in ['0', '9', '0'] {
+            s.port_edit_input(d);
+        }
+        assert_eq!(s.port_buffer, "9090");
+        assert!(s.commit_port_edit());
+        assert_eq!(s.api_port, 9090);
+        assert!(!s.port_editing);
+    }
+
+    #[test]
+    fn cancelling_keeps_the_current_port() {
+        let mut s = settings_on_port_row();
+        s.start_port_edit(Some('1'));
+        s.port_edit_input('2');
+        s.cancel_port_edit();
+        assert_eq!(s.api_port, 8443);
+        assert!(!s.port_editing);
+    }
+
+    #[test]
+    fn an_invalid_or_empty_entry_is_rejected() {
+        let mut s = settings_on_port_row();
+        s.start_port_edit(None);
+        // Empty buffer.
+        assert!(!s.commit_port_edit());
+        assert_eq!(s.api_port, 8443);
+        // Zero is not a usable port.
+        s.start_port_edit(Some('0'));
+        assert!(!s.commit_port_edit());
+        assert_eq!(s.api_port, 8443);
+    }
+
+    #[test]
+    fn the_buffer_caps_at_five_digits_and_backspace_pops() {
+        let mut s = settings_on_port_row();
+        s.start_port_edit(None);
+        for d in ['6', '5', '5', '3', '5', '9'] {
+            s.port_edit_input(d);
+        }
+        assert_eq!(s.port_buffer, "65535"); // the '9' was ignored
+        s.port_edit_backspace();
+        assert_eq!(s.port_buffer, "6553");
+        assert!(s.commit_port_edit());
+        assert_eq!(s.api_port, 6553);
+    }
+
+    #[test]
+    fn the_editor_only_opens_on_the_port_row() {
+        let mut s = settings_on_port_row();
+        s.cursor = 0; // some other row
+        while matches!(OverlaySettings::ROWS[s.cursor], SettingsRow::Section(_)) {
+            s.cursor += 1;
+        }
+        s.start_port_edit(Some('8'));
+        assert!(!s.port_editing);
+        assert_eq!(s.api_port, 8443);
+    }
+
+    #[test]
+    fn arrows_do_not_nudge_the_port() {
+        let mut s = settings_on_port_row();
+        assert!(!s.adjust(true));
+        assert!(!s.adjust(false));
+        assert_eq!(s.api_port, 8443);
+    }
+}

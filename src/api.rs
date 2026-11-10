@@ -1,8 +1,11 @@
-//! Minimal HTTP/1.1 REST API server — Crestron Pro3 integration.
+//! Minimal HTTPS REST API server — Crestron Pro3 integration.
 //!
-//! See ROADMAP.md.  Design constraints:
+//! Design constraints:
 //! - std only: `TcpListener` + one short-lived thread per connection, no async.
-//! - Plain HTTP, `Connection: close` — one transaction per connection.
+//! - TLS everywhere: every accepted socket completes an OpenSSL handshake
+//!   before a single request byte is read (see [`crate::tls`]).  HTTP
+//!   semantics stay deliberately simple: `Connection: close`, one
+//!   transaction per connection.
 //! - GET/POST only, 8 KiB request cap, 2 s socket timeouts.
 //! - At most [`MAX_IN_FLIGHT`] concurrent connections; excess gets a 503.
 //! - Reads are served from a published [`StateSnapshot`] and never touch the
@@ -21,6 +24,8 @@ use std::{
     },
     time::Duration,
 };
+
+use openssl::ssl::SslAcceptor;
 
 use crate::{
     config::Config,
@@ -119,6 +124,11 @@ struct ServerState {
     config_dirty: ConfigDirtyFlag,
     /// Set to false to ask the accept loop to stop.
     running: Arc<AtomicBool>,
+    /// Every accepted connection completes a handshake with this
+    /// acceptor before its request is read.  The acceptor is cheap to
+    /// clone (it shares the underlying SSL_CTX) and immutable after
+    /// construction, so all connection threads share one.
+    tls: Arc<SslAcceptor>,
 }
 
 /// Snapshot handle shared between the main loop (writer) and the API threads.
@@ -143,6 +153,7 @@ const COMMAND_QUEUE: usize = 16;
 pub fn serve(
     bind: &str,
     port: u16,
+    tls: &SslAcceptor,
     snapshot: SharedSnapshot,
     cfg: std::sync::Arc<std::sync::RwLock<Config>>,
     config_dirty: ConfigDirtyFlag,
@@ -176,6 +187,7 @@ pub fn serve(
     // The accept thread takes its own clone of the sender; the server
     // keeps the original so the channel stays open.
     let cmd_tx_thread = cmd_tx.clone();
+    let tls = Arc::new(tls.clone());
 
     let spawned = std::thread::Builder::new()
         .name("api-accept".into())
@@ -190,13 +202,14 @@ pub fn serve(
                     limiter,
                     config_dirty,
                     running: running_thread,
+                    tls,
                 },
             )
         });
 
     match spawned {
         Ok(t) => {
-            eprintln!("[api] listening on http://{addr}/api/v1");
+            eprintln!("[api] listening on https://{addr}/api/v1");
             (
                 ApiServer {
                     cmd_tx,
@@ -230,7 +243,7 @@ fn accept_loop(listener: TcpListener, server_state: ServerState) {
     // port is never released.
     let _ = listener.set_nonblocking(true);
     for stream in incoming_until_stopped(&listener, &running) {
-        let mut stream = match stream {
+        let stream = match stream {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("[api] accept failed: {e}");
@@ -240,12 +253,7 @@ fn accept_loop(listener: TcpListener, server_state: ServerState) {
         // Hard cap on concurrent connections — a Crestron opens one socket
         // per command, so anything above a handful is abuse.
         if in_flight.load(Ordering::SeqCst) >= MAX_IN_FLIGHT {
-            let _ = write_response(
-                &mut stream,
-                503,
-                &err_body("busy — too many connections"),
-                "application/json",
-            );
+            reject_over_capacity(stream, &server_state.tls);
             continue;
         }
 
@@ -259,6 +267,7 @@ fn accept_loop(listener: TcpListener, server_state: ServerState) {
             limiter: server_state.limiter.clone(),
             config_dirty: server_state.config_dirty.clone(),
             running: Arc::clone(&server_state.running),
+            tls: server_state.tls.clone(),
         };
         // The client identity is the source IP.  `peer_addr` fails only
         // for an unconnected socket, which cannot happen here.
@@ -331,9 +340,39 @@ fn isolate_panic<F: FnOnce()>(f: F) -> bool {
     }
 }
 
-fn handle_connection(mut stream: TcpStream, state: &ServerState, peer: &str) {
+/// Answer a connection that arrived while the server was at capacity.
+/// Done inline (no fresh thread) so a flood cannot multiply threads;
+/// the handshake can block the accept loop for at most [`IO_TIMEOUT`],
+/// which a flood could achieve anyway by stalling real connections.
+fn reject_over_capacity(stream: TcpStream, tls: &SslAcceptor) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+    if let Ok(mut tls_stream) = tls.accept(stream) {
+        let _ = write_response(
+            &mut tls_stream,
+            503,
+            &err_body("busy — too many connections"),
+            "application/json",
+        );
+    }
+}
+
+fn handle_connection(stream: TcpStream, state: &ServerState, peer: &str) {
+    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+    // TLS before anything else: no request byte is read until the
+    // handshake completes.
+    let mut stream = match state.tls.accept(stream) {
+        Ok(s) => s,
+        Err(e) => {
+            // Almost always a port scan or a plain-HTTP probe against a
+            // deployment that was not told the API moved to HTTPS.
+            if crate::render_pipeline::DEBUG.load(Ordering::Relaxed) {
+                eprintln!("[api] TLS handshake with {peer} failed: {e}");
+            }
+            return;
+        }
+    };
     let (status, body, ctype) = match read_request(&mut stream) {
         Ok(Some(req)) => {
             // Rate-limit after the path is known — reads and mutations
@@ -361,8 +400,8 @@ fn handle_connection(mut stream: TcpStream, state: &ServerState, peer: &str) {
     let _ = write_response(&mut stream, status, &body, ctype);
 }
 
-fn write_response(
-    stream: &mut TcpStream,
+fn write_response<S: Write>(
+    stream: &mut S,
     status: u16,
     body: &str,
     content_type: &str,
@@ -391,7 +430,7 @@ fn write_response(
 }
 
 /// Write a 429 with a `Retry-After` header.
-fn write_rate_limited(stream: &mut TcpStream, retry_after_secs: u64) -> std::io::Result<()> {
+fn write_rate_limited<S: Write>(stream: &mut S, retry_after_secs: u64) -> std::io::Result<()> {
     let body = err_body("too many requests");
     let head = format!(
         "HTTP/1.1 429 Too Many Requests\r\n\
@@ -2362,7 +2401,15 @@ mod tests {
         let cfg = Arc::new(RwLock::new(Config::default()));
         let dirty: ConfigDirtyFlag = Arc::new(AtomicBool::new(false));
 
-        let (mut server, _rx) = serve("127.0.0.1", port, snap.clone(), cfg.clone(), dirty.clone());
+        let tls = crate::tls::acceptor_ephemeral().expect("test certificate");
+        let (mut server, _rx) = serve(
+            "127.0.0.1",
+            port,
+            &tls,
+            snap.clone(),
+            cfg.clone(),
+            dirty.clone(),
+        );
         assert!(server.is_running(), "the server should be running");
 
         // The port must be bound while the server runs.
@@ -2383,7 +2430,8 @@ mod tests {
         );
 
         // And it can be started again on the same port.
-        let (server2, _rx2) = serve("127.0.0.1", port, snap, cfg, dirty.clone());
+        let tls2 = crate::tls::acceptor_ephemeral().expect("test certificate");
+        let (server2, _rx2) = serve("127.0.0.1", port, &tls2, snap, cfg, dirty.clone());
         assert!(server2.is_running());
         assert!(
             TcpStream::connect(("127.0.0.1", port)).is_ok(),

@@ -70,6 +70,7 @@ PACKAGES=(
     "libxshmfence1"
     "libfreetype6"
     "libpng16-16 libpng16-16t64"
+    "libssl3 libssl3t64"
     "libbrotli1 libbrotli1t64"
     "libharfbuzz0b libharfbuzz0b64"
 )

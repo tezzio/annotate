@@ -1,5 +1,5 @@
 //! Application state — single definition shared by the UI, the render loop,
-//! and the REST API (see ROADMAP.md).
+//! and the REST API.
 //!
 //! `AppState` is owned exclusively by the single-threaded SDL2 main loop.
 //! The API thread never touches it; instead the main loop publishes an
@@ -265,6 +265,24 @@ pub struct AppState {
     /// the committed canvas and bake the result into the scene.
     pub eraser_drag: Option<EraserDrag>,
 
+    /// Strokes committed to `scene` whose rasterization has not yet
+    /// reached the committed texture.  On mouse-up the stroke leaves
+    /// `active_stroke` (so the GPU overlay stops drawing it) but the
+    /// pipeline only shows it once the worker renders + publishes a
+    /// frame containing it — a gap of one or more frames in which the
+    /// just-finished stroke is invisible, which makes fast successive
+    /// strokes look separated.  The render loop draws these as GPU
+    /// overlays until `in_flight_cover` says the texture caught up.
+    pub in_flight: Vec<DrawObject>,
+
+    /// `(submit id, covered prefix length)` recorded by the render loop
+    /// when a scene snapshot containing the current `in_flight` prefix
+    /// was submitted to the pipeline.  Once
+    /// `RenderPipeline::rendered_submit()` reaches the id, the uploaded
+    /// texture contains those strokes and the prefix is drained.
+    /// Strokes appended after this point wait for a later submit.
+    pub in_flight_cover: Option<(u64, usize)>,
+
     /// Bounding box (inclusive min, exclusive max in canvas pixel space)
     /// of the region of `committed_canvas` that was alpha-zeroed by the
     /// live eraser preview since the last frame's texture upload.  The
@@ -362,7 +380,7 @@ pub struct AppState {
     /// Set whenever a field that contributes to [`StateSnapshot`] has been
     /// mutated.  The main loop clears it after publishing a fresh snapshot
     /// to the API threads; while it's false, [`AppState::to_snapshot`] is
-    /// not called.  See ROADMAP.md.
+    /// not called.
     pub snapshot_dirty: bool,
 
     /// Wall-clock of the last published snapshot — used to throttle
@@ -392,6 +410,8 @@ impl AppState {
             drag_cur: (0, 0),
             active_stroke: None,
             eraser_drag: None,
+            in_flight: Vec::new(),
+            in_flight_cover: None,
             scene: Scene::new(undo_limit),
             text_input_active: false,
             text_buffer: String::new(),
