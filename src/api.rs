@@ -780,6 +780,19 @@ fn route(
     // log says so), which keeps single-user kiosk installs working.
     let authenticated = session_user(req, sessions);
 
+    // The API map is public — a client needs to know how the API works
+    // before it can authenticate, so it is answered before the token
+    // check below.
+    if req.path == "/api/v1" || req.path == "/api/v1/" {
+        if req.method != "GET" {
+            return reply_err(405, "method not allowed — use GET", text_mode);
+        }
+        if text_mode {
+            return (200, crate::api_map::to_text(), "text/plain");
+        }
+        return reply(200, ApiPayload::Ok(crate::api_map::to_json()), text_mode);
+    }
+
     if req.path.starts_with("/api/v1/")
         && let Some(expected) = cfg.api.token.as_deref().filter(|t| !t.is_empty())
         && !authenticated.is_some()
@@ -2499,6 +2512,94 @@ mod tests {
         let worker = guard.users.iter().find(|u| u.username == "worker").unwrap();
         assert!(worker.verify_password("newpassword123"));
         assert!(!worker.verify_password("x"));
+    }
+
+    #[test]
+    fn the_api_map_is_public() {
+        // A client has to be able to discover the API before it has a
+        // token, so the map is answered before the token check.
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, _rx) = sync_channel::<ApiCommand>(4);
+        // A config that demands a token.
+        let cfg = cfg_with_token("secret");
+        let sessions = test_sessions();
+
+        // No token at all — the map must still be served.
+        let (status, body, ctype) =
+            route(&get("/api/v1/"), &snap, &tx, &cfg, &sessions, &dirty_flag());
+        assert_eq!(status, 200);
+        assert_eq!(ctype, "application/json");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["api_version"], "1");
+        assert!(v["endpoints"].as_array().unwrap().len() > 10);
+
+        // The bare path works too.
+        let (status, _, _) = route(&get("/api/v1"), &snap, &tx, &cfg, &sessions, &dirty_flag());
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn the_api_map_can_be_plain_text() {
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, _rx) = sync_channel::<ApiCommand>(4);
+        let cfg = cfg_with_token("secret");
+        let sessions = test_sessions();
+
+        let (status, body, ctype) = route(
+            &get("/api/v1/?fmt=text"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+            &dirty_flag(),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(ctype, "text/plain");
+        assert!(body.starts_with("OK "));
+        assert!(body.contains("/api/v1/tool"), "got: {body}");
+        assert!(!body.contains('{'), "the text map must not be JSON");
+    }
+
+    #[test]
+    fn the_api_map_rejects_the_wrong_method() {
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, _rx) = sync_channel::<ApiCommand>(4);
+        let cfg = default_cfg();
+        let sessions = test_sessions();
+
+        let mut req = get("/api/v1/");
+        req.method = "POST".into();
+        let (status, _, _) = route(&req, &snap, &tx, &cfg, &sessions, &dirty_flag());
+        assert_eq!(status, 405);
+    }
+
+    #[test]
+    fn the_other_endpoints_still_need_the_token() {
+        // The map being public must not have opened the rest of the API.
+        let snap: SharedSnapshot = Arc::new(RwLock::new(StateSnapshot::default()));
+        let (tx, _rx) = sync_channel::<ApiCommand>(4);
+        let cfg = cfg_with_token("secret");
+        let sessions = test_sessions();
+
+        let (status, _, _) = route(
+            &get("/api/v1/state"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+            &dirty_flag(),
+        );
+        assert_eq!(status, 401);
+
+        let (status, _, _) = route(
+            &get("/api/v1/state?token=secret"),
+            &snap,
+            &tx,
+            &cfg,
+            &sessions,
+            &dirty_flag(),
+        );
+        assert_eq!(status, 200);
     }
 
     #[test]

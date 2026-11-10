@@ -1,4 +1,5 @@
 mod api;
+mod api_map;
 mod canvas;
 mod capture;
 mod config;
