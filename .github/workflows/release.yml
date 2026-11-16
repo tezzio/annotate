@@ -74,9 +74,36 @@ jobs:
           path: target/${{ matrix.arch }}/annotator
           if-no-files-found: error
 
+  # The macOS build.  It links against the system libraries and the
+  # Homebrew copies of SDL2 and OpenSSL — there is no Debian sysroot on
+  # a Mac, so scripts/build-macos.sh is used instead of scripts/build.sh.
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Homebrew dependencies
+        run: |
+          brew install sdl2-compat sdl2_ttf pkg-config openssl@3
+
+      - name: Build binary
+        run: make build-macos
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: annotator-macos-arm64
+          path: target/macos/bin/annotator
+          if-no-files-found: error
+
   publish:
     runs-on: ubuntu-latest
-    needs: [build]
+    needs: [build, build-macos]
     permissions:
       contents: write
     steps:
@@ -92,6 +119,12 @@ jobs:
           name: annotator-linux-aarch64
           path: annotator-linux-aarch64
 
+      - name: Download macOS binary
+        uses: actions/download-artifact@v4
+        with:
+          name: annotator-macos-arm64
+          path: annotator-macos-arm64
+
       - name: Rename artifacts with version
         run: |
           # The tag wins when the workflow was dispatched by hand: in that
@@ -101,13 +134,14 @@ jobs:
           VERSION="${VERSION#v}"
           cp annotator-linux-x86_64/annotator "annotator-${VERSION}-linux-x86_64"
           cp annotator-linux-aarch64/annotator "annotator-${VERSION}-linux-aarch64"
+          cp annotator-macos-arm64/annotator "annotator-${VERSION}-macos-arm64"
 
       - name: Checksums
         run: |
           # One .sha256 per binary so a download can be verified with
-          # `sha256sum -c annotator-VERSION-linux-ARCH.sha256` from the
+          # `sha256sum -c annotator-VERSION-OS-ARCH.sha256` from the
           # directory the files were saved to.
-          for f in annotator-*-linux-x86_64 annotator-*-linux-aarch64; do
+          for f in annotator-*-linux-x86_64 annotator-*-linux-aarch64 annotator-*-macos-arm64; do
             sha256sum "$f" > "$f.sha256"
           done
 
@@ -118,6 +152,8 @@ jobs:
           files: |
             annotator-*-linux-x86_64
             annotator-*-linux-aarch64
+            annotator-*-macos-arm64
             annotator-*-linux-x86_64.sha256
             annotator-*-linux-aarch64.sha256
+            annotator-*-macos-arm64.sha256
           generate_release_notes: true

@@ -324,6 +324,26 @@ fn random_bytes(n: usize) -> Vec<u8> {
             return buf;
         }
     }
+    // macOS has `getentropy`, which is the BSD equivalent of
+    // `getrandom`.  It fills at most 256 bytes per call.
+    #[cfg(target_os = "macos")]
+    {
+        let mut filled = 0usize;
+        let mut ok = true;
+        while filled < n {
+            let chunk = (n - filled).min(256);
+            let ret =
+                unsafe { libc::getentropy(buf[filled..].as_mut_ptr() as *mut libc::c_void, chunk) };
+            if ret != 0 {
+                ok = false;
+                break;
+            }
+            filled += chunk;
+        }
+        if ok {
+            return buf;
+        }
+    }
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         use std::io::Read;
         if f.read_exact(&mut buf).is_ok() {
@@ -510,7 +530,21 @@ pub fn config_candidates() -> Vec<PathBuf> {
     let mut out = Vec::new();
 
     // The user's own configuration directory.
-    if let Ok(p) = std::env::var("XDG_CONFIG_HOME")
+    //
+    // macOS keeps application settings in ~/Library/Application Support;
+    // the XDG variables are used everywhere else.
+    if cfg!(target_os = "macos") {
+        if let Ok(home) = std::env::var("HOME")
+            && !home.is_empty()
+        {
+            out.push(
+                PathBuf::from(home)
+                    .join("Library/Application Support")
+                    .join("annotator")
+                    .join(CONFIG_FILE_NAME),
+            );
+        }
+    } else if let Ok(p) = std::env::var("XDG_CONFIG_HOME")
         && !p.is_empty()
     {
         out.push(PathBuf::from(p).join("annotator").join(CONFIG_FILE_NAME));

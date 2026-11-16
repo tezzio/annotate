@@ -545,7 +545,13 @@ fn handle_keydown(
         return true;
     }
 
-    let ctrl = mods.contains(Mod::LCTRLMOD) || mods.contains(Mod::RCTRLMOD);
+    // The "command" modifier is Ctrl on Linux and Command on macOS, so
+    // the shortcuts work the same way on both.  SDL2 reports the macOS
+    // Command key as the GUI modifier.
+    let ctrl = mods.contains(Mod::LCTRLMOD)
+        || mods.contains(Mod::RCTRLMOD)
+        || cfg!(target_os = "macos")
+            && (mods.contains(Mod::LGUIMOD) || mods.contains(Mod::RGUIMOD));
     let shift = mods.contains(Mod::LSHIFTMOD) || mods.contains(Mod::RSHIFTMOD);
 
     // Text input mode intercepts most keys

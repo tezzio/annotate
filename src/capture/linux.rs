@@ -19,57 +19,10 @@ use v4l::{
     video::{Capture, capture::Parameters},
 };
 
-// ── Public types ──────────────────────────────────────────────────────────────
-
-#[derive(Clone, PartialEq)]
-pub enum FrameFormat {
-    Rgb24,
-    Yuyv,
-}
-
-/// A video frame — either RGB24 (software path) or YUYV (V4L2 hardware
-/// passthrough).
-#[derive(Clone)]
-pub struct Frame {
-    pub data: Arc<Vec<u8>>,
-    pub width: u32,
-    pub height: u32,
-    pub format: FrameFormat,
-}
-
-impl Frame {
-    /// Convenience: build a Frame that takes ownership of a `Vec<u8>`.
-    /// Wraps the buffer in `Arc` so the consumer can hold it cheaply
-    /// while the capture thread reuses its ring slot for the next frame.
-    pub fn from_owned(data: Vec<u8>, width: u32, height: u32, format: FrameFormat) -> Self {
-        Self {
-            data: Arc::new(data),
-            width,
-            height,
-            format,
-        }
-    }
-}
-
-/// A user-selectable capture mode (format + resolution + estimated fps).
-#[derive(Clone, Debug)]
-pub struct CapMode {
-    pub is_mjpeg: bool,
-    pub width: u32,
-    pub height: u32,
-    pub fps: u32,
-}
+use super::{CapMode, CaptureStatus, DeviceInfo, Frame, FrameFormat};
 
 impl CapMode {
-    pub fn label(&self) -> String {
-        format!(
-            "{} {}×{} @{}fps",
-            if self.is_mjpeg { "MJPEG" } else { "YUYV" },
-            self.width,
-            self.height,
-            self.fps
-        )
-    }
+    /// The V4L2 fourcc this mode asks the driver for.
     fn fourcc(&self) -> FourCC {
         if self.is_mjpeg {
             FourCC::new(b"MJPG")
@@ -77,30 +30,6 @@ impl CapMode {
             FourCC::new(b"YUYV")
         }
     }
-}
-
-/// Describes a detected V4L2 device.
-#[derive(Clone, Debug)]
-pub struct DeviceInfo {
-    pub path: PathBuf,
-    pub name: String,
-    pub modes: Vec<CapMode>,
-    /// Pre-formatted one-liner derived from modes.
-    pub caps_summary: String,
-}
-
-/// What the capture thread reports back to the main loop.
-///
-/// The capture thread runs on its own, so the main loop cannot see a
-/// device being unplugged until the thread says so.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CaptureStatus {
-    /// The device is streaming normally.
-    Streaming,
-    /// The device went away — unplugged, or the driver released it.
-    /// The capture thread keeps retrying and will report `Streaming`
-    /// again once the device comes back.
-    DeviceLost,
 }
 
 // ── Device enumeration ────────────────────────────────────────────────────────
@@ -777,56 +706,6 @@ fn passthrough_yuyv_into(data: &[u8], w: u32, h: u32, slot: &mut Vec<u8>) -> Opt
     slot.clear();
     slot.extend_from_slice(&data[..expected]);
     Some(())
-}
-
-// ── Screenshot capture ─────────────────────────────────────────────────────────
-
-use sdl2::pixels::PixelFormatEnum;
-use sdl2::render::Canvas as SdlCanvas;
-use sdl2::video::Window;
-use std::fs::File;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-/// Save the current canvas content to a PNG file in /tmp/
-/// Returns the path to the saved file, or None on failure.
-pub fn save_screenshot(
-    sdl_canvas: &SdlCanvas<Window>,
-    canvas_w: u32,
-    canvas_h: u32,
-) -> Option<String> {
-    // Create PNG encoder
-    let mut file = File::create("/tmp/annotator_screenshot.png").ok()?;
-
-    // Get pixels from the canvas (area below menu bar)
-    let menu_h = crate::ui::MENU_HEIGHT as u32;
-    let capture_h = canvas_h.saturating_sub(menu_h);
-
-    // Read pixels
-    let rect = sdl2::rect::Rect::new(0, menu_h as i32, canvas_w, capture_h);
-    let rgb_data = sdl_canvas
-        .read_pixels(Some(rect), PixelFormatEnum::RGB24)
-        .ok()?;
-
-    // Encode as PNG
-    let mut encoder = png::Encoder::new(&mut file, canvas_w, capture_h);
-    encoder.set_color(png::ColorType::Rgb);
-    encoder.set_depth(png::BitDepth::Eight);
-
-    if let Ok(mut writer) = encoder.write_header()
-        && writer.write_image_data(&rgb_data).is_ok()
-    {
-        // Rename with timestamp
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let path = format!("/tmp/annotate_screenshot_{}.png", timestamp);
-        if std::fs::rename("/tmp/annotator_screenshot.png", &path).is_ok() {
-            return Some(path);
-        }
-        return Some("/tmp/annotator_screenshot.png".to_string());
-    }
-    None
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

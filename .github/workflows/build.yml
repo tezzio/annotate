@@ -95,6 +95,37 @@ jobs:
           path: target/aarch64/annotator
           if-no-files-found: error
 
+  # The macOS build.  It links against the system libraries and the
+  # Homebrew copies of SDL2 and OpenSSL — there is no Debian sysroot on
+  # a Mac, so scripts/build-macos.sh is used instead of scripts/build.sh.
+  build-macos:
+    runs-on: macos-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Homebrew dependencies
+        run: |
+          brew install sdl2-compat sdl2_ttf pkg-config openssl@3
+
+      - name: Build macOS binary
+        run: make build-macos
+
+      # The tests are run here: the macOS runner has the libraries the
+      # test binary links against, so it can actually be executed.
+      - name: Run the unit tests
+        run: make test
+
+      - name: Upload macOS binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: annotator-macos-arm64
+          path: target/macos/bin/annotator
+          if-no-files-found: error
+
   # Dependency vulnerability scan.  Advisory only (`continue-on-error`):
   # a newly published CVE must never block binaries from being built —
   # the finding shows up as a failing (but non-gating) check so it gets

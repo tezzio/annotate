@@ -23,13 +23,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ── Architecture & multiarch ────────────────────────────────────────────────
-: "${ARCH:=x86_64}"
-case "$ARCH" in
-    x86_64|amd64)  ARCH=x86_64;  MULTIARCH=x86_64-linux-gnu  ;;
-    aarch64|arm64) ARCH=aarch64; MULTIARCH=aarch64-linux-gnu ;;
-    *) echo "ERROR: unsupported ARCH '$ARCH' (use x86_64 or aarch64)" >&2; exit 1 ;;
+#
+# On macOS there is no multiarch directory and no cross build: the
+# target triple is the host's, so the architecture follows `uname -m`.
+case "$(uname -s)" in
+    Darwin)
+        : "${ARCH:=$(uname -m)}"
+        MULTIARCH=""
+        : "${TARGET:=$ARCH-apple-darwin}"
+        ;;
+    *)
+        : "${ARCH:=x86_64}"
+        case "$ARCH" in
+            x86_64|amd64)  ARCH=x86_64;  MULTIARCH=x86_64-linux-gnu  ;;
+            aarch64|arm64) ARCH=aarch64; MULTIARCH=aarch64-linux-gnu ;;
+            *) echo "ERROR: unsupported ARCH '$ARCH' (use x86_64 or aarch64)" >&2; exit 1 ;;
+        esac
+        : "${TARGET:=$ARCH-unknown-linux-gnu}"
+        ;;
 esac
-: "${TARGET:=$ARCH-unknown-linux-gnu}"
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 : "${TARGET_DIR:=$PROJECT_DIR/target}"

@@ -20,6 +20,23 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
+# ── macOS ────────────────────────────────────────────────────────────────────
+#
+# The Debian sysroot does not exist on a Mac: the libraries come from
+# the system and from Homebrew.  The OpenSSL crate does not support the
+# LibreSSL that macOS ships, so the Homebrew build of OpenSSL is used.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    OPENSSL_PREFIX="$(brew --prefix openssl@3 2>/dev/null || brew --prefix openssl)"
+    export OPENSSL_LIB_DIR="$OPENSSL_PREFIX/lib"
+    export OPENSSL_INCLUDE_DIR="$OPENSSL_PREFIX/include"
+    export OPENSSL_NO_PKG_CONFIG=1
+    export PKG_CONFIG_PATH="$OPENSSL_PREFIX/lib/pkgconfig:$(brew --prefix sdl2-compat)/lib/pkgconfig:$(brew --prefix sdl2_ttf)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+
+    info "Running the tests..."
+    cargo test "$@"
+    exit 0
+fi
+
 : "${SYSROOT:=$TARGET_DIR/$ARCH-libs}"
 
 LIBDIR="$SYSROOT/usr/lib/$MULTIARCH"

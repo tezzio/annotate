@@ -4,12 +4,17 @@
 # the Debian library packages fetched by scripts/sysroot.sh.  There is no
 # initrd, no ISO and no operating system image — just the binary.
 #
+# On macOS the Debian packages do not apply: the build links against the
+# system libraries and the Homebrew copies of SDL2 and OpenSSL.  The
+# `build-macos` target takes care of that.
+#
 # Usage:
 #   make help              Show available targets
 #   make bootstrap         Install host dependencies (+ rustup if needed)
 #   make libs              Fetch the Debian library packages
 #   make build             Build the annotator binary
 #   make build-arm         Build the aarch64 binary
+#   make build-macos       Build the annotator on macOS
 #   make all               Fetch the libraries and build both binaries
 #   make clean             Remove the built binaries
 #
@@ -25,7 +30,8 @@ TARGET      ?= $(ARCH)-unknown-linux-gnu
 
 LIBDIRS := $(TARGET_DIR)/x86_64-libs $(TARGET_DIR)/aarch64-libs
 
-.PHONY: help bootstrap libs libs-x86 libs-arm build build-arm test all clean clean-all
+.PHONY: help bootstrap libs libs-x86 libs-arm build build-arm build-macos \
+        test all clean clean-all
 
 help:
 	@echo "annotate build system"
@@ -39,6 +45,7 @@ help:
 	@echo "Build targets:"
 	@echo "  build          Build the annotator for $(TARGET)"
 	@echo "  build-arm      Build the annotator for aarch64"
+	@echo "  build-macos    Build the annotator on macOS (Homebrew SDL2/OpenSSL)"
 	@echo "  all            Fetch the libraries and build both binaries"
 	@echo ""
 	@echo "Clean targets:"
@@ -53,6 +60,7 @@ help:
 	@echo "  make bootstrap                    # install host deps"
 	@echo "  make                              # libs + build for $(ARCH)"
 	@echo "  make build-arm                    # cross-compile for aarch64"
+	@echo "  make build-macos                  # build on a Mac"
 	@echo "  make all                          # both architectures"
 
 bootstrap:
@@ -68,10 +76,20 @@ libs-arm:
 	@ARCH=aarch64 bash $(SCRIPTS_DIR)/sysroot.sh
 
 build:
-	@ARCH=$(ARCH) bash $(SCRIPTS_DIR)/build.sh
+	@if [ "$$(uname -s)" = "Darwin" ]; then \
+		bash $(SCRIPTS_DIR)/build-macos.sh; \
+	else \
+		ARCH=$(ARCH) bash $(SCRIPTS_DIR)/build.sh; \
+	fi
 
 build-arm:
 	@ARCH=aarch64 bash $(SCRIPTS_DIR)/build.sh
+
+# build-macos: build on a Mac.  The Debian sysroot does not apply
+# there, so this uses the system libraries plus the Homebrew copies of
+# SDL2 and OpenSSL.
+build-macos:
+	@bash $(SCRIPTS_DIR)/build-macos.sh
 
 # test: run the unit tests.  The host has no SDL2 development packages
 # installed, so the libraries from the library directory are put on the
@@ -88,6 +106,7 @@ all: libs-x86 libs-arm
 # cache are preserved so that the next build is fast.
 clean:
 	@rm -f $(TARGET_DIR)/x86_64/annotator $(TARGET_DIR)/aarch64/annotator
+	@rm -rf $(TARGET_DIR)/macos
 	@echo "Cleaned binaries (libraries and cargo cache preserved)"
 
 # clean-all: also remove the fetched Debian library packages and the

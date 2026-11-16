@@ -1,16 +1,10 @@
 [package]
 name = "annotator"
-version = "0.5.0"
+version = "0.5.5"
 edition = "2024"
 
 [dependencies]
 sdl2         = { version = "0.37", features = ["ttf"] }
-v4l          = "0.14"
-# Pure-Rust JPEG decoder with SIMD on both aarch64 (NEON) and x86_64 (SSE2/AVX2).
-# Explicit feature flags ensure SIMD paths are compiled in on every target.
-# zune-core is required to reach DecoderOptions / ColorSpace for output colorspace control.
-zune-jpeg    = { version = "0.4", default-features = false, features = ["x86", "neon", "std"] }
-zune-core    = { version = "0.4", default-features = false, features = ["std"] }
 libc         = "0.2"
 # Work-stealing thread pool for parallel scene rasterization and the
 # background rasterizer thread.  Default features pull in std; no extra
@@ -22,11 +16,60 @@ toml         = "0.8"
 sha2         = "0.10"
 hex          = "0.4"
 png          = "0.17"
-url          = "2"
+
 # HTTPS for the REST API.  `openssl-sys` is pure FFI — it compiles no C,
 # it links the prebuilt libssl from the per-arch sysroot (scripts/sysroot.sh),
 # so the aarch64 cross build still needs no C toolchain.
+#
+# macOS ships LibreSSL as part of the system, which the OpenSSL crate does
+# not support, so the Homebrew build of OpenSSL is used there instead.
 openssl      = "0.10"
+
+# V4L2 is a Linux kernel API.  The crate is Linux-only, so it is only
+# pulled in for Linux targets; macOS captures through AVFoundation instead.
+#
+# The JPEG decoder goes with it: it is only used for the MJPEG streams
+# the V4L2 backend produces.  AVFoundation hands out uncompressed frames,
+# so macOS has no use for it.
+[target.'cfg(target_os = "linux")'.dependencies]
+v4l          = "0.14"
+# Pure-Rust JPEG decoder with SIMD on both aarch64 (NEON) and x86_64 (SSE2/AVX2).
+# Explicit feature flags ensure SIMD paths are compiled in on every target.
+# zune-core is required to reach DecoderOptions / ColorSpace for output colorspace control.
+zune-jpeg    = { version = "0.4", default-features = false, features = ["x86", "neon", "std"] }
+zune-core    = { version = "0.4", default-features = false, features = ["std"] }
+
+# On macOS, `use-pkgconfig` lets sdl2-sys find the Homebrew SDL2 and
+# SDL2_ttf instead of insisting on the system framework copies, which
+# are not present on a machine that only has the Xcode command line
+# tools installed.
+#
+# The Linux build is left alone: it links against the Debian sysroot
+# through a linker wrapper, and the pkg-config probe would fail there.
+#
+# The AVFoundation bindings for the macOS capture backend are here too.
+# They are the `objc2` family of crates: safe wrappers over the
+# Objective-C runtime with no C code of their own.
+[target.'cfg(target_os = "macos")'.dependencies]
+sdl2                       = { version = "0.37", features = ["ttf", "use-pkgconfig"] }
+objc2                       = "0.6"
+objc2-foundation            = { version = "0.3", features = ["NSArray", "NSString", "NSObject", "NSError", "NSDictionary", "NSValue"] }
+objc2-av-foundation         = { version = "0.3", features = [
+    "AVCaptureDevice",
+    "AVCaptureInput",
+    "AVCaptureOutput",
+    "AVCaptureOutputBase",
+    "AVCaptureSession",
+    "AVCaptureSessionPreset",
+    "AVCaptureVideoDataOutput",
+    "AVMediaFormat",
+    "dispatch2",
+    "objc2-core-media",
+    "objc2-core-video",
+] }
+objc2-core-media            = { version = "0.3", features = ["CMSampleBuffer", "CMFormatDescription", "CMBlockBuffer"] }
+objc2-core-video            = { version = "0.3", features = ["CVPixelBuffer", "CVImageBuffer", "CVBuffer", "CVBase", "CVReturn"] }
+dispatch2                   = "0.3"
 
 [build-dependencies]
 ureq    = "2"

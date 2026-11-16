@@ -198,12 +198,15 @@ pub fn save_dir() -> PathBuf {
     {
         return PathBuf::from(d);
     }
-    let base = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            PathBuf::from(home).join(".local/share")
-        });
+    let home = || std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let base = if cfg!(target_os = "macos") {
+        // macOS keeps application data in ~/Library/Application Support.
+        PathBuf::from(home()).join("Library/Application Support")
+    } else {
+        std::env::var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(home()).join(".local/share"))
+    };
     base.join("annotator/saves")
 }
 

@@ -111,6 +111,7 @@ pub fn primary_address() -> Option<IpAddr> {
 }
 
 /// The names of the interfaces that carry a default route.
+#[cfg(target_os = "linux")]
 fn default_route_interfaces() -> Vec<String> {
     let Ok(routes) = std::fs::read_to_string("/proc/net/route") else {
         return Vec::new();
@@ -126,6 +127,41 @@ fn default_route_interfaces() -> Vec<String> {
         }
     }
     out
+}
+
+/// The names of the interfaces that carry a default route.
+///
+/// macOS has no `/proc`; `netstat -rn` prints the routing table with the
+/// default route first and names the interface in the last column.
+#[cfg(target_os = "macos")]
+fn default_route_interfaces() -> Vec<String> {
+    let Ok(out) = std::process::Command::new("netstat")
+        .args(["-rn", "-f", "inet"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut interfaces = Vec::new();
+    for line in text.lines() {
+        // The header lines and the "Destination" separator carry no
+        // interface.
+        if line.starts_with("Destination") || line.starts_with("Routing") {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some(dest) = fields.next() else { continue };
+        if dest != "default" {
+            continue;
+        }
+        // "default  10.0.0.1  UGSc  en0"
+        let Some(iface) = fields.nth(3) else { continue };
+        interfaces.push(iface.to_string());
+    }
+    interfaces
 }
 
 /// Classify an address by how it was obtained.
@@ -168,15 +204,55 @@ fn is_link_local_v6(v6: &Ipv6Addr) -> bool {
 /// systems without NetworkManager.  If neither can be consulted the
 /// address is reported as static, which is the safe answer: it never
 /// claims a lease the operator cannot verify.
+#[cfg(target_os = "linux")]
 fn dhcp_leases_contain(iface: &str, addr: &Ipv4Addr) -> bool {
     if network_manager_uses_dhcp(iface) {
         return true;
     }
-    dhclient_lease_contains(iface, addr)
+    dhclient_lease_contain(iface, addr)
+}
+
+/// True when the address was assigned by DHCP.
+///
+/// macOS keeps no readable lease files — the DHCP state lives inside
+/// `configd`.  `ipconfig getpacket <iface>` prints the last DHCP
+/// exchange for the interface, so the address is compared against the
+/// one the server handed out.  When the command is unavailable the
+/// address is reported as static, which is the safe answer: it never
+/// claims a lease the operator cannot verify.
+#[cfg(target_os = "macos")]
+fn dhcp_leases_contain(iface: &str, addr: &Ipv4Addr) -> bool {
+    let Ok(out) = std::process::Command::new("ipconfig")
+        .args(["getpacket", iface])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let want = addr.to_string();
+    // The packet lists the address the server offered as `yiaddr`, and
+    // the one the client is using as `ciaddr`.
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(value) = line
+            .strip_prefix("yiaddr = ")
+            .or_else(|| line.strip_prefix("ciaddr = "))
+        else {
+            continue;
+        };
+        if value.trim() == want {
+            return true;
+        }
+    }
+    false
 }
 
 /// True when NetworkManager drives `iface` with an automatic (DHCP)
 /// method.
+#[cfg(target_os = "linux")]
 fn network_manager_uses_dhcp(iface: &str) -> bool {
     // `nmcli -g ipv4.method con show <connection>` prints the method for
     // the named connection.  The connection that owns the device has to
@@ -223,6 +299,7 @@ fn network_manager_uses_dhcp(iface: &str) -> bool {
 }
 
 /// True when a dhclient lease file for `iface` lists this address.
+#[cfg(target_os = "linux")]
 fn dhclient_lease_contains(iface: &str, addr: &Ipv4Addr) -> bool {
     let dirs = ["/var/lib/dhcp", "/var/lib/dhclient"];
     let want = addr.to_string();
