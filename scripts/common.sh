@@ -26,9 +26,19 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 #
 # On macOS there is no multiarch directory and no cross build: the
 # target triple is the host's, so the architecture follows `uname -m`.
+#
+# The names differ between the two worlds: `uname -m` reports `arm64`
+# on macOS, while Rust's target triple and the rest of the build use
+# `aarch64`.  ARCH is normalised to the Rust spelling, so the same
+# variable means the same thing everywhere.
 case "$(uname -s)" in
     Darwin)
         : "${ARCH:=$(uname -m)}"
+        case "$ARCH" in
+            x86_64|amd64)  ARCH=x86_64;  ;;
+            aarch64|arm64) ARCH=aarch64; ;;
+            *) echo "ERROR: unsupported ARCH '$ARCH' (use x86_64 or aarch64)" >&2; exit 1 ;;
+        esac
         MULTIARCH=""
         : "${TARGET:=$ARCH-apple-darwin}"
         ;;

@@ -62,7 +62,6 @@ case "$ARCH" in
     aarch64|arm64) ARCH=aarch64; TARGET=aarch64-apple-darwin ;;
     *) die "Unsupported ARCH '$ARCH' (use x86_64 or aarch64)" ;;
 esac
-TARGET="${TARGET:-$TARGET}"
 
 # ── Dependencies ─────────────────────────────────────────────────────────────
 

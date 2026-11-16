@@ -109,7 +109,7 @@ jobs:
 
       - name: Install Homebrew dependencies
         run: |
-          brew install sdl2-compat sdl2_ttf pkg-config openssl@3
+          brew install sdl2-compat sdl2_ttf sdl3 pkg-config openssl@3
 
       - name: Build macOS binary
         run: make build-macos
@@ -119,11 +119,23 @@ jobs:
       - name: Run the unit tests
         run: make test
 
+      # The bundle carries its own copies of SDL2, SDL3 and OpenSSL, so
+      # it runs on a machine that has never seen Homebrew.
+      - name: Build the macOS bundle
+        run: make package-macos
+
       - name: Upload macOS binary
         uses: actions/upload-artifact@v4
         with:
           name: annotator-macos-arm64
           path: target/macos/bin/annotator
+          if-no-files-found: error
+
+      - name: Upload macOS disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: annotator-macos-arm64-dmg
+          path: target/macos/*.dmg
           if-no-files-found: error
 
   # Dependency vulnerability scan.  Advisory only (`continue-on-error`):

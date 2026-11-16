@@ -89,16 +89,28 @@ jobs:
 
       - name: Install Homebrew dependencies
         run: |
-          brew install sdl2-compat sdl2_ttf pkg-config openssl@3
+          brew install sdl2-compat sdl2_ttf sdl3 pkg-config openssl@3
 
       - name: Build binary
         run: make build-macos
+
+      # The bundle carries its own copies of SDL2, SDL3 and OpenSSL, so
+      # it runs on a machine that has never seen Homebrew.
+      - name: Build the bundle and the disk image
+        run: make package-macos
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: annotator-macos-arm64
           path: target/macos/bin/annotator
+          if-no-files-found: error
+
+      - name: Upload disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: annotator-macos-arm64-dmg
+          path: target/macos/*.dmg
           if-no-files-found: error
 
   publish:
@@ -125,6 +137,12 @@ jobs:
           name: annotator-macos-arm64
           path: annotator-macos-arm64
 
+      - name: Download macOS disk image
+        uses: actions/download-artifact@v4
+        with:
+          name: annotator-macos-arm64-dmg
+          path: annotator-macos-arm64-dmg
+
       - name: Rename artifacts with version
         run: |
           # The tag wins when the workflow was dispatched by hand: in that
@@ -135,13 +153,19 @@ jobs:
           cp annotator-linux-x86_64/annotator "annotator-${VERSION}-linux-x86_64"
           cp annotator-linux-aarch64/annotator "annotator-${VERSION}-linux-aarch64"
           cp annotator-macos-arm64/annotator "annotator-${VERSION}-macos-arm64"
+          # The disk image is already named after the version, but the
+          # name is normalised here so it matches the other assets.
+          for dmg in annotator-macos-arm64-dmg/*.dmg; do
+            cp "$dmg" "annotator-${VERSION}-macos-arm64.dmg"
+          done
 
       - name: Checksums
         run: |
           # One .sha256 per binary so a download can be verified with
           # `sha256sum -c annotator-VERSION-OS-ARCH.sha256` from the
           # directory the files were saved to.
-          for f in annotator-*-linux-x86_64 annotator-*-linux-aarch64 annotator-*-macos-arm64; do
+          for f in annotator-*-linux-x86_64 annotator-*-linux-aarch64 \
+                   annotator-*-macos-arm64 annotator-*-macos-arm64.dmg; do
             sha256sum "$f" > "$f.sha256"
           done
 
@@ -153,7 +177,9 @@ jobs:
             annotator-*-linux-x86_64
             annotator-*-linux-aarch64
             annotator-*-macos-arm64
+            annotator-*-macos-arm64.dmg
             annotator-*-linux-x86_64.sha256
             annotator-*-linux-aarch64.sha256
             annotator-*-macos-arm64.sha256
+            annotator-*-macos-arm64.dmg.sha256
           generate_release_notes: true

@@ -31,7 +31,7 @@ TARGET      ?= $(ARCH)-unknown-linux-gnu
 LIBDIRS := $(TARGET_DIR)/x86_64-libs $(TARGET_DIR)/aarch64-libs
 
 .PHONY: help bootstrap libs libs-x86 libs-arm build build-arm build-macos \
-        test all clean clean-all
+        package-macos test all clean clean-all
 
 help:
 	@echo "annotate build system"
@@ -46,6 +46,7 @@ help:
 	@echo "  build          Build the annotator for $(TARGET)"
 	@echo "  build-arm      Build the annotator for aarch64"
 	@echo "  build-macos    Build the annotator on macOS (Homebrew SDL2/OpenSSL)"
+	@echo "  package-macos  Build the macOS .app bundle and the .dmg"
 	@echo "  all            Fetch the libraries and build both binaries"
 	@echo ""
 	@echo "Clean targets:"
@@ -61,6 +62,7 @@ help:
 	@echo "  make                              # libs + build for $(ARCH)"
 	@echo "  make build-arm                    # cross-compile for aarch64"
 	@echo "  make build-macos                  # build on a Mac"
+	@echo "  make package-macos                # build the .app and the .dmg"
 	@echo "  make all                          # both architectures"
 
 bootstrap:
@@ -90,6 +92,12 @@ build-arm:
 # SDL2 and OpenSSL.
 build-macos:
 	@bash $(SCRIPTS_DIR)/build-macos.sh
+
+# package-macos: build the .app bundle and the .dmg.  The bundle
+# carries its own copies of the SDL2, SDL3 and OpenSSL libraries, so it
+# runs on a machine that has never seen Homebrew.
+package-macos:
+	@bash $(SCRIPTS_DIR)/package-macos.sh
 
 # test: run the unit tests.  The host has no SDL2 development packages
 # installed, so the libraries from the library directory are put on the

@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "annotator"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "bzip2",
  "dispatch2",

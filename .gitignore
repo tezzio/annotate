@@ -6,4 +6,10 @@
 
 # Editor / tooling
 /.claude/PLAN.md
-/assets/
+
+# Scratch space for generated artwork.  The icon *source*
+# (assets/make-icon.swift) is tracked; the rendered .icns is a build
+# artefact and lives in target/.
+/assets/*.icns
+/assets/*.iconset/
+
