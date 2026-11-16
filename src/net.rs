@@ -209,7 +209,7 @@ fn dhcp_leases_contain(iface: &str, addr: &Ipv4Addr) -> bool {
     if network_manager_uses_dhcp(iface) {
         return true;
     }
-    dhclient_lease_contain(iface, addr)
+    dhclient_lease_contains(iface, addr)
 }
 
 /// True when the address was assigned by DHCP.
