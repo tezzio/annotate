@@ -74,10 +74,17 @@ public final class CameraBridge {
     //
     // The reader is closed when the camera is closed, but its callback
     // may already be running: the image it is holding is released with
-    // the reader, and reading it afterwards reads freed memory.  The
-    // callback checks this flag, and the close waits for the callback
-    // to finish before it releases anything.
+    // the reader, and reading it afterwards reads freed memory.
     private static volatile boolean sOpen = false;
+
+    // Held while a frame is being read.
+    //
+    // The close takes it before releasing the reader, so that a frame
+    // is never read from a reader that has been closed.  A flag alone
+    // is not enough: it is checked when the callback starts, and the
+    // callback may already be reading the image by the time the close
+    // clears it.
+    private static final Object sLock = new Object();
 
     /**
      * Called by this class when a frame arrives.
@@ -247,26 +254,53 @@ public final class CameraBridge {
         final int requestedWidth = width;
         final int requestedHeight = height;
 
+        // The thread the camera's callbacks arrive on.  A callback
+        // that arrives after the camera has been closed is ignored: the
+        // thread is stopped with `quitSafely`, which lets the messages
+        // that are already queued run, and one of them is the "opened"
+        // message.
+        final HandlerThread thisThread = sThread;
+
         try {
             manager.openCamera(cameraId, new CameraDevice.StateCallback() {
                 @Override
                 public void onOpened(CameraDevice camera) {
-                    sCamera = camera;
-                    sOpen = true;
+                    synchronized (sLock) {
+                        if (sThread != thisThread) {
+                            // The camera was closed while it was being
+                            // opened.
+                            camera.close();
+                            return;
+                        }
+                        sCamera = camera;
+                        sOpen = true;
+                    }
                     startPreview(manager, camera, requestedWidth, requestedHeight);
                 }
 
                 @Override
                 public void onDisconnected(CameraDevice camera) {
-                    camera.close();
-                    sCamera = null;
+                    synchronized (sLock) {
+                        if (sThread != thisThread) {
+                            camera.close();
+                            return;
+                        }
+                        camera.close();
+                        sCamera = null;
+                    }
                     reportStatus(STATUS_DISCONNECTED);
                 }
 
                 @Override
                 public void onError(CameraDevice camera, int error) {
-                    camera.close();
-                    sCamera = null;
+                    synchronized (sLock) {
+                        if (sThread != thisThread) {
+                            camera.close();
+                            return;
+                        }
+                        camera.close();
+                        sCamera = null;
+                    }
                     Log.w(TAG, "the camera failed with error " + error);
                     reportStatus(STATUS_FAILED);
                 }
@@ -284,6 +318,7 @@ public final class CameraBridge {
      */
     private static void startPreview(CameraManager manager, CameraDevice camera,
                                      int width, int height) {
+        synchronized (sLock) {
         try {
             // The reader has to be exactly the size the camera
             // delivers.  A reader of a different size makes the camera
@@ -300,27 +335,35 @@ public final class CameraBridge {
             thisReader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
                 @Override
                 public void onImageAvailable(ImageReader reader) {
-                    // The reader may have been closed while this
-                    // callback was waiting to run.
-                    if (!sOpen || reader != thisReader) {
-                        return;
-                    }
-                    Image image = reader.acquireNextImage();
-                    if (image == null) {
-                        return;
-                    }
-                    try {
-                        deliver(image);
-                    } catch (Throwable t) {
-                        // A failure here would take the whole
-                        // application down, so it is caught.
-                        Log.w(TAG, "could not deliver a frame", t);
-                    } finally {
+                    // The lock is held for as long as the image is
+                    // read, so that the close cannot release the
+                    // reader underneath it.
+                    synchronized (sLock) {
+                        // The reader may have been closed while this
+                        // callback was waiting to run.
+                        if (!sOpen || reader != thisReader) {
+                            return;
+                        }
+                        Image image = null;
                         try {
-                            image.close();
-                        } catch (Throwable ignored) {
-                            // The image may already have been
-                            // released with the reader.
+                            image = reader.acquireNextImage();
+                            if (image == null) {
+                                return;
+                            }
+                            deliver(image);
+                        } catch (Throwable t) {
+                            // A failure here would take the whole
+                            // application down, so it is caught.
+                            Log.w(TAG, "could not deliver a frame", t);
+                        } finally {
+                            if (image != null) {
+                                try {
+                                    image.close();
+                                } catch (Throwable ignored) {
+                                    // The image may already have
+                                    // been released with the reader.
+                                }
+                            }
                         }
                     }
                 }
@@ -354,6 +397,7 @@ public final class CameraBridge {
         } catch (CameraAccessException e) {
             Log.w(TAG, "could not configure the camera", e);
             reportStatus(STATUS_FAILED);
+        }
         }
     }
 
@@ -487,39 +531,41 @@ public final class CameraBridge {
      * Close the camera and stop the thread it ran on.
      */
     public static void close() {
-        // The flag is cleared first, so a callback that is already
-        // running stops delivering frames.  The thread is then given a
-        // moment to finish, because the reader cannot be released
-        // while a callback is still holding an image from it.
-        sOpen = false;
+        // The lock is taken first: a callback that is already reading
+        // a frame finishes with it before anything is released.
+        synchronized (sLock) {
+            // The flag is cleared, so a callback that has not started
+            // yet stops.
+            sOpen = false;
+
+            if (sSession != null) {
+                try {
+                    sSession.close();
+                } catch (Exception e) {
+                    Log.w(TAG, "could not close the capture session", e);
+                }
+                sSession = null;
+            }
+            if (sReader != null) {
+                sReader.close();
+                sReader = null;
+            }
+            if (sCamera != null) {
+                sCamera.close();
+                sCamera = null;
+            }
+        }
+
+        // The thread is stopped afterwards.  It is not joined before
+        // the reader is released, because the callback takes the lock
+        // anyway: a callback that is waiting for the lock finds the
+        // flag cleared and returns without touching the image.
         HandlerThread thread = sThread;
         if (thread != null) {
-            try {
-                thread.quitSafely();
-                thread.join(500);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+            thread.quitSafely();
         }
         sThread = null;
         sHandler = null;
-
-        if (sSession != null) {
-            try {
-                sSession.close();
-            } catch (Exception e) {
-                Log.w(TAG, "could not close the capture session", e);
-            }
-            sSession = null;
-        }
-        if (sReader != null) {
-            sReader.close();
-            sReader = null;
-        }
-        if (sCamera != null) {
-            sCamera.close();
-            sCamera = null;
-        }
     }
 
     /**

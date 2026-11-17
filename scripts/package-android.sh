@@ -99,6 +99,30 @@ sysroot_dir_for_abi() {
     esac
 }
 
+# Strip the debug symbols from a library.
+#
+# The NDK's `llvm-strip` is used, because the macOS `strip` does not
+# understand the Android binaries.
+strip_library() {
+    local lib="$1"
+    [[ -f "$lib" ]] || return 0
+
+    local stripper=""
+    for host_tag in darwin-x86_64 darwin-arm64 linux-x86_64; do
+        local candidate="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$host_tag/bin/llvm-strip"
+        [[ -x "$candidate" ]] || continue
+        stripper="$candidate"
+        break
+    done
+    if [[ -z "$stripper" ]]; then
+        warn "no llvm-strip was found in the NDK — the library keeps its symbols"
+        return 0
+    fi
+    "$stripper" --strip-unneeded "$lib" 2>/dev/null || {
+        warn "could not strip $lib"
+    }
+}
+
 # ── The native libraries ─────────────────────────────────────────────────────
 #
 # Every ABI's libraries are collected into `jniLibs/<abi>/`, and the
@@ -133,6 +157,10 @@ for ABI in "${ABI_LIST[@]}"; do
     SDL2_SO="$(find "$TARGET_DIR/$TARGET/release/build" -name "libSDL2.so" 2>/dev/null | head -1)"
     if [[ -n "$SDL2_SO" ]]; then
         cp "$SDL2_SO" "$JNI_LIBS/libSDL2.so"
+        # The debug symbols are of no use in a shipped library, and they
+        # are three quarters of its size.  The APK carries four
+        # architectures, so every library is packaged four times.
+        strip_library "$JNI_LIBS/libSDL2.so"
         info "Packaging libSDL2.so for $ABI"
     else
         die "no libSDL2.so was built for $ABI"

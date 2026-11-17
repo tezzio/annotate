@@ -133,3 +133,10 @@ ureq    = "3"
 tar     = "0.4"
 bzip2   = { version = "0.4", features = ["static"] }
 zip     = { version = "9", default-features = false, features = ["deflate"] }
+
+# The release build is stripped: the debug symbols are of no use in a
+# shipped binary, and they are a third of its size.  On Android that
+# matters — the APK carries four architectures, so every library is
+# packaged four times.
+[profile.release]
+strip = "symbols"
