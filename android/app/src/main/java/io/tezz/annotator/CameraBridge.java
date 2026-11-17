@@ -324,15 +324,19 @@ public final class CameraBridge {
             // delivers.  A reader of a different size makes the camera
             // abandon its buffers and stop streaming, so the size that
             // was actually chosen is looked up rather than assumed.
-            int[] chosen = chooseSize(manager, camera, width, height);
-            // The reader needs several buffers: the camera fills them
-            // while a frame is being read, and with only two it runs
-            // out and stops — "Unable to acquire a buffer item, very
-            // likely client tried to acquire more than maxImages
-            // buffers".
+            // The reader is created for the size that was asked for.
+            //
+            // The camera scales its output to the size the reader
+            // asks for, so the two have to agree: a reader of a
+            // different size makes the camera abandon its buffers —
+            // "BufferQueue has been abandoned" — and the feed stops.
+            //
+            // The camera's list of sizes is not a guide here: it
+            // covers every aspect ratio the sensor can produce, and
+            // the camera will deliver a size that is not on it.
             sReader = ImageReader.newInstance(
-                    chosen[0],
-                    chosen[1],
+                    width,
+                    height,
                     ImageFormat.YUV_420_888,
                     4);
 
@@ -391,7 +395,7 @@ public final class CameraBridge {
             // "BufferQueue has been abandoned", and the feed stops.
             builder.set(
                     CaptureRequest.SCALER_CROP_REGION,
-                    new android.graphics.Rect(0, 0, chosen[0], chosen[1]));
+                    new android.graphics.Rect(0, 0, width, height));
 
             camera.createCaptureSession(Collections.singletonList(surface),
                     new CameraCaptureSession.StateCallback() {
@@ -418,60 +422,6 @@ public final class CameraBridge {
             reportStatus(STATUS_FAILED);
         }
         }
-    }
-
-    /**
-     * The size the camera will actually deliver.
-     *
-     * The camera rounds the requested size up to one it supports, so
-     * the size it will really produce is looked up in its
-     * configuration.  When nothing matches, the requested size is
-     * used — the camera will then pick its own and the frames will
-     * carry the real size.
-     */
-    private static int[] chooseSize(CameraManager manager, CameraDevice camera,
-                                    int width, int height) {
-        try {
-            CameraCharacteristics chars = manager.getCameraCharacteristics(camera.getId());
-            StreamConfigurationMap map =
-                    chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-            if (map != null) {
-                Size[] sizes = map.getOutputSizes(ImageFormat.YUV_420_888);
-                if (sizes != null) {
-                    // The exact size that was asked for, if the camera
-                    // has it.  The reader has to be the size the camera
-                    // delivers, and the camera delivers the size it is
-                    // told to.
-                    for (Size s : sizes) {
-                        if (s.getWidth() == width && s.getHeight() == height) {
-                            return new int[] { width, height };
-                        }
-                    }
-
-                    // Otherwise the closest one that is at least as
-                    // large, so that the camera can crop down to it.
-                    Size best = null;
-                    for (Size s : sizes) {
-                        if (s.getWidth() >= width && s.getHeight() >= height) {
-                            if (best == null
-                                    || (long) s.getWidth() * s.getHeight()
-                                       < (long) best.getWidth() * best.getHeight()) {
-                                best = s;
-                            }
-                        }
-                    }
-                    if (best == null && sizes.length > 0) {
-                        best = sizes[0];
-                    }
-                    if (best != null) {
-                        return new int[] { best.getWidth(), best.getHeight() };
-                    }
-                }
-            }
-        } catch (CameraAccessException e) {
-            Log.w(TAG, "could not read the stream configuration", e);
-        }
-        return new int[] { width, height };
     }
 
     /**
