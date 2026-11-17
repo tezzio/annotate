@@ -1,5 +1,10 @@
 package io.tezz.annotator;
 
+import android.Manifest;
+import android.content.pm.PackageManager;
+import android.os.Build;
+import android.os.Bundle;
+
 import org.libsdl.app.SDLActivity;
 
 /**
@@ -17,8 +22,39 @@ import org.libsdl.app.SDLActivity;
  * calls into it as soon as the libraries are loaded.
  */
 public class MainActivity extends SDLActivity {
+
+    private static final int CAMERA_PERMISSION_REQUEST = 1;
+
     @Override
     protected String[] getLibraries() {
         return new String[] { "SDL2", "main" };
+    }
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+
+        // The camera needs a permission that has to be granted at run
+        // time from Android 6 onwards.  Without it the capture backend
+        // finds no cameras, so it is asked for as soon as the activity
+        // starts.
+        requestCameraPermission();
+    }
+
+    /**
+     * Ask for the camera permission, if it has not been granted yet.
+     */
+    private void requestCameraPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            // Before Android 6 the permission is granted at install
+            // time.
+            return;
+        }
+        if (checkSelfPermission(Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(
+                    new String[] { Manifest.permission.CAMERA },
+                    CAMERA_PERMISSION_REQUEST);
+        }
     }
 }

@@ -49,3 +49,11 @@ pub fn error(tag: &str, message: &str) {
 pub fn info(tag: &str, message: &str) {
     log(PRIORITY_INFO, tag, message);
 }
+
+/// The system log's "debug" priority.
+const PRIORITY_DEBUG: i32 = 3;
+
+/// Write a debug message to the Android system log.
+pub fn debug(tag: &str, message: &str) {
+    log(PRIORITY_DEBUG, tag, message);
+}

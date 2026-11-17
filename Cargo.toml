@@ -123,6 +123,10 @@ dispatch2                   = "0.3"
 # The application itself is `libmain.so`, which links against SDL2.
 [target.'cfg(target_os = "android")'.dependencies]
 sdl2                       = { version = "0.37", features = ["ttf", "bundled"] }
+# The camera is reached through Camera2, which cannot be called from
+# Rust directly; the Java bridge does it and hands the frames over
+# through JNI.
+jni                        = "0.21"
 
 [build-dependencies]
 ureq    = "3"
