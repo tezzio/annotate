@@ -138,6 +138,73 @@ jobs:
           path: target/macos/*.dmg
           if-no-files-found: error
 
+  # The Android build.  It cross-compiles the native library with the
+  # NDK and packages it into an APK with Gradle.  The runner already
+  # has the SDK, the NDK and a JDK, so nothing has to be installed.
+  #
+  # Every architecture Android supports is built: the four ABIs are
+  # packaged into a single APK, and Android picks the right one when
+  # the application is installed.
+  build-android:
+    runs-on: ubuntu-latest
+    needs: check
+    env:
+      ANDROID_ABIS: arm64-v8a,armeabi-v7a,x86_64,x86
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            aarch64-linux-android
+            armv7-linux-androideabi
+            x86_64-linux-android
+            i686-linux-android
+
+      - name: Install cmake
+        # SDL2 is built from source for Android, and that build needs
+        # cmake.  The runner has an old one, which SDL2's CMakeLists
+        # rejects, so a current one is installed.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake
+
+      - name: Install Java 17
+        # The Android Gradle Plugin wants Java 17.  The runner's
+        # default JDK is newer, and Gradle refuses to parse its
+        # version number ("IllegalArgumentException: 25.0.4").
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jdk
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
+          echo "PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:$PATH" >> "$GITHUB_ENV"
+
+      - name: Install Gradle
+        # The Android Gradle Plugin needs Gradle 8.9 or newer.  The
+        # wrapper is not checked in — it would add a binary to the
+        # tree — so the distribution is fetched here instead.
+        run: |
+          curl -sL -o /tmp/gradle.zip \
+            https://services.gradle.org/distributions/gradle-8.13-bin.zip
+          unzip -q /tmp/gradle.zip -d /tmp/gradledist
+          echo "/tmp/gradledist/gradle-8.13/bin" >> "$GITHUB_PATH"
+
+      - name: Install the Android SDK platform
+        # The application compiles against API 35 and packages with
+        # build-tools 35; the runner may not have that pair installed.
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" || true
+
+      - name: Build the Android APK
+        run: make package-android
+
+      - name: Upload the Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: annotator-android-apk
+          path: target/android/*.apk
+          if-no-files-found: error
+
   # Dependency vulnerability scan.  Advisory only (`continue-on-error`):
   # a newly published CVE must never block binaries from being built —
   # the finding shows up as a failing (but non-gating) check so it gets

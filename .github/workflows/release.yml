@@ -113,9 +113,47 @@ jobs:
           path: target/macos/*.dmg
           if-no-files-found: error
 
+  # The Android build.  Every architecture is compiled and packaged into
+  # a single APK; Android picks the right one when it is installed.
+  build-android:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_ABIS: arm64-v8a,armeabi-v7a,x86_64,x86
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            aarch64-linux-android
+            armv7-linux-androideabi
+            x86_64-linux-android
+            i686-linux-android
+
+      - name: Install cmake
+        # SDL2 is built from source for Android, and that build needs
+        # cmake.  The runner has an old one, which SDL2's CMakeLists
+        # rejects, so a current one is installed.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake
+
+      - name: Build the APK
+        run: make package-android
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: annotator-android-apk
+          path: target/android/*.apk
+          if-no-files-found: error
+
   publish:
     runs-on: ubuntu-latest
-    needs: [build, build-macos]
+    needs: [build, build-macos, build-android]
     permissions:
       contents: write
     steps:
@@ -143,6 +181,12 @@ jobs:
           name: annotator-macos-arm64-dmg
           path: annotator-macos-arm64-dmg
 
+      - name: Download the Android APK
+        uses: actions/download-artifact@v4
+        with:
+          name: annotator-android-apk
+          path: annotator-android-apk
+
       - name: Rename artifacts with version
         run: |
           # The tag wins when the workflow was dispatched by hand: in that
@@ -158,6 +202,10 @@ jobs:
           for dmg in annotator-macos-arm64-dmg/*.dmg; do
             cp "$dmg" "annotator-${VERSION}-macos-arm64.dmg"
           done
+          # The APK carries every ABI, so it gets a plain name.
+          for apk in annotator-android-apk/*.apk; do
+            cp "$apk" "annotator-${VERSION}-android.apk"
+          done
 
       - name: Checksums
         run: |
@@ -165,7 +213,8 @@ jobs:
           # `sha256sum -c annotator-VERSION-OS-ARCH.sha256` from the
           # directory the files were saved to.
           for f in annotator-*-linux-x86_64 annotator-*-linux-aarch64 \
-                   annotator-*-macos-arm64 annotator-*-macos-arm64.dmg; do
+                   annotator-*-macos-arm64 annotator-*-macos-arm64.dmg \
+                   annotator-*-android.apk; do
             sha256sum "$f" > "$f.sha256"
           done
 
@@ -178,8 +227,10 @@ jobs:
             annotator-*-linux-aarch64
             annotator-*-macos-arm64
             annotator-*-macos-arm64.dmg
+            annotator-*-android.apk
             annotator-*-linux-x86_64.sha256
             annotator-*-linux-aarch64.sha256
             annotator-*-macos-arm64.sha256
             annotator-*-macos-arm64.dmg.sha256
+            annotator-*-android.apk.sha256
           generate_release_notes: true
