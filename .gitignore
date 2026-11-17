@@ -13,3 +13,9 @@
 /assets/*.icns
 /assets/*.iconset/
 
+
+# CI logs pulled down for debugging
+runner.log
+
+# macOS
+.DS_Store
