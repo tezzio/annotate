@@ -73,12 +73,17 @@ fn download(sources: Sources, what: &str) -> Vec<u8> {
 
 /// Fetch a URL, returning its body.
 fn fetch(url: &str) -> Result<Vec<u8>, String> {
-    let resp = ureq::get(url)
-        .timeout(Duration::from_secs(120))
-        .call()
-        .map_err(|e| e.to_string())?;
+    // ureq 3 puts the timeout on the configuration rather than on the
+    // request, and a failed call carries the error inside the returned
+    // value rather than in a `Result`.
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(120)))
+        .build();
+    let agent: ureq::Agent = config.into();
+    let resp = agent.get(url).call().map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
-    resp.into_reader()
+    resp.into_body()
+        .as_reader()
         .read_to_end(&mut buf)
         .map_err(|e| format!("failed to read the response body: {e}"))?;
     Ok(buf)
@@ -151,7 +156,8 @@ fn fetch_fa_solid(assets: &Path) {
         .expect("failed to open Font Awesome zip");
     let solid_index = (0..archive.len()).find(|&i| {
         archive.by_index(i).ok().is_some_and(|f| {
-            let n = f.name().to_owned();
+            // zip 9 returns the entry name as a `Result`.
+            let n = f.name().ok().map(|n| n.into_owned()).unwrap_or_default();
             n.ends_with(".ttf") && n.contains("fa-solid")
         })
     });
@@ -166,7 +172,12 @@ fn fetch_fa_solid(assets: &Path) {
             let mut archive2 =
                 zip::ZipArchive::new(std::io::Cursor::new(data)).expect("failed to reopen zip");
             let names: Vec<String> = (0..archive2.len())
-                .filter_map(|i| archive2.by_index(i).ok().map(|f| f.name().to_owned()))
+                .filter_map(|i| {
+                    archive2
+                        .by_index(i)
+                        .ok()
+                        .and_then(|f| f.name().ok().map(|n| n.into_owned()))
+                })
                 .filter(|n| n.ends_with(".ttf") || n.ends_with(".otf"))
                 .collect();
             panic!("Free Solid font not found in archive. Font entries present: {names:?}");

@@ -125,7 +125,7 @@ dispatch2                   = "0.3"
 sdl2                       = { version = "0.37", features = ["ttf", "bundled"] }
 
 [build-dependencies]
-ureq    = "2"
+ureq    = "3"
 tar     = "0.4"
 bzip2   = { version = "0.4", features = ["static"] }
-zip     = { version = "2", default-features = false, features = ["deflate"] }
+zip     = { version = "9", default-features = false, features = ["deflate"] }

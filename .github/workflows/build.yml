@@ -207,18 +207,94 @@ jobs:
 
   # Dependency vulnerability scan.  Advisory only (`continue-on-error`):
   # a newly published CVE must never block binaries from being built —
-  # the finding shows up as a failing (but non-gating) check so it gets
-  # triaged, not silently ignored.
+  # the finding shows up in the job summary and in the log, so it gets
+  # triaged, but it does not fail the build.
   audit:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install cargo-audit
+        # The `rustsec/audit-check` action runs on Node 20, which the
+        # runners no longer support, and it tries to create a check run
+        # with a token that is not allowed to — so it fails even when
+        # there is nothing to report.  The binary is fetched instead,
+        # which has neither problem.
+        run: |
+          curl -sSfL \
+            https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.23.0/cargo-audit-x86_64-unknown-linux-gnu-v0.23.0.tgz \
+            | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/cargo-audit-x86_64-unknown-linux-gnu-v0.23.0" \
+            >> "$GITHUB_PATH"
+
       - name: Run cargo audit
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        #
+        # The advisories are advisory.  A newly published CVE must not
+        # stop the binaries from being built, and a red cross on the
+        # job says "the build is broken" when it is not — so the
+        # findings are reported in the job summary and as annotations,
+        # and the job itself passes.
+        #
+        # The summary is the only place the list is easy to read: the
+        # raw JSON is not, and the log is easy to lose.
+        run: |
+          # `cargo audit` exits non-zero when it finds anything, which
+          # is what the run step would report as a failure.
+          cargo audit --json > audit.json 2> audit.err || true
+
+          python3 - <<'PY'
+          import json, os, sys
+
+          with open("audit.json") as fh:
+              report = json.load(fh)
+
+          vulns = report.get("vulnerabilities", {}).get("list", [])
+          warnings = []
+          for kind, entries in (report.get("warnings") or {}).items():
+              for entry in entries:
+                  warnings.append((kind, entry))
+
+          lines = ["## Dependency audit", ""]
+
+          if not vulns and not warnings:
+              lines.append("No vulnerabilities or warnings. :white_check_mark:")
+          else:
+              if vulns:
+                  lines += [
+                      f"### {len(vulns)} vulnerabilities",
+                      "",
+                      "| Advisory | Crate | Version | Fixed in |",
+                      "|---|---|---|---|",
+                  ]
+                  for v in vulns:
+                      a = v["advisory"]
+                      p = v["package"]
+                      fixed = ", ".join(v["versions"].get("patched") or []) or "-"
+                      lines.append(
+                          f"| [{a['id']}]({a.get('url') or ''}) | `{p['name']}` "
+                          f"| {p['version']} | {fixed} |"
+                      )
+                      # An annotation puts the advisory in the code
+                      # review as well as in the summary.
+                      print(f"::warning::{a['id']} — {p['name']} {p['version']}: {a['title']}")
+                  lines.append("")
+              if warnings:
+                  lines += [f"### {len(warnings)} warnings", ""]
+                  for kind, entry in warnings:
+                      a = entry["advisory"]
+                      p = entry["package"]
+                      lines.append(
+                          f"- **{kind}** — [{a['id']}]({a.get('url') or ''}) "
+                          f"`{p['name']}` {p['version']}: {a['title']}"
+                      )
+                      print(f"::warning::{a['id']} — {p['name']} {p['version']}: {a['title']}")
+                  lines.append("")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write("\n".join(lines) + "\n")
+
+          print("\n".join(lines))
+          PY
