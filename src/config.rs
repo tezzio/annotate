@@ -216,7 +216,9 @@ const SALT_LEN: usize = 16;
 ///
 /// The result is self-describing:
 ///
-///     pbkdf2-sha256$<iterations>$<salt-hex>$<key-hex>
+/// ```text
+/// pbkdf2-sha256$<iterations>$<salt-hex>$<key-hex>
+/// ```
 ///
 /// so an old `sha256(password + "annotator-salt")` hash can still be
 /// verified — and is transparently upgraded to this scheme the first

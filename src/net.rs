@@ -164,6 +164,40 @@ fn default_route_interfaces() -> Vec<String> {
     interfaces
 }
 
+/// The names of the interfaces that carry a default route.
+///
+/// Android keeps its routing table in the kernel, reachable through
+/// `getifaddrs` but not through a readable file the way `/proc/net/
+/// route` is on Linux, and there is no shell to run `netstat` in.
+///
+/// The interface flags are the closest equivalent: an interface that
+/// is up and running is the one carrying traffic.  A tablet typically
+/// has one such interface, which is the address the operator wants to
+/// see.
+#[cfg(target_os = "android")]
+fn default_route_interfaces() -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        // The `operstate` file says whether the interface is up; it is
+        // readable without any permission on Android.
+        let operstate = entry.path().join("operstate");
+        let Ok(text) = std::fs::read_to_string(&operstate) else {
+            continue;
+        };
+        let state = text.trim();
+        if state == "up" || state == "unknown" {
+            out.push(name);
+        }
+    }
+    out
+}
+
 /// Classify an address by how it was obtained.
 fn classify(iface: &str, addr: IpAddr, _prefix: u8) -> AddrSource {
     match addr {
@@ -210,6 +244,19 @@ fn dhcp_leases_contain(iface: &str, addr: &Ipv4Addr) -> bool {
         return true;
     }
     dhclient_lease_contains(iface, addr)
+}
+
+/// True when the address was assigned by DHCP.
+///
+/// Android runs its DHCP client inside `netd`, and there is no command
+/// to interrogate it — the application has no shell to run one in, and
+/// the lease files are not readable by an ordinary application.
+///
+/// The address is therefore reported as static, which is the safe
+/// answer: it never claims a lease the operator cannot verify.
+#[cfg(target_os = "android")]
+fn dhcp_leases_contain(_iface: &str, _addr: &Ipv4Addr) -> bool {
+    false
 }
 
 /// True when the address was assigned by DHCP.

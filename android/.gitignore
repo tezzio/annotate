@@ -1,0 +1,13 @@
+# Gradle
+.gradle/
+build/
+local.properties
+
+# The native libraries that the build script produces and the Gradle
+# build copies into the APK.  They are build artefacts, not sources.
+app/src/main/jniLibs/
+
+# Android Studio
+*.iml
+.idea/
+captures/

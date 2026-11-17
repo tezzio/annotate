@@ -10,10 +10,12 @@
 //!
 //! Usage:
 //!
-//!     annotator --password list
-//!     annotator --password set <user> [--admin]     # prompts for the password
-//!     annotator --password reset <user>             # generates a password
-//!     annotator --password generate                 # prints a password
+//! ```text
+//! annotator --password list
+//! annotator --password set <user> [--admin]     # prompts for the password
+//! annotator --password reset <user>             # generates a password
+//! annotator --password generate                 # prints a password
+//! ```
 //!
 //! The password is read from stdin with echo disabled, so it never
 //! appears in the shell history or in `ps` output.

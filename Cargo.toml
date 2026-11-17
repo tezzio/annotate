@@ -3,6 +3,37 @@ name = "annotator"
 version = "0.5.6"
 edition = "2024"
 
+[features]
+# The desktop builds produce an executable; the Android build produces a
+# shared library instead.  The two are separate Cargo targets, and each
+# is gated on its own feature.
+#
+# `desktop` is on by default, so an ordinary `cargo build` produces the
+# executable.  `android` is turned on by the Android build script
+# instead.
+default = ["desktop"]
+desktop = []
+android = []
+
+# On Android the application is a shared library, not an executable:
+# SDL loads `libmain.so` and calls `SDL_main` in it.  Everywhere else it
+# is an ordinary binary.
+#
+# The library has no `required-features`: cargo's `--all-targets`
+# builds it even when the feature is off, and a library without an
+# entry point would then be reported as a wall of dead code.  The
+# entry points are gated on the features instead, so the library is a
+# valid crate either way.
+[lib]
+name = "annotator"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "annotator"
+path = "src/main.rs"
+required-features = ["desktop"]
+
 [dependencies]
 sdl2         = { version = "0.37", features = ["ttf"] }
 libc         = "0.2"
@@ -23,6 +54,11 @@ png          = "0.17"
 #
 # macOS ships LibreSSL as part of the system, which the OpenSSL crate does
 # not support, so the Homebrew build of OpenSSL is used there instead.
+#
+# Android is excluded: the OpenSSL crate has no Android support at all,
+# and the REST API is a control-processor feature that the tablet build
+# does without.  See `src/api_android.rs`.
+[target.'cfg(not(target_os = "android"))'.dependencies]
 openssl      = "0.10"
 
 # V4L2 is a Linux kernel API.  The crate is Linux-only, so it is only
@@ -70,6 +106,23 @@ objc2-av-foundation         = { version = "0.3", features = [
 objc2-core-media            = { version = "0.3", features = ["CMSampleBuffer", "CMFormatDescription", "CMBlockBuffer"] }
 objc2-core-video            = { version = "0.3", features = ["CVPixelBuffer", "CVImageBuffer", "CVBuffer", "CVBase", "CVReturn"] }
 dispatch2                   = "0.3"
+
+# On Android, SDL2 has to be built from source against the NDK — there
+# is no system SDL2 to link against, and the Homebrew copy is for the
+# wrong platform.  The `bundled` feature builds the vendored SDL2
+# sources with cmake.
+#
+# SDL2 is built as a *shared* library here, not linked into the
+# application.  Its JNI entry points — the ones the Java shim calls,
+# such as `nativeGetVersion` — live in SDL2 itself, and the shim
+# reaches them by loading `libSDL2.so` and looking the symbols up in
+# it.  Linking SDL2 statically would leave the shim with nothing to
+# call, and the application would die with "No implementation found
+# for java.lang.String org.libsdl.app.SDLActivity.nativeGetVersion()".
+#
+# The application itself is `libmain.so`, which links against SDL2.
+[target.'cfg(target_os = "android")'.dependencies]
+sdl2                       = { version = "0.37", features = ["ttf", "bundled"] }
 
 [build-dependencies]
 ureq    = "2"

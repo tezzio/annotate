@@ -1,11 +1,12 @@
 //! Video capture.
 //!
 //! The application talks to one interface, but the operating systems
-//! underneath it are different: Linux exposes cameras through V4L2 and
-//! macOS through AVFoundation.  The shared types live here, and the
-//! platform-specific code sits in [`linux`] and [`macos`].
+//! underneath it are different: Linux exposes cameras through V4L2,
+//! macOS through AVFoundation and Android through Camera2.  The shared
+//! types live here, and the platform-specific code sits in [`linux`],
+//! [`macos`] and [`android`].
 //!
-//! Both backends implement the same three entry points:
+//! Every backend implements the same three entry points:
 //!
 //! * [`enumerate_devices`] — the cameras the machine can see.
 //! * [`start_capture`] — a thread that pushes frames into a channel.
@@ -24,6 +25,12 @@ mod macos;
 
 #[cfg(target_os = "macos")]
 pub use macos::{enumerate_devices, null_receiver, null_status_receiver, start_capture};
+
+#[cfg(target_os = "android")]
+mod android;
+
+#[cfg(target_os = "android")]
+pub use android::{enumerate_devices, null_receiver, null_status_receiver, start_capture};
 
 /// The pixel layout of a captured frame.
 #[derive(Clone, PartialEq, Debug)]

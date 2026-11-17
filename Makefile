@@ -15,23 +15,28 @@
 #   make build             Build the annotator binary
 #   make build-arm         Build the aarch64 binary
 #   make build-macos       Build the annotator on macOS
+#   make package-android   Build the Android APK
 #   make all               Fetch the libraries and build both binaries
 #   make clean             Remove the built binaries
 #
 # Environment:
 #   ARCH       x86_64 | aarch64 (default: x86_64)
 #   TARGET     Cargo target triple (default: $ARCH-unknown-linux-gnu)
+#   ANDROID_ABIS  The Android ABIs to build, comma-separated
+#              (default: arm64-v8a).  Every ABI that is built is
+#              packaged into a single APK.
 
 PROJECT_DIR := $(abspath .)
 TARGET_DIR  := $(PROJECT_DIR)/target
 SCRIPTS_DIR := $(PROJECT_DIR)/scripts
 ARCH        ?= x86_64
 TARGET      ?= $(ARCH)-unknown-linux-gnu
+ANDROID_ABIS ?= arm64-v8a
 
 LIBDIRS := $(TARGET_DIR)/x86_64-libs $(TARGET_DIR)/aarch64-libs
 
 .PHONY: help bootstrap libs libs-x86 libs-arm build build-arm build-macos \
-        package-macos test all clean clean-all
+        package-macos build-android package-android test all clean clean-all
 
 help:
 	@echo "annotate build system"
@@ -47,6 +52,8 @@ help:
 	@echo "  build-arm      Build the annotator for aarch64"
 	@echo "  build-macos    Build the annotator on macOS (Homebrew SDL2/OpenSSL)"
 	@echo "  package-macos  Build the macOS .app bundle and the .dmg"
+	@echo "  build-android  Cross-compile the native library for Android"
+	@echo "  package-android Build the Android APK ($(ANDROID_ABIS))"
 	@echo "  all            Fetch the libraries and build both binaries"
 	@echo ""
 	@echo "Clean targets:"
@@ -63,6 +70,7 @@ help:
 	@echo "  make build-arm                    # cross-compile for aarch64"
 	@echo "  make build-macos                  # build on a Mac"
 	@echo "  make package-macos                # build the .app and the .dmg"
+	@echo "  make package-android              # build the Android APK"
 	@echo "  make all                          # both architectures"
 
 bootstrap:
@@ -99,6 +107,21 @@ build-macos:
 package-macos:
 	@bash $(SCRIPTS_DIR)/package-macos.sh
 
+# build-android: cross-compile the native library for Android.  The
+# result is libmain.so, which SDL's Java shim loads.
+#
+# The ABI can be overridden with `make build-android ABI=armeabi-v7a`.
+# Several ABIs can be built at once by separating them with commas:
+# `make build-android ABI=arm64-v8a,armeabi-v7a`.
+build-android:
+	@bash $(SCRIPTS_DIR)/build-android.sh --abi "$(ANDROID_ABIS)"
+
+# package-android: build the APK.  The native library is built first,
+# then Gradle packages it.  One APK carries every ABI that was built.
+package-android:
+	@bash $(SCRIPTS_DIR)/build-android.sh --abi "$(ANDROID_ABIS)"
+	@bash $(SCRIPTS_DIR)/package-android.sh --abi "$(ANDROID_ABIS)"
+
 # test: run the unit tests.  The host has no SDL2 development packages
 # installed, so the libraries from the library directory are put on the
 # link path — and on the runtime path, because the test binary is
@@ -114,7 +137,7 @@ all: libs-x86 libs-arm
 # cache are preserved so that the next build is fast.
 clean:
 	@rm -f $(TARGET_DIR)/x86_64/annotator $(TARGET_DIR)/aarch64/annotator
-	@rm -rf $(TARGET_DIR)/macos
+	@rm -rf $(TARGET_DIR)/macos $(TARGET_DIR)/android
 	@echo "Cleaned binaries (libraries and cargo cache preserved)"
 
 # clean-all: also remove the fetched Debian library packages and the
