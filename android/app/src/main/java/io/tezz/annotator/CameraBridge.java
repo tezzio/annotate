@@ -325,11 +325,16 @@ public final class CameraBridge {
             // abandon its buffers and stop streaming, so the size that
             // was actually chosen is looked up rather than assumed.
             int[] chosen = chooseSize(manager, camera, width, height);
+            // The reader needs several buffers: the camera fills them
+            // while a frame is being read, and with only two it runs
+            // out and stops — "Unable to acquire a buffer item, very
+            // likely client tried to acquire more than maxImages
+            // buffers".
             sReader = ImageReader.newInstance(
                     chosen[0],
                     chosen[1],
                     ImageFormat.YUV_420_888,
-                    2);
+                    4);
 
             final ImageReader thisReader = sReader;
             thisReader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
@@ -346,7 +351,13 @@ public final class CameraBridge {
                         }
                         Image image = null;
                         try {
-                            image = reader.acquireNextImage();
+                            // The *latest* image is taken rather than
+                            // the next one: the older frames are
+                            // discarded, so the camera never runs out
+                            // of buffers while a frame is being read.
+                            // A live preview wants the newest frame
+                            // anyway.
+                            image = reader.acquireLatestImage();
                             if (image == null) {
                                 return;
                             }
@@ -373,6 +384,14 @@ public final class CameraBridge {
             CaptureRequest.Builder builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
             builder.addTarget(surface);
             builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO);
+            // The camera is told which size to deliver.  Without this
+            // it picks one of its own — 1920x864 rather than the
+            // 1920x1440 the reader was created for — and a reader of
+            // the wrong size makes the camera abandon its buffers:
+            // "BufferQueue has been abandoned", and the feed stops.
+            builder.set(
+                    CaptureRequest.SCALER_CROP_REGION,
+                    new android.graphics.Rect(0, 0, chosen[0], chosen[1]));
 
             camera.createCaptureSession(Collections.singletonList(surface),
                     new CameraCaptureSession.StateCallback() {
@@ -419,9 +438,18 @@ public final class CameraBridge {
             if (map != null) {
                 Size[] sizes = map.getOutputSizes(ImageFormat.YUV_420_888);
                 if (sizes != null) {
-                    // The smallest size that is at least as large as
-                    // the one that was asked for: that is the one the
-                    // camera will deliver.
+                    // The exact size that was asked for, if the camera
+                    // has it.  The reader has to be the size the camera
+                    // delivers, and the camera delivers the size it is
+                    // told to.
+                    for (Size s : sizes) {
+                        if (s.getWidth() == width && s.getHeight() == height) {
+                            return new int[] { width, height };
+                        }
+                    }
+
+                    // Otherwise the closest one that is at least as
+                    // large, so that the camera can crop down to it.
                     Size best = null;
                     for (Size s : sizes) {
                         if (s.getWidth() >= width && s.getHeight() >= height) {
